@@ -32,7 +32,7 @@ ralph "Fix all repo bugs labelled xyz"
 ```
 
 ```bash
-ralph "Resolve all PR comments and CI failures" --push
+ralph "Resolve all PR comments and CI failures on current branch" --push
 ```
 
 The `--push` flag pushes changes after completion and monitors CI. When CI fails, it extracts unique failures and creates fixup commits. Requires a skill/tool that can fetch CI build errors (e.g., Azure DevOps or GitHub Actions integration).
