@@ -25,6 +25,8 @@ Add a system alias that calls `dotnet fsi Ralph.fsx` and passes arguments.
 
 ## Usage
 
+Call from root of your repo:
+
 ```bash
 ralph "Fix all repo bugs labelled xyz"
 ```
