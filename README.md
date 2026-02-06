@@ -21,7 +21,7 @@ A: When CI passes. Or February 3rd. Whichever comes first.
 
 ## Setup
 
-Add a system alias pointing to `Ralph.fsx`.
+Add a system alias that calls `dotnet fsi Ralph.fsx` and passes arguments.
 
 ## Usage
 
