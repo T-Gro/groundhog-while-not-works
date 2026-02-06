@@ -21,33 +21,19 @@ A: When CI passes. Or February 3rd. Whichever comes first.
 
 ## Setup
 
-Add a system alias to your shell config (`~/.zshrc` or `~/.bashrc`):
-
-```bash
-alias ralph='dotnet fsi /path/to/groundhog-while-not-works/Ralph.fsx --'
-```
+Add a system alias pointing to `Ralph.fsx`.
 
 ## Usage
 
-**Basic invocation** - interactive mode:
 ```bash
-ralph
+ralph "Fix all repo bugs labelled xyz"
 ```
 
-**With a request:**
 ```bash
-ralph "Add error handling to the parser"
+ralph "Resolve all PR comments and CI failures" --push
 ```
 
-**Auto-approve all prompts:**
-```bash
-ralph "Fix the flaky tests" --yes
-```
-
-**With CI monitoring** (requires a skill that tells it how to fetch CI errors):
-```bash
-ralph "Implement the new API endpoint" --yes --push
-```
+The `--push` flag pushes changes after completion and monitors CI. When CI fails, it extracts unique failures and creates fixup commits. Requires a skill/tool that can fetch CI build errors (e.g., Azure DevOps or GitHub Actions integration).
 
 ## License
 
