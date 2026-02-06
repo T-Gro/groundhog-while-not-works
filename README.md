@@ -27,6 +27,9 @@ Add a system alias that calls `dotnet fsi Ralph.fsx` and passes arguments.
 
 Call from root of your repo:
 
+- Assumes `copilot` CLI is installed
+- Assumes repo has copilot instructions and skills to build and test
+
 ```bash
 ralph "Fix all repo bugs labelled xyz"
 ```
