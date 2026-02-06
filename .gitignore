@@ -1,0 +1,8 @@
+# Ralph working directory
+.tools/
+
+# macOS
+.DS_Store
+
+# Backup files
+*.bak
