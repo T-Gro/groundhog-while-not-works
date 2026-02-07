@@ -105,6 +105,12 @@ module TypeDefinitions =
         FinalVerifierResults: Map<VerifierName, VerifierStatus>  // Final verification after all sprints
         FinalVerifierSummaries: Map<VerifierName, string>  // Management summaries from final verifiers
         CIStatus: (string * bool option) option  // (PR URL, passed: None=pending, Some true=passed, Some false=failed)
+        // New fields for integrated UI:
+        CurrentPhase: string  // "Planning", "Executing", "Final Verification", "Complete"
+        CurrentAgentTask: string  // What agent is currently doing
+        LastVerifierLog: (string * bool * string) option  // (verifier name, passed, summary)
+        PlanOverview: string  // Brief overview of the plan
+        ErrorLog: string option  // Last error if any
     }
 
     let emptyTiming = { 
@@ -119,6 +125,8 @@ let mutable state: State = {
         Backlog = []; StartTime = DateTime.Now; Message = ""; AgentStartTime = None
         TotalEstimatedIterations = 0; CompletedIterations = 0
         FinalVerifierResults = Map.empty; FinalVerifierSummaries = Map.empty; CIStatus = None
+        CurrentPhase = "Initializing"; CurrentAgentTask = ""; LastVerifierLog = None
+        PlanOverview = ""; ErrorLog = None
     }
 let mutable liveCtx: LiveDisplayContext option = None
 
@@ -575,158 +583,166 @@ let buildDashboard () =
         else
             float completedItems / float (max 1 totalItems) * 100.0
     
-    // Build progress bar
-    let progressBar = 
-        let barWidth = 50
+    // Compact header with phase and progress
+    let headerLine = 
+        let phaseColor = 
+            match state.CurrentPhase with
+            | "Complete" -> "green"
+            | "Planning" -> "cyan"
+            | _ -> "yellow"
+        let pct = sprintf "%.0f" progress
+        let barWidth = 30
         let filled = min barWidth (max 0 (int (float barWidth * progress / 100.0)))
         let empty = max 0 (barWidth - filled)
         let barStr = String.replicate filled "█" + String.replicate empty "░"
-        let color = if progress >= 100.0 then "green" else if progress >= 50.0 then "yellow" else "blue"
-        let pct = sprintf "%.1f" progress
-        Markup($"[{color}]{barStr}[/] [{color}]{pct}%%[/] ({completedItems}/{totalItems} sprints)")
+        Markup($"[yellow bold]RALPH[/] │ [{phaseColor}]{escapeMarkup state.CurrentPhase}[/] │ {barStr} {pct}%% │ {completedItems}/{totalItems} sprints │ {elapsedStr}")
     
-    // Build status panel
-    let statusPanel = 
-        let agentStatus = 
-            match state.AgentStartTime with
-            | Some startTime -> 
-                let agentElapsed = DateTime.Now - startTime
-                let agentElapsedStr = agentElapsed.ToString("mm\\:ss")
-                $"[green bold]AGENT RUNNING[/] for {agentElapsedStr}"
-            | None -> "[dim]Idle - no agent running[/]"
-        Panel(Markup(agentStatus)).Header("[yellow]Current Activity[/]").Expand()
+    // Current activity - single line showing what agent is doing
+    let activityLine =
+        match state.AgentStartTime with
+        | Some startTime ->
+            let agentElapsed = DateTime.Now - startTime
+            let agentElapsedStr = agentElapsed.ToString("mm\\:ss")
+            let task = if String.IsNullOrEmpty state.CurrentAgentTask then "Working..." else state.CurrentAgentTask
+            Markup($"[green]▶ AGENT[/] ({agentElapsedStr}): {escapeMarkup task}")
+        | None ->
+            Markup($"[dim]Agent idle[/]")
     
-    // Build Product Backlog table - columns are dynamic based on discovered verifiers
+    // Build Sprint Board table - compact with key info
     let verifierNames = Verifiers.listAll ()
     let t = Table().Border(TableBorder.Rounded).Expand()
-    t.AddColumn("#") |> ignore
-    t.AddColumn("Sprint") |> ignore
-    t.AddColumn("Status") |> ignore
-    t.AddColumn("DoD") |> ignore
-    t.AddColumn("Iter") |> ignore
-    // Add a column for each discovered verifier with clickable link to file
+    t.AddColumn(TableColumn("#").Width(3)) |> ignore
+    t.AddColumn(TableColumn("Sprint").Width(25)) |> ignore
+    t.AddColumn(TableColumn("Status").Width(12)) |> ignore
+    t.AddColumn(TableColumn("Iter").Width(5)) |> ignore
+    t.AddColumn(TableColumn("Time").Width(7)) |> ignore
+    // Add verifier columns with compact headers
     for name in verifierNames do
+        let shortName = if name.Length > 8 then name.Substring(0, 7) + "…" else name
         let filePath = getVerifierFilePath name
-        let header = $"[link=file://{filePath}]{name}[/]"
-        t.AddColumn(TableColumn(Markup(header))) |> ignore
-    t.AddColumn("Time") |> ignore
+        let header = $"[link=file://{filePath}]{shortName}[/]"
+        t.AddColumn(TableColumn(Markup(header)).Width(8)) |> ignore
     
     for (item, status, timing) in state.Backlog do
         let now = DateTime.Now
+        let shortName = if item.Name.Length > 24 then item.Name.Substring(0, 21) + "..." else item.Name
         let statusStr, iterStr = 
             match status with
             | Todo -> "[dim]Todo[/]", "[dim]-[/]"
-            | Running (phase, iter) -> 
-                let activePhase = "Implementing"
-                $"[yellow]⏳ {activePhase}[/]", if iter > 1 then $"[yellow]⟲{iter}[/]" else $"[yellow]{iter}[/]"
+            | Running (_, iter) -> 
+                $"[yellow]⏳ Run[/]", if iter > 1 then $"[yellow]⟲{iter}[/]" else $"[yellow]{iter}[/]"
             | Done iters -> "[green]✓ Done[/]", $"[green]{iters}[/]"
-        // DoD status column with emoji counts
-        let dodStr = 
-            let total = item.DoD.Length
-            let passed = timing.LastDoDResults |> List.filter (fun r -> r.Passed = Some true) |> List.length
-            let failed = timing.LastDoDResults |> List.filter (fun r -> r.Passed = Some false) |> List.length
-            match status with
-            | Done _ -> $"[green]✅ {passed}/{total}[/]"
-            | Running _ when failed > 0 -> $"[yellow]⚠️ {passed}/{total}[/]"
-            | Running _ when passed > 0 -> $"[yellow]✅ {passed}/{total}[/]"
-            | _ -> $"[dim]{total} items[/]"
         let timeStr = 
             match status, timing.EndTime with
             | Done _, Some endT -> 
                 let mins = (endT - timing.StartTime).TotalMinutes
-                if mins >= 60.0 then $"[green]{mins / 60.0:F1}h[/]"
-                else $"[green]{int mins}min[/]"
+                if mins >= 60.0 then $"[green]{mins / 60.0:F1}h[/]" else $"[green]{int mins}m[/]"
             | Running _, _ -> 
                 let mins = (now - timing.StartTime).TotalMinutes
-                if mins >= 60.0 then $"[yellow]{mins / 60.0:F1}h[/]"
-                else $"[yellow]{int mins}min[/]"
+                if mins >= 60.0 then $"[yellow]{mins / 60.0:F1}h[/]" else $"[yellow]{int mins}m[/]"
             | _ -> "[dim]-[/]"
         
-        // Verifier columns - dynamically built from discovered verifiers (show status + iteration count)
+        // Verifier columns - compact icons
         let verifierIcon name =
             match timing.VerifierResults.TryFind name with
-            | Some (Passed iters) -> if iters > 1 then $"[green]✅{iters}[/]" else "[green]✅[/]"
-            | Some (Failed iters) -> if iters > 1 then $"[red]❌{iters}[/]" else "[red]❌[/]"
+            | Some (Passed iters) -> if iters > 1 then $"[green]✓{iters}[/]" else "[green]✓[/]"
+            | Some (Failed iters) -> if iters > 1 then $"[red]✗{iters}[/]" else "[red]✗[/]"
             | Some NotStarted | None -> "[dim]○[/]"
         
-        // Build row with dynamic verifier columns
         let verifierCells = verifierNames |> List.map verifierIcon
-        let allCells = [string item.Id; escapeMarkup item.Name; statusStr; dodStr; iterStr] @ verifierCells @ [timeStr]
+        let allCells = [string item.Id; escapeMarkup shortName; statusStr; iterStr; timeStr] @ verifierCells
         t.AddRow(allCells |> Array.ofList) |> ignore
     
-    // Build final verification mini table (sprint-agnostic, shown separately)
+    // Current task detail panel - shows DoD status and last failure reason
+    let currentTaskPanel : IRenderable =
+        match currentItem with
+        | Some (item, Running (phase, iter), timing) ->
+            let dodItems = 
+                if timing.LastDoDResults.Length > 0 then
+                    timing.LastDoDResults |> List.map (fun r ->
+                        let icon = match r.Passed with Some true -> "[green]✓[/]" | Some false -> "[red]✗[/]" | None -> "[dim]○[/]"
+                        let criterion = if r.Criterion.Length > 60 then r.Criterion.Substring(0, 57) + "..." else r.Criterion
+                        $"{icon} {escapeMarkup criterion}")
+                else
+                    item.DoD |> List.map (fun c -> 
+                        let criterion = if c.Length > 60 then c.Substring(0, 57) + "..." else c
+                        $"[dim]○[/] {escapeMarkup criterion}")
+            let dodSection = dodItems |> String.concat "\n"
+            let lastFailure = 
+                match timing.IterationReasons |> List.tryLast with
+                | Some (i, r) -> 
+                    let reason = if r.Length > 80 then r.Substring(0, 77) + "..." else r
+                    $"\n[red]Last issue (iter {i}):[/] {escapeMarkup reason}"
+                | None -> ""
+            Panel(Markup($"[bold]{escapeMarkup item.Name}[/]\n{dodSection}{lastFailure}"))
+                .Header($"[cyan]Current: Sprint {item.Id} (iter {iter})[/]")
+                .Expand()
+            :> IRenderable
+        | _ when not (String.IsNullOrEmpty state.PlanOverview) && state.CurrentPhase = "Planning" ->
+            Panel(Markup($"[dim]{escapeMarkup state.PlanOverview}[/]")).Header("[cyan]Planning...[/]").Expand() :> IRenderable
+        | _ -> 
+            Text("") :> IRenderable
+    
+    // Last verifier result - single line summary
+    let lastVerifierLine : IRenderable =
+        match state.LastVerifierLog with
+        | Some (name, passed, summary) ->
+            let icon = if passed then "[green]✓[/]" else "[red]✗[/]"
+            let summaryText = if summary.Length > 70 then summary.Substring(0, 67) + "..." else summary
+            Markup($"{icon} [bold]{escapeMarkup name}[/]: {escapeMarkup summaryText}") :> IRenderable
+        | None -> Text("") :> IRenderable
+    
+    // Final verification table - compact, only shown when there are results
     let finalVerificationPanel : IRenderable =
         if state.FinalVerifierResults.IsEmpty then
             Text("") :> IRenderable
         else
             let ft = Table().Border(TableBorder.Simple).Expand()
-            ft.AddColumn("Verifier") |> ignore
-            ft.AddColumn("Status") |> ignore
-            ft.AddColumn("Summary") |> ignore
+            ft.AddColumn(TableColumn("Final Verifier").Width(15)) |> ignore
+            ft.AddColumn(TableColumn("").Width(8)) |> ignore
+            ft.AddColumn(TableColumn("Summary").NoWrap()) |> ignore
             for name in verifierNames do
                 let status = 
                     match state.FinalVerifierResults.TryFind name with
-                    | Some (Passed i) -> if i > 1 then $"[green]✅ PASSED ({i})[/]" else "[green]✅ PASSED[/]"
-                    | Some (Failed i) -> if i > 1 then $"[red]❌ FAILED ({i})[/]" else "[red]❌ FAILED[/]"
-                    | Some NotStarted | None -> "[dim]○ Pending[/]"
+                    | Some (Passed i) -> if i > 1 then $"[green]✓({i})[/]" else "[green]✓ Pass[/]"
+                    | Some (Failed i) -> if i > 1 then $"[red]✗({i})[/]" else "[red]✗ Fail[/]"
+                    | Some NotStarted | None -> "[dim]○[/]"
                 let summary = 
                     state.FinalVerifierSummaries.TryFind name 
                     |> Option.defaultValue "" 
+                    |> fun s -> if s.Length > 50 then s.Substring(0, 47) + "..." else s
                     |> escapeMarkup
-                let filePath = getVerifierFilePath name
-                let linkedName = $"[link=file://{filePath}]{name}[/]"
-                ft.AddRow([| Markup(linkedName) :> IRenderable; Markup(status) :> IRenderable; Markup(summary) :> IRenderable |]) |> ignore
-            Panel(ft).Header("[bold cyan]Final Verification (Complete Feature)[/]").Expand() :> IRenderable
+                ft.AddRow([| Markup(escapeMarkup name) :> IRenderable; Markup(status) :> IRenderable; Markup(summary) :> IRenderable |]) |> ignore
+            ft :> IRenderable
     
-    // Build CI checks panel (if CI monitoring is active)
-    let ciPanel : IRenderable =
-        match state.CIStatus with
+    // Error display - if there's an error
+    let errorLine : IRenderable =
+        match state.ErrorLog with
+        | Some err -> 
+            let errText = if err.Length > 100 then err.Substring(0, 97) + "..." else err
+            Markup($"[red bold]Error:[/] {escapeMarkup errText}") :> IRenderable
         | None -> Text("") :> IRenderable
-        | Some (prUrl, status) ->
-            let statusStr = 
-                match status with
-                | None -> "[yellow]⏳ Pending[/]"
-                | Some true -> "[green]✅ Passed[/]"
-                | Some false -> "[red]❌ Failed[/]"
-            let content = $"PR: [link={prUrl}]{prUrl}[/]\nStatus: {statusStr}"
-            Panel(Markup(content)).Header("[bold]CI Checks[/]").Expand() :> IRenderable
     
-    // Current sprint detail panel - shows description and DoD with status
-    let summaryPanel =
-        match currentItem with
-        | Some (item, Running (phase, iter), timing) ->
-            let desc = if item.Description.Length > 150 then item.Description.Substring(0, 147) + "..." else item.Description
-            // Build DoD list with checkmarks/crosses for iter > 1
-            let dodLines = 
-                if iter > 1 && timing.LastDoDResults.Length > 0 then
-                    timing.LastDoDResults |> List.map (fun r ->
-                        let icon = match r.Passed with Some true -> "✅" | Some false -> "❌" | None -> "⬜"
-                        $"  {icon} {escapeMarkup r.Criterion}"
-                    ) |> String.concat "\n"
-                else
-                    item.DoD |> List.map (fun c -> $"  ⬜ {escapeMarkup c}") |> String.concat "\n"
-            let lastReasonDetail = 
-                match timing.IterationReasons |> List.tryLast with
-                | Some (i, r) -> $"\n\n[red]Iteration {i} issue:[/] {escapeMarkup r}"
-                | None -> ""
-            let content = $"[bold]{escapeMarkup item.Name}[/]\n{escapeMarkup desc}\n\n[cyan]Definition of Done:[/]\n{dodLines}{lastReasonDetail}"
-            Panel(Markup(content))
-                .Header($"[cyan]Sprint {item.Id} - {phaseName phase} (iter {iter})[/]")
-                .Expand()
-            :> IRenderable
-        | _ -> Text("") :> IRenderable
+    // Message line
+    let messageLine : IRenderable =
+        if String.IsNullOrEmpty state.Message then Text("") :> IRenderable
+        else Markup(state.Message) :> IRenderable
     
+    // Build compact single-screen layout
     let rows = [
-        yield Rule($"[yellow bold]RALPH[/] - {elapsedStr}").RuleStyle("yellow") :> IRenderable
-        yield Markup($"[dim]Backlog:[/] [link=file://{backlogFile}]{backlogFile}[/]") :> IRenderable
-        yield progressBar :> IRenderable
-        yield Text("") :> IRenderable
-        yield statusPanel :> IRenderable
-        yield summaryPanel
-        yield Panel(t).Header("[bold]Product Backlog[/]").Expand() :> IRenderable
-        yield finalVerificationPanel
-        yield ciPanel
-        yield Markup(state.Message) :> IRenderable
+        yield Rule("").RuleStyle("dim") :> IRenderable
+        yield headerLine :> IRenderable
+        yield activityLine :> IRenderable
+        yield Rule("").RuleStyle("dim") :> IRenderable
+        if state.Backlog.Length > 0 then
+            yield t :> IRenderable
+        yield currentTaskPanel
+        yield lastVerifierLine
+        if not state.FinalVerifierResults.IsEmpty then
+            yield Rule("[cyan]Final Verification[/]").RuleStyle("cyan") :> IRenderable
+            yield finalVerificationPanel
+        yield errorLine
+        yield messageLine
     ]
     
     Rows(rows)
@@ -772,11 +788,11 @@ let setMessage msg =
 // AGENT EXECUTION
 // ============================================================================
 
-let runAgent (prompt: string) (_title: string) (_showWindow: bool) = async {
+let runAgent (prompt: string) (title: string) (_showWindow: bool) = async {
     Directory.CreateDirectory ralphDir |> ignore
     
-    // Mark agent as running
-    state <- { state with AgentStartTime = Some DateTime.Now }
+    // Mark agent as running with task info
+    state <- { state with AgentStartTime = Some DateTime.Now; CurrentAgentTask = title }
     liveCtx |> Option.iter (fun ctx -> ctx.UpdateTarget(buildDashboard()); ctx.Refresh())
     
     // Run copilot via Fli
@@ -788,7 +804,7 @@ let runAgent (prompt: string) (_title: string) (_showWindow: bool) = async {
         }
         |> Command.execute
     
-    state <- { state with AgentStartTime = None }
+    state <- { state with AgentStartTime = None; CurrentAgentTask = "" }
     liveCtx |> Option.iter (fun ctx -> ctx.UpdateTarget(buildDashboard()); ctx.Refresh())
     
     return result.Text |> Option.defaultValue ""
@@ -834,19 +850,19 @@ let verifyStage showWin subtaskId (verifierName: VerifierName) (sprintItem: Back
     let prompt = getVerifierPrompt verifierName + sprintContext + verifierSuffix
     let! out = runAgent prompt $"Verify-{verifierName}" showWin
     
-    // Extract and display management summary
+    // Extract management summary
     let summary = parseManagementSummary out |> Option.defaultValue "(no summary)"
     
     if hasSignal "VERIFY_PASSED" out || hasSignal "VERIFY PASSED" out then
-        AnsiConsole.MarkupLine $"[green]✓ {verifierName}:[/] {escapeMarkup summary}"
+        state <- { state with LastVerifierLog = Some (verifierName, true, summary) }
         setMessage $"[green]✓ {verifierName} passed[/]"
         return Ok ()
     elif hasSignal "VERIFY_FAILED" out || hasSignal "VERIFY FAILED" out then
-        AnsiConsole.MarkupLine $"[red]✗ {verifierName}:[/] {escapeMarkup summary}"
+        state <- { state with LastVerifierLog = Some (verifierName, false, summary) }
         setMessage $"[red]✗ {verifierName} failed[/]"
         return Error $"{verifierName}: {summary}"
     else
-        AnsiConsole.MarkupLine $"[yellow]⚠ {verifierName}:[/] {escapeMarkup summary}"
+        state <- { state with LastVerifierLog = Some (verifierName, false, summary) }
         setMessage $"[yellow]{verifierName} inconclusive[/]"
         return Error $"{verifierName} verification did not output VERIFY_PASSED or VERIFY_FAILED"
 }
@@ -882,8 +898,8 @@ let runAllVerifiers showWin subtaskId (sprintItem: BacklogItem) = async {
 }
 
 let showPlan plan =
-    AnsiConsole.MarkupLine $"[bold]Overview:[/] {escapeMarkup plan.Overview}"
-    AnsiConsole.MarkupLine $"[dim]Product Backlog: {plan.Subtasks.Length} sprints[/]\n"
+    state <- { state with PlanOverview = $"{plan.Overview} ({plan.Subtasks.Length} sprints)" }
+    liveCtx |> Option.iter (fun ctx -> ctx.Refresh())
 
 // ============================================================================
 // BACKLOG EXECUTION
@@ -980,7 +996,8 @@ let rec runAllBacklogItems items showWin = async {
 // ============================================================================
 
 let runFinalVerifiers showWin = async {
-    AnsiConsole.MarkupLine "[yellow]--- FINAL VERIFICATION - Complete Feature ---[/]"
+    state <- { state with CurrentPhase = "Final Verification" }
+    liveCtx |> Option.iter (fun ctx -> ctx.Refresh())
     
     // Discover verifiers from files
     let verifierNames = Verifiers.listAll ()
@@ -1002,23 +1019,26 @@ let runFinalVerifiers showWin = async {
         let prompt = Verifiers.getPrompt name + verifierSuffix
         let! out = runAgent prompt $"FinalVerify-{name}" showWin
         
-        // Extract and display management summary
+        // Extract management summary
         let summary = parseManagementSummary out |> Option.defaultValue "(no summary)"
         
         // Store summary for dashboard display
         state <- { state with FinalVerifierSummaries = state.FinalVerifierSummaries.Add(name, summary) }
         
-        // All verifiers use the same signal detection
+        // All verifiers use the same signal detection - update state instead of printing
         if hasSignal "VERIFY_PASSED" out || hasSignal "VERIFY PASSED" out then
-            AnsiConsole.MarkupLine $"[green]✓ Final {name}:[/] {escapeMarkup summary}"
-            state <- { state with FinalVerifierResults = state.FinalVerifierResults.Add(name, Passed (prevCount + 1)) }
+            state <- { state with 
+                        FinalVerifierResults = state.FinalVerifierResults.Add(name, Passed (prevCount + 1))
+                        LastVerifierLog = Some (name, true, summary) }
         elif hasSignal "VERIFY_FAILED" out || hasSignal "VERIFY FAILED" out then
-            AnsiConsole.MarkupLine $"[red]✗ Final {name}:[/] {escapeMarkup summary}"
-            state <- { state with FinalVerifierResults = state.FinalVerifierResults.Add(name, Failed (prevCount + 1)) }
+            state <- { state with 
+                        FinalVerifierResults = state.FinalVerifierResults.Add(name, Failed (prevCount + 1))
+                        LastVerifierLog = Some (name, false, summary) }
             allPassed <- false
         else
-            AnsiConsole.MarkupLine $"[yellow]⚠ Final {name}:[/] {escapeMarkup summary}"
-            state <- { state with FinalVerifierResults = state.FinalVerifierResults.Add(name, Failed (prevCount + 1)) }
+            state <- { state with 
+                        FinalVerifierResults = state.FinalVerifierResults.Add(name, Failed (prevCount + 1))
+                        LastVerifierLog = Some (name, false, summary) }
             allPassed <- false
         
         liveCtx |> Option.iter (fun ctx -> ctx.Refresh())
@@ -1053,7 +1073,8 @@ let rec finalChecksWithFixup showWin maxFixupSprints currentFixup = async {
     if passed then
         return true
     elif currentFixup >= maxFixupSprints then
-        AnsiConsole.MarkupLine $"[red]Final verification failed after {maxFixupSprints} fixup sprints[/]"
+        state <- { state with ErrorLog = Some $"Final verification failed after {maxFixupSprints} fixup sprints" }
+        liveCtx |> Option.iter (fun ctx -> ctx.Refresh())
         return false
     else
         // Get failed verifiers
@@ -1064,8 +1085,7 @@ let rec finalChecksWithFixup showWin maxFixupSprints currentFixup = async {
             |> List.map fst
         
         let failedNames = failed |> String.concat ", "
-        AnsiConsole.MarkupLine $"[yellow]--- FIXUP SPRINT #{currentFixup + 1} - Full implement/verify cycle ---[/]"
-        AnsiConsole.MarkupLine $"[yellow]Failed verifiers: {failedNames}[/]"
+        setMessage $"Fixup #{currentFixup + 1}: {failedNames}"
         
         // Create and run a proper fixup sprint through the full cycle
         let fixupItem = createFixupSprint failed (currentFixup + 1)
@@ -1083,7 +1103,8 @@ let rec finalChecksWithFixup showWin maxFixupSprints currentFixup = async {
             // Recurse to re-run final verification (counts are preserved and incremented)
             return! finalChecksWithFixup showWin maxFixupSprints (currentFixup + 1)
         | Error e ->
-            AnsiConsole.MarkupLine $"[red]Fixup sprint failed: {escapeMarkup e}[/]"
+            state <- { state with ErrorLog = Some $"Fixup sprint failed: {e}" }
+            liveCtx |> Option.iter (fun ctx -> ctx.Refresh())
             return false
 }
 
@@ -1109,6 +1130,11 @@ let runWithLive (plan: Plan) showWin (originalRequest: string) =
         FinalVerifierResults = Map.empty
         FinalVerifierSummaries = Map.empty
         CIStatus = None
+        CurrentPhase = "Executing"
+        CurrentAgentTask = ""
+        LastVerifierLog = None
+        PlanOverview = plan.Overview
+        ErrorLog = None
     }
     
     Directory.CreateDirectory ralphDir |> ignore
@@ -1132,27 +1158,27 @@ let runWithLive (plan: Plan) showWin (originalRequest: string) =
             | Ok () ->
                 let passed = finalChecks showWin
                 if passed then
-                    setMessage "[green bold]WORKFLOW COMPLETE[/]"
+                    state <- { state with CurrentPhase = "Complete"; Message = "[green bold]WORKFLOW COMPLETE[/]" }
                 else
-                    setMessage "[red bold]Completed but some checks failed[/]"
+                    state <- { state with CurrentPhase = "Complete"; Message = "[yellow]Completed with some issues[/]" }
             | Error e ->
-                setMessage $"[red]{escapeMarkup e}[/]"
+                state <- { state with ErrorLog = Some e }
         with ex ->
             result <- Error ex.Message
-            setMessage $"[red]Exception: {escapeMarkup ex.Message}[/]"
+            state <- { state with ErrorLog = Some ex.Message }
         finished <- true
     )
     
     // Run the live display with refresh loop
     AnsiConsole.Live(buildDashboard())
-        .AutoClear(false)
+        .AutoClear(true)
         .Overflow(VerticalOverflow.Ellipsis)
         .Start(fun ctx ->
             liveCtx <- Some ctx
             while not finished do
                 ctx.UpdateTarget(buildDashboard())
                 ctx.Refresh()
-                Thread.Sleep(1000)
+                Thread.Sleep(500)
             ctx.UpdateTarget(buildDashboard())
             ctx.Refresh() // Final refresh
             liveCtx <- None
@@ -1160,24 +1186,21 @@ let runWithLive (plan: Plan) showWin (originalRequest: string) =
     
     workTask.Wait() // Ensure task completes
     
-    // Print clean completion message after Live display ends
-    AnsiConsole.WriteLine()
+    // Brief completion message
     AnsiConsole.WriteLine()
     match result with
     | Ok () -> 
-        AnsiConsole.MarkupLine "[green bold]✓ Workflow complete![/]"
-        AnsiConsole.WriteLine()
         AnsiConsole.Write(FigletText("COMPLETE").Color(Color.Green))
     | Error _ -> 
-        AnsiConsole.MarkupLine "[red bold]✗ Workflow finished with errors[/]"
+        AnsiConsole.Write(FigletText("FAILED").Color(Color.Red))
     
     result
 
 // Arbiter: Invoked when normal execution fails, attempts recovery with full context
 // Returns Result<Plan, string> - caller decides what to do with the plan
 let invokeArbiter (originalRequest: string) (errorReason: string) (failedSprintId: int option) (showWin: bool) : Result<Plan, string> =
-    AnsiConsole.MarkupLine "[yellow]--- ARBITER INVOKED ---[/]"
-    AnsiConsole.MarkupLine $"[dim]Error: {escapeMarkup errorReason}[/]"
+    state <- { state with CurrentPhase = "Arbiter"; Message = "Invoking arbiter for recovery..." }
+    liveCtx |> Option.iter (fun ctx -> ctx.Refresh())
     
     // Run arbiter agent with Prompts.arbiter and 'Arbiter' name
     let arbiterPrompt = Prompts.arbiter originalRequest errorReason failedSprintId 0
@@ -1189,27 +1212,28 @@ let invokeArbiter (originalRequest: string) (errorReason: string) (failedSprintI
         // Log arbiter decision on success
         let timestamp = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss")
         let sprintStr = match failedSprintId with Some id -> string id | None -> "Planning"
-        // Arbiter log removed - no separate file
-        AnsiConsole.MarkupLine "[green]Arbiter produced recovery plan.[/]"
+        setMessage "[green]Arbiter produced recovery plan[/]"
         Ok plan
     | None ->
-        AnsiConsole.MarkupLine $"[red]Arbiter failed: BACKLOG.md not updated or invalid[/]"
+        state <- { state with ErrorLog = Some "Arbiter failed: BACKLOG.md not updated or invalid" }
+        liveCtx |> Option.iter (fun ctx -> ctx.Refresh())
         Error "Arbiter could not produce valid plan"
 
 // Helper that wraps invokeArbiter with retry logic and execution for run loop integration
 let rec invokeArbiterWithRetry (originalRequest: string) (errorReason: string) (sprintId: int option) showWin arbiterCount =
     if arbiterCount > 3 then
-        AnsiConsole.MarkupLine "[red]Arbiter failed to recover after 3 attempts. Stopping.[/]"
+        state <- { state with ErrorLog = Some "Arbiter failed to recover after 3 attempts" }
+        liveCtx |> Option.iter (fun ctx -> ctx.Refresh())
         1
     else
-        AnsiConsole.MarkupLine $"[dim]Arbiter attempt {arbiterCount + 1}/3[/]"
+        setMessage $"Arbiter attempt {arbiterCount + 1}/3..."
         match invokeArbiter originalRequest errorReason sprintId showWin with
         | Ok plan ->
             showPlan plan
             match runWithLive plan showWin originalRequest with
             | Ok () -> 0
             | Error e when e.StartsWith("REPLAN_REQUESTED") ->
-                AnsiConsole.MarkupLine "[yellow]Recovery requested replanning.[/]"
+                setMessage "Recovery requested replanning"
                 invokeArbiterWithRetry originalRequest e None showWin (arbiterCount + 1)
             | Error e ->
                 invokeArbiterWithRetry originalRequest e None showWin (arbiterCount + 1)
@@ -1224,38 +1248,50 @@ let rec run request showWin autoApprove replanCount arbiterCount =
         AnsiConsole.MarkupLine "[red]Too many replans (5). Stopping.[/]"
         1
     else
-        AnsiConsole.Clear()
-        AnsiConsole.Write(FigletText("RALPH").Color(Color.Yellow))
+        // Initialize state for planning phase
+        state <- { 
+            Backlog = []; StartTime = DateTime.Now; Message = "Planning..."
+            AgentStartTime = None; TotalEstimatedIterations = 0; CompletedIterations = 0
+            FinalVerifierResults = Map.empty; FinalVerifierSummaries = Map.empty; CIStatus = None
+            CurrentPhase = "Planning"; CurrentAgentTask = "Architect"
+            LastVerifierLog = None; PlanOverview = request; ErrorLog = None
+        }
+        
         Directory.CreateDirectory ralphDir |> ignore
         
-        if replanCount > 0 then
-            AnsiConsole.MarkupLine $"[yellow]REPLANNING (attempt {replanCount + 1})...[/]\n"
+        let mutable planResult: Plan option = None
+        let mutable planFinished = false
         
-        // Run planning with a spinner
-        AnsiConsole.Status()
-            .Spinner(Spinner.Known.Dots)
-            .Start("Planning...", fun ctx ->
-                // Start planning in background
-                let planTask = Task.Run(fun () ->
-                    runAgent (Prompts.architect request) "Architect" showWin |> Async.RunSynchronously
-                )
-                // Update status while waiting
-                while not planTask.IsCompleted do
-                    match state.AgentStartTime with
-                    | Some startTime ->
-                        let elapsed = (DateTime.Now - startTime).ToString("mm\\:ss")
-                        ctx.Status <- $"Planning... Agent running {elapsed}"
-                    | None -> 
-                        ctx.Status <- "Planning... Starting agent..."
-                    Thread.Sleep(1000)
-                planTask.Result |> ignore  // We don't need the output, LLM writes directly to BACKLOG.md
+        // Run planning phase with Live display
+        let planTask = Task.Run(fun () ->
+            try
+                let _ = runAgent (Prompts.architect request) "Architect" showWin |> Async.RunSynchronously
+                planResult <- BacklogFile.readAsPlan()
+            with ex ->
+                state <- { state with ErrorLog = Some ex.Message }
+            planFinished <- true
+        )
+        
+        // Run the live display during planning
+        AnsiConsole.Live(buildDashboard())
+            .AutoClear(true)
+            .Overflow(VerticalOverflow.Ellipsis)
+            .Start(fun ctx ->
+                liveCtx <- Some ctx
+                while not planFinished do
+                    ctx.UpdateTarget(buildDashboard())
+                    ctx.Refresh()
+                    Thread.Sleep(500)
+                ctx.UpdateTarget(buildDashboard())
+                ctx.Refresh()
+                liveCtx <- None
             )
         
-        // Read plan from BACKLOG.md (LLM created/updated it directly)
-        match BacklogFile.readAsPlan() with
+        planTask.Wait()
+        
+        match planResult with
         | None -> 
-            AnsiConsole.MarkupLine $"[red]Planning failed: BACKLOG.md not found or invalid[/]"
-            AnsiConsole.MarkupLine $"[dim]Arbiter attempt {arbiterCount + 1}/3[/]"
+            state <- { state with ErrorLog = Some "Planning failed: BACKLOG.md not found or invalid" }
             match invokeArbiter request "Planning failed: BACKLOG.md not created or invalid" None showWin with
             | Ok newPlan ->
                 showPlan newPlan
@@ -1270,11 +1306,8 @@ let rec run request showWin autoApprove replanCount arbiterCount =
                 match runWithLive plan showWin request with
                 | Ok () -> 0
                 | Error e when e.StartsWith("REPLAN_REQUESTED") ->
-                    AnsiConsole.MarkupLine $"[yellow]Subtask requested replanning.[/]"
-                    AnsiConsole.MarkupLine $"[dim]{escapeMarkup e}[/]"
                     run request showWin autoApprove (replanCount + 1) 0  // Reset arbiterCount on explicit replan
                 | Error e -> 
-                    AnsiConsole.MarkupLine $"[dim]Arbiter attempt {arbiterCount + 1}/3[/]"
                     match invokeArbiter request e None showWin with
                     | Ok newPlan ->
                         showPlan newPlan
@@ -1353,7 +1386,7 @@ module CIMonitor =
         let mutable waited = 0
         let intervalMinutes = 30
         
-        AnsiConsole.MarkupLine "[cyan]Starting CI monitoring...[/]"
+        setMessage "Starting CI monitoring..."
         
         while status = Pending && waited < maxWaitMinutes do
             let! s = checkBuildStatus showWin
@@ -1361,13 +1394,11 @@ module CIMonitor =
             
             match status with
             | Success ->
-                AnsiConsole.MarkupLine "[green]✓ CI passed![/]"
+                setMessage "[green]✓ CI passed![/]"
             | Failed failures ->
-                AnsiConsole.MarkupLine $"[red]✗ CI failed with {failures.Length} unique failures[/]"
-                for f in failures do
-                    AnsiConsole.MarkupLine $"[red]  - {escapeMarkup f}[/]"
+                setMessage $"[red]✗ CI failed with {failures.Length} unique failures[/]"
             | Pending ->
-                AnsiConsole.MarkupLine $"[yellow]CI still pending. Waiting {intervalMinutes} minutes (total waited: {waited} min)...[/]"
+                setMessage $"[yellow]CI pending... waiting {intervalMinutes}min (total: {waited}min)[/]"
                 Thread.Sleep(intervalMinutes * 60 * 1000)
                 waited <- waited + intervalMinutes
         
@@ -1381,7 +1412,7 @@ module CIMonitor =
         
         while not (status = Success) && iteration < maxIterations do
             iteration <- iteration + 1
-            AnsiConsole.MarkupLine $"[cyan]CI Fixup iteration {iteration}/{maxIterations}[/]"
+            setMessage $"CI Fixup iteration {iteration}/{maxIterations}"
             
             // Monitor CI
             let! s = monitorCI showWin 180  // Max 3 hours wait
@@ -1390,7 +1421,7 @@ module CIMonitor =
             match status with
             | Success -> ()
             | Pending -> 
-                AnsiConsole.MarkupLine "[yellow]CI still pending after max wait time[/]"
+                setMessage "[yellow]CI still pending after max wait[/]"
             | Failed failures ->
                 if iteration < maxIterations then
                     // Create a fixup task
@@ -1417,38 +1448,32 @@ module CIMonitor =
                     
                     // Push the fixes
                     match runGitPush() with
-                    | Ok _ -> AnsiConsole.MarkupLine "[green]Pushed fixes[/]"
-                    | Error e -> AnsiConsole.MarkupLine $"[red]Push failed: {escapeMarkup e}[/]"
+                    | Ok _ -> setMessage "[green]Pushed fixes[/]"
+                    | Error e -> setMessage $"[red]Push failed[/]"
         
         return status
     }
 
 let runInteractive () = 
-    AnsiConsole.Clear()
     AnsiConsole.Write(FigletText("RALPH").Color(Color.Yellow))
     let showWin = AnsiConsole.Confirm("Show agent windows? ", true)
-    AnsiConsole.MarkupLine "\n[cyan]What do you want to build?[/]"
-    let request = AnsiConsole.Ask<string> "[green]>[/] "
+    let request = AnsiConsole.Ask<string> "[green]Request:[/] "
     run request showWin false 0 0
 
 let runWithPush request showWin auto =
     let result = run request showWin auto 0 0
     if result = 0 then
-        AnsiConsole.MarkupLine "[cyan]--push enabled: Pushing changes and monitoring CI...[/]"
+        setMessage "[cyan]Pushing changes and monitoring CI...[/]"
         match CIMonitor.runGitPush() with
         | Ok _ ->
-            AnsiConsole.MarkupLine "[green]✓ Pushed successfully[/]"
+            setMessage "[green]✓ Pushed successfully[/]"
             let status = CIMonitor.runCIFixupLoop request showWin |> Async.RunSynchronously
             match status with
             | CIMonitor.Success -> 0
-            | CIMonitor.Pending -> 
-                AnsiConsole.MarkupLine "[yellow]CI still pending[/]"
-                0
-            | CIMonitor.Failed _ ->
-                AnsiConsole.MarkupLine "[red]CI failed after all retry attempts[/]"
-                1
+            | CIMonitor.Pending -> 0
+            | CIMonitor.Failed _ -> 1
         | Error e ->
-            AnsiConsole.MarkupLine $"[red]Push failed: {escapeMarkup e}[/]"
+            state <- { state with ErrorLog = Some $"Push failed: {e}" }
             1
     else result
 
