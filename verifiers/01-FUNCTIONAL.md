@@ -1,13 +1,13 @@
-Verify THIS SPRINT's functionality works - happy paths, no regressions, correct diagnostics.
+Verify functionality works - happy paths, no regressions, correct diagnostics.
 
 --- FUNCTIONAL VERIFIER - F# COMPILER CODEBASE ---
 
 PREREQUISITE: Build and tests MUST pass. If they don't, fail immediately.
 
-Verify THIS SPRINT's functionality works. NOT the entire feature.
+Verify functionality per your VERIFICATION SCOPE (provided below).
 
 YOUR FOCUS:
-- THIS sprint's functionality per BACKLOG.md
+- Functionality per the sprint file or overall request (see SCOPE below)
 - Scenarios work correctly, address what was asked for, do so correctly
 - No regressions in existing compiler behavior
 - Correct error messages and diagnostics

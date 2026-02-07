@@ -1,5 +1,16 @@
 #!/usr/bin/env dotnet fsi
 
+// Ralph.fsx - Main orchestration script
+// Loads satellite modules and provides agent execution + state management
+
+// Load satellite files in dependency order
+#load "Utils.fsx"
+#load "TypeDefinitions.fsx"
+#load "Prompting.fsx"
+#load "GUI.fsx"
+#load "CI_Retries.fsx"
+
+// Additional dependencies not in satellites
 #r "nuget: Fli"
 #r "nuget: Spectre.Console"
 
@@ -8,788 +19,69 @@ open System.IO
 open System.Text.RegularExpressions
 open System.Threading
 open System.Threading.Tasks
-open System.Xml.Linq
 open Fli
 open Spectre.Console
 open Spectre.Console.Rendering
 
-module Config =
-    let Model = "claude-opus-4.6"
-    let MaxIterations = 50
-    // Use script location for verifiers, working directory for ralph output
-    let scriptDir = __SOURCE_DIRECTORY__
-    let ralphDir = Path.Combine(Directory.GetCurrentDirectory(), ".tools", "ralph")
-    let backlogFile = Path.Combine(ralphDir, "BACKLOG.md")  // Single unified backlog file
-    let verifiersDir = Path.Combine(scriptDir, "verifiers")  // Verifier prompts as .md files (relative to script)
-
-module XmlHelpers =
-    // Token-efficient XML helpers
-    // - Attributes for fixed/known-size data
-    // - Direct text content for free-form data (no wrapper elements)
-    // - Element names match domain concepts (e.g. <Functional> not <Verifier step="Functional">)
-    /// Core XML element builder: xe "name" [attrs] [children] "innerText"
-    /// All parameters optional via shortcuts below
-    let xe (name: string) (attrs: (string * string) list) (children: XElement list) (text: string) : XElement =
-        let el = XElement(XName.Get name)
-        for (k, v) in attrs do el.Add(XAttribute(XName.Get k, v))
-        for c in children do el.Add(c)
-        if not (String.IsNullOrEmpty text) then el.Add(text)
-        el
-
-    // Shortcuts - any subset of (attrs, children, text)
-    let x   name                        = xe name [] [] ""          // <name/>
-
-    let xt  name text                   = xe name [] [] text        // <name>text</name>
-    let xc  name children               = xe name [] children ""    // <name><child/></name>
-    let xat name attrs text             = xe name attrs [] text     // <name attr="val">text</name>
-    let xac name attrs children         = xe name attrs children "" // <name attr="val"><child/></name>
-
-    // xe is the full form: xe name attrs children text
-
-    // Signal detection: match signal NOT inside quotes (avoids false positives from LLM quoting signals)
-    let hasSignal (signal: string) (text: string) =
-        let pattern = sprintf @"(?<![""'`])%s(?![""'`])" (Regex.Escape signal)
-        Regex.IsMatch(text, pattern, RegexOptions.IgnoreCase)
-
-open Config
+// Import from satellite modules
+open Utils
 open XmlHelpers
-
-module TypeDefinitions =
-    // DoD = Definition of Done - each item is a technically executable criterion
-    type DoDResult = { Criterion: string; Passed: bool option }  // None = not yet evaluated
-    type BacklogItem = { 
-        Id: int
-        Name: string           // Short name for table display
-        Description: string    // Robust description from planner
-        DoD: string list       // Definition of Done - list of executable criteria
-    }
-    type Plan = { Overview: string; Subtasks: BacklogItem list }
-    // Phase is just Implement - verifiers handle all validation
-    type Phase = Implement
-
-    // Verifier names are now strings discovered from verifiers/*.md files
-    // No hardcoded enum - fully file-driven
-    type VerifierName = string
-    // Track status AND iteration count for each verifier
-    type VerifierStatus = NotStarted | Passed of iterations: int | Failed of iterations: int
-
-    // Track full history of an iteration for retry context
-    type IterationRecord = {
-        Iteration: int
-        AgentOutput: string
-        VerifierResults: (VerifierName * bool * string) list
-    }
-
-    type BacklogItemTiming = {
-        StartTime: DateTime
-        EndTime: DateTime option
-        IterationReasons: (int * string) list  // (iteration, reason for retry)
-        Summary: string option
-        LastDoDResults: DoDResult list         // DoD results from last iteration
-        VerifierResults: Map<VerifierName, VerifierStatus>  // Track each verifier
-        IterationHistory: IterationRecord list  // Full history for retry context
-    }
-
-    type BacklogStatus = 
-        | Todo
-        | Running of phase: Phase * iteration: int
-        | Done of iterations: int
-
-    type State = {
-        Backlog: (BacklogItem * BacklogStatus * BacklogItemTiming) list
-        StartTime: DateTime
-        Message: string
-        AgentStartTime: DateTime option  // When agent started (None = idle)
-        TotalEstimatedIterations: int  // For progress calculation
-        CompletedIterations: int
-        FinalVerifierResults: Map<VerifierName, VerifierStatus>  // Final verification after all sprints
-        FinalVerifierSummaries: Map<VerifierName, string>  // Management summaries from final verifiers
-        CIStatus: (string * bool option) option  // (PR URL, passed: None=pending, Some true=passed, Some false=failed)
-        // New fields for integrated UI:
-        CurrentPhase: string  // "Planning", "Executing", "Final Verification", "Complete"
-        CurrentAgentTask: string  // What agent is currently doing
-        LastVerifierLog: (string * bool * string) option  // (verifier name, passed, summary)
-        PlanOverview: string  // Brief overview of the plan
-        ErrorLog: string option  // Last error if any
-    }
-
-    let emptyTiming = { 
-        StartTime = DateTime.MinValue; EndTime = None; IterationReasons = []; Summary = None; LastDoDResults = []
-        VerifierResults = Map.empty; IterationHistory = []
-    }
-
 open TypeDefinitions
+open Prompting
+open GUI
+open CI_Retries
 
+// ============================================================================
+// MUTABLE STATE
+// ============================================================================
 
-let mutable state: State = { 
-        Backlog = []; StartTime = DateTime.Now; Message = ""; AgentStartTime = None
-        TotalEstimatedIterations = 0; CompletedIterations = 0
-        FinalVerifierResults = Map.empty; FinalVerifierSummaries = Map.empty; CIStatus = None
-        CurrentPhase = "Initializing"; CurrentAgentTask = ""; LastVerifierLog = None
-        PlanOverview = ""; ErrorLog = None
-    }
+let mutable state: State = emptyState
 let mutable liveCtx: LiveDisplayContext option = None
 
-// Verifier file system - verifiers are discovered from verifiers/*.md files
-// File name (without extension) = verifier name
-// First line = basic role description (for other agents to know what this verifier does)
-// Rest = full prompt for the verifier
-// NO CACHING - always read fresh from disk for live editing
-// Ordering: files with numeric prefix (e.g., "01-FUNCTIONAL.md") are sorted by prefix
-//           the prefix is stripped from the display name
-module Verifiers =
-    /// Parse filename to extract order and display name
-    /// "01-FUNCTIONAL" -> (1, "FUNCTIONAL"), "PERF" -> (999, "PERF")
-    let private parseFileName (name: string) : int * string =
-        let m = Regex.Match(name, @"^(\d+)-(.+)$")
-        if m.Success then
-            (int m.Groups.[1].Value, m.Groups.[2].Value)
-        else
-            (999, name)  // No prefix = sort last among prefixed, but maintain relative order
-    
-    /// List all available verifier names from the verifiers directory, ordered by prefix
-    /// Returns display names (without numeric prefix)
-    let listAll () : VerifierName list =
-        if Directory.Exists(Config.verifiersDir) then
-            Directory.GetFiles(Config.verifiersDir, "*.md")
-            |> Array.map Path.GetFileNameWithoutExtension
-            |> Array.map (fun n -> (n, parseFileName n))
-            |> Array.sortBy (fun (_, (order, _)) -> order)
-            |> Array.map (fun (_, (_, displayName)) -> displayName)
-            |> Array.toList
-        else []
-    
-    /// Get the raw filename (with prefix) for a display name
-    let private getFileName (displayName: string) : string option =
-        if Directory.Exists(Config.verifiersDir) then
-            Directory.GetFiles(Config.verifiersDir, "*.md")
-            |> Array.map Path.GetFileNameWithoutExtension
-            |> Array.tryFind (fun n ->
-                let (_, name) = parseFileName n
-                name = displayName)
-        else None
-    
-    /// Read a verifier file and return (roleDescription, fullPrompt)
-    /// Always reads from disk - no caching for live editing
-    let private readFile (displayName: string) : (string * string) option =
-        match getFileName displayName with
-        | Some fileName ->
-            let filePath = Path.Combine(Config.verifiersDir, fileName + ".md")
-            if File.Exists(filePath) then
-                let content = File.ReadAllText(filePath)
-                let lines = content.Split([|'\n'; '\r'|], StringSplitOptions.RemoveEmptyEntries)
-                if lines.Length > 0 then
-                    Some (lines.[0].Trim(), content)
-                else None
-            else None
-        | None -> None
-    
-    /// Get the prompt for a verifier (reads from file each time)
-    let getPrompt (name: VerifierName) : string =
-        match readFile name with
-        | Some (_, prompt) -> prompt
-        | None -> $"Verifier {name}: No file found at verifiers/{name}.md. Please create one."
-    
-    /// Get the role description for a verifier (first line of file)
-    let getRoleDescription (name: VerifierName) : string =
-        match readFile name with
-        | Some (role, _) -> role
-        | None -> $"Verifier for {name}"
-    
+// ============================================================================
+// STATE UPDATE HELPERS (wrappers around StateOps for mutable state access)
+// ============================================================================
 
+let updateStatus sprintPath status msg =
+    StateOps.updateStatus &state liveCtx sprintPath status msg
 
-// XML prompt builder for subagents
-// Token-efficient format: attributes for fixed data, text for free-form
-module XmlPrompt =
-    type Role = Implementor
-    
-    type IterationHistory = {
-        Iteration: int
-        AgentOutput: string
-        VerifierResults: (VerifierName * bool * string) list  // verifier name, passed, feedback
-    }
-    
-    type SprintHistory = {
-        SprintId: int
-        SprintName: string
-        Summary: string
-    }
-    
-    type StepHistory = {
-        Iteration: int
-        Passed: bool
-        Summary: string
-    }
-    
-    let private roleElement (role: Role) =
-        match role with
-        | Implementor ->
-            xt "Implementor" "YOU ARE AN IMPLEMENTOR for F# compiler. Write code fulfilling sprint requirements. Follow DoD. Minimize breaking changes. Reuse existing helpers. Minimize allocations. Build and tests MUST pass."
-    
-    let private dodElement (dod: DoDResult list) =
-        let criteria = dod |> List.map (fun d ->
-            let elName = match d.Passed with Some true -> "pass" | Some false -> "fail" | None -> "todo"
-            xt elName d.Criterion)
-        xc "dod" criteria
-    
-    let private pastSprintsElement (sprints: SprintHistory list) =
-        if sprints.IsEmpty then x "first_sprint"
-        else
-            let items = sprints |> List.map (fun s ->
-                xat "s" [("id", string s.SprintId)] (s.SprintName + ": " + s.Summary))
-            xc "done" items
-    
-    let private pastStepsElement (steps: StepHistory list) =
-        if steps.IsEmpty then x "first_step"
-        else
-            let items = steps |> List.map (fun s ->
-                let suffix = if s.Passed then "" else " [FAILED]"
-                xat "impl" [("i", string s.Iteration)] (s.Summary + suffix))
-            xc "steps" items
-    
-    let private iterationHistoryElement (history: IterationHistory list) =
-        if history.IsEmpty then None
-        else
-            let items = 
-                history |> List.collect (fun h ->
-                    let verifierPart = 
-                        h.VerifierResults |> List.map (fun (verifierName, passed, feedback) ->
-                            // Use verifier name directly as element name (lowercase for XML)
-                            let elName = verifierName.ToLowerInvariant().Replace("-", "_")
-                            let suffix = if passed then "" else " [FAILED]"
-                            xt elName (feedback + suffix))
-                    let exchanges = [xt "out" h.AgentOutput] @ verifierPart
-                    [xac ("i" + string h.Iteration) [] exchanges]
-                )
-            Some (xc "history" items)
-    
-/// Build full XML prompt for an implementor
-    let build 
-        (role: Role) 
-        (currentSprint: BacklogItem)
-        (iteration: int)
-        (dod: DoDResult list)
-        (pastSprints: SprintHistory list)
-        (pastSteps: StepHistory list)
-        (iterationHistory: IterationHistory list) =
-        
-        xc "R" ([
-            xt "backlog" $".tools/ralph/BACKLOG.md - YOUR TASK: ### Task {currentSprint.Id} - {currentSprint.Name}"
-            xt "scope" "ONLY implement THIS task. Other tasks are NOT your concern."
-            roleElement role
-            // Sprint: impl as element name, attrs for id/iteration, text = "Name: Description"
-            xat "impl" [("id", string currentSprint.Id); ("i", string iteration)] 
-                (currentSprint.Name + ": " + currentSprint.Description)
-            dodElement dod
-            pastSprintsElement pastSprints
-            pastStepsElement pastSteps
-        ] @ 
-        (match iterationHistoryElement iterationHistory with Some el -> [el] | None -> []))
-    
-    let toPrompt (el: XElement) = el.ToString()
+let updateTiming sprintPath (f: BacklogItemTiming -> BacklogItemTiming) =
+    StateOps.updateTiming &state sprintPath f
 
-// Unified BACKLOG.md file - single source of truth
-module BacklogFile =
-    type BacklogData = {
-        Overview: string  // Original request + approach
-        Tasks: (BacklogItem * BacklogStatus * Map<VerifierName, VerifierStatus> * string option) list  // Last item is summary when done
-    }
-    
-    // Discover verifier names from files at runtime
-    let private getVerifierNames () = Verifiers.listAll ()
-    let private statusToIcon = function Passed _ -> "✅" | Failed _ -> "❌" | NotStarted -> "○"
-    let private iconToStatus = function "✅" -> Passed 1 | "❌" -> Failed 1 | _ -> NotStarted
-    
-    let write (data: BacklogData) =
-        let verifierNames = getVerifierNames ()
-        let sb = System.Text.StringBuilder()
-        sb.AppendLine("# BACKLOG") |> ignore
-        sb.AppendLine("") |> ignore
-        sb.AppendLine("## Overview") |> ignore
-        sb.AppendLine(data.Overview) |> ignore
-        sb.AppendLine("") |> ignore
-        sb.AppendLine("## Tasks") |> ignore
-        sb.AppendLine("") |> ignore
-        
-        // Table header - dynamically built from discovered verifiers
-        let stageHeaders = verifierNames |> String.concat " | "
-        let separators = verifierNames |> List.map (fun _ -> "---") |> String.concat " | "
-        sb.AppendLine($"| ID | Task | Status | {stageHeaders} |") |> ignore
-        sb.AppendLine($"| --- | --- | --- | {separators} |") |> ignore
-        
-        for (item, status, verifiers, _) in data.Tasks do
-            let statusStr = match status with Todo -> "○ Todo" | Running (p, i) -> $"⏳ {p} ({i})" | Done i -> $"✅ Done ({i})"
-            let verifierCells = verifierNames |> List.map (fun name -> 
-                match verifiers.TryFind name with Some v -> statusToIcon v | None -> "○") |> String.concat " | "
-            sb.AppendLine($"| {item.Id} | {item.Name} | {statusStr} | {verifierCells} |") |> ignore
-        
-        sb.AppendLine("") |> ignore
-        sb.AppendLine("## Task Details") |> ignore
-        sb.AppendLine("") |> ignore
-        
-        for (item, status, _, summary) in data.Tasks do
-            sb.AppendLine($"### Task {item.Id} - {item.Name}") |> ignore
-            sb.AppendLine("") |> ignore
-            sb.AppendLine(item.Description) |> ignore
-            sb.AppendLine("") |> ignore
-            sb.AppendLine("**Definition of Done:**") |> ignore
-            for dod in item.DoD do
-                sb.AppendLine($"- {dod}") |> ignore
-            match status, summary with
-            | Done _, Some s -> 
-                sb.AppendLine("") |> ignore
-                sb.AppendLine($"**Completed:** {s}") |> ignore
-            | _ -> ()
-            sb.AppendLine("") |> ignore
-        
-        Directory.CreateDirectory(ralphDir) |> ignore
-        // Create .bak backup before writing (safety net for fragile parsing logic)
-        if File.Exists(backlogFile) then
-            File.Copy(backlogFile, backlogFile + ".bak", overwrite = true)
-        File.WriteAllText(backlogFile, sb.ToString())
-    
-    let read () : BacklogData option =
-        if not (File.Exists backlogFile) then None
-        else
-            try
-                let content = File.ReadAllText(backlogFile)
-                let lines = content.Split('\n') |> Array.toList
-                
-                let getSection header =
-                    lines 
-                    |> List.skipWhile (fun l -> not (l.StartsWith($"## {header}")))
-                    |> List.skip 1
-                    |> List.takeWhile (fun l -> not (l.StartsWith("## ")))
-                    |> String.concat "\n"
-                    |> fun s -> s.Trim()
-                
-                let overview = getSection "Overview"
-                
-                // Parse task table
-                let tableLines = 
-                    lines 
-                    |> List.skipWhile (fun l -> not (l.StartsWith("| ID")))
-                    |> List.skip 2  // Skip header and separator
-                    |> List.takeWhile (fun l -> l.StartsWith("|"))
-                
-                // Parse task details for full info
-                let parseTaskDetail id =
-                    let detailLines = 
-                        lines 
-                        |> List.skipWhile (fun l -> not (l.StartsWith($"### Task {id} -")))
-                    if detailLines.IsEmpty then None
-                    else
-                        let headerLine = detailLines.Head
-                        let name = headerLine.Substring(headerLine.IndexOf(" - ") + 3).Trim()
-                        let contentLines = detailLines |> List.skip 1 |> List.takeWhile (fun l -> not (l.StartsWith("### ")))
-                        let descLines = contentLines |> List.takeWhile (fun l -> not (l.StartsWith("**Definition")))
-                        let dodLines = contentLines |> List.skipWhile (fun l -> not (l.StartsWith("- "))) |> List.filter (fun l -> l.StartsWith("- "))
-                        let summaryLine = contentLines |> List.tryFind (fun l -> l.StartsWith("**Completed:**"))
-                        let summary = summaryLine |> Option.map (fun l -> l.Substring(14).Trim())
-                        Some ({ 
-                            Id = id
-                            Name = name
-                            Description = descLines |> String.concat "\n" |> fun s -> s.Trim()
-                            DoD = dodLines |> List.map (fun l -> l.Substring(2).Trim())
-                        }, summary)
-                
-                let tasks = 
-                    tableLines |> List.choose (fun line ->
-                        let cells = line.Split('|') |> Array.map (fun c -> c.Trim()) |> Array.filter (fun c -> c <> "")
-                        if cells.Length < 3 then None
-                        else
-                            try
-                                let id = int cells.[0]
-                                let statusCell = cells.[2]
-                                let status = 
-                                    if statusCell.Contains("Done") then Done 1
-                                    elif statusCell.Contains("⏳") then Running (Implement, 1)
-                                    else Todo
-                                // Parse verifiers dynamically - header tells us which columns are which
-                                let verifierNames = getVerifierNames ()
-                                let verifiers = 
-                                    if cells.Length > 3 then
-                                        verifierNames 
-                                        |> List.mapi (fun i name -> 
-                                            if i + 3 < cells.Length then Some (name, iconToStatus cells.[i + 3])
-                                            else None)
-                                        |> List.choose (fun x -> x)
-                                        |> Map.ofList
-                                    else Map.empty
-                                match parseTaskDetail id with
-                                | Some (item, summary) -> Some (item, status, verifiers, summary)
-                                | None -> None
-                            with _ -> None
-                    )
-                
-                Some { Overview = overview; Tasks = tasks }
-            with _ -> None
-    
-    let updateTaskStatus (taskId: int) (status: BacklogStatus) (verifiers: Map<VerifierName, VerifierStatus>) (summary: string option) =
-        match read() with
-        | Some data ->
-            let updatedTasks = data.Tasks |> List.map (fun (item, s, v, sum) ->
-                if item.Id = taskId then (item, status, verifiers, summary) else (item, s, v, sum))
-            write { data with Tasks = updatedTasks }
-        | None -> ()
-    
-    let getOverview () = 
-        match read() with Some d -> d.Overview | None -> ""
-    
-    // Convert BacklogData to Plan for compatibility with existing flow
-    let readAsPlan () : Plan option =
-        match read() with
-        | Some data -> 
-            Some { 
-                Overview = data.Overview
-                Subtasks = data.Tasks |> List.map (fun (item, _, _, _) -> item)
-            }
-        | None -> None
+let addIterationReason sprintPath iter reason =
+    StateOps.addIterationReason &state sprintPath iter reason
 
-// Terminal GUI helpers - display functions
-module TerminalGUI =
-    let escapeMarkup (s: string) = Markup.Escape(s)
-    
-    let getVerifierFilePath (name: string) =
-        let files = 
-            if Directory.Exists(verifiersDir) then
-                Directory.GetFiles(verifiersDir, "*.md") 
-                |> Array.filter (fun f -> 
-                    let fn = Path.GetFileNameWithoutExtension(f)
-                    let displayName = if fn.Length > 3 && fn.[2] = '-' && Char.IsDigit(fn.[0]) && Char.IsDigit(fn.[1]) 
-                                      then fn.Substring(3) else fn
-                    displayName = name)
-                |> Array.tryHead
-            else None
-        files |> Option.defaultValue (Path.Combine(verifiersDir, $"{name}.md"))
-    
-    let phaseName = function Implement -> "Implement"
+let addIterationRecord sprintPath (record: IterationRecord) =
+    StateOps.addIterationRecord &state sprintPath record
 
-let escapeMarkup = TerminalGUI.escapeMarkup
-let getVerifierFilePath = TerminalGUI.getVerifierFilePath
-let phaseName = TerminalGUI.phaseName
+let updateDoDResults sprintPath (results: DoDResult list) =
+    StateOps.updateDoDResults &state sprintPath results
 
-// Update BACKLOG.md with completed task summary
-let updateSharedContext (item: BacklogItem) (summary: string) =
-    // Get current verifier results from state
-    let verifiers = 
-        state.Backlog 
-        |> List.tryFind (fun (s, _, _) -> s.Id = item.Id) 
-        |> Option.map (fun (_, _, timing) -> timing.VerifierResults)
-        |> Option.defaultValue Map.empty
-    BacklogFile.updateTaskStatus item.Id (Done 1) verifiers (Some summary)
+let startItemTiming sprintPath =
+    StateOps.startItemTiming &state sprintPath
 
-module Prompts =
-    let lines items = items |> String.concat "\n"
-    let bullets items = items |> List.map (fun c -> $"- {c}") |> lines
-    
-    // All prompts should reference BACKLOG.md rather than embedding content
-    let backlogRef = "Read .tools/ralph/BACKLOG.md for full context (Overview section for approach, Tasks section for status)."
-    
-    let architect request = 
-        xc "R" [
-            xt "role" "ARCHITECT and PRODUCT OWNER. Plan work as SPRINTS delivering tested product increments."
-            xt "request" request
-            xc "critical" [
-                xt "warn" "SUBAGENTS START FROM SCRATCH - they have ZERO context beyond what you write in BACKLOG.md"
-                xt "warn" "The Overview section is THE ONLY context they get - make it COMPREHENSIVE"
-                xt "warn" "Each task description must be SELF-CONTAINED with all needed details"
-            ]
-            xc "overview_must_include" [
-                xt "item" "The ORIGINAL USER REQUEST (quoted verbatim)"
-                xt "item" "Your ANALYSIS of the problem - what files/functions are involved"
-                xt "item" "Your APPROACH - how you decided to solve it and WHY"
-                xt "item" "KEY DESIGN DECISIONS - patterns to use, edge cases to handle"
-                xt "item" "CODEBASE CONTEXT - relevant existing code, conventions to follow"
-            ]
-            xc "task_must_include" [
-                xt "item" "WHAT to FIX in CONTEXT"
-                xt "item" "POINTER TO HOW/WHERE TO DO IT"
-                xt "item" "WHY this approach (so implementor understands intent)"
-                xt "item" "EXAMPLES of expected behavior or code patterns - important for sprint boundaries"
-            ]
-            xc "rules" [
-                xt "rule" "NEVER create separate 'testing' or 'add tests' sprints - each sprint includes its own testing"
-                xt "rule" "Each sprint is a PRODUCT INCREMENT with Definition of Done (DoD)"
-                xt "rule" "A sprint is only complete when ALL DoD criteria pass"
-                xt "rule" "DoD must include: Build succeeds, Tests pass, No duplication, Feature works"
-            ]
-            xc "output" [
-                xt "file" ".tools/ralph/BACKLOG.md"
-                xt "format" "Create/update the BACKLOG.md file with this exact structure"
-                xc "structure" [
-                    xt "heading" "# BACKLOG"
-                    xt "section" "## Overview - COMPREHENSIVE context: original request, analysis, approach, design decisions, codebase context"
-                    xt "section" "## Tasks - markdown table with columns:  ID | Task | Status | (Status = ○ Todo for all)"
-                    xt "section" "## Task Details - for each task: ### Task N - Name, DETAILED description with what/where/how/why, **Definition of Done:** with criteria"
-                ]
-                xt "signal" "PLAN_COMPLETE"
-            ]
-        ] |> XmlPrompt.toPrompt
+let endItemTiming sprintPath summary =
+    StateOps.endItemTiming &state liveCtx sprintPath summary
 
-    let implement (s: BacklogItem) (iter: int) (feedback: string list) (prevDoDResults: DoDResult list) (pastSprints: XmlPrompt.SprintHistory list) (pastSteps: XmlPrompt.StepHistory list) (iterHistory: XmlPrompt.IterationHistory list) = 
-        let dod = s.DoD |> List.map (fun c -> 
-            let passed = prevDoDResults |> List.tryFind (fun r -> r.Criterion = c) |> Option.bind (fun r -> r.Passed)
-            { Criterion = c; Passed = passed })
-        let xml = XmlPrompt.build XmlPrompt.Implementor s iter dod pastSprints pastSteps iterHistory
-        
-        // Add feedback if any
-        let feedbackEl = 
-            if feedback.IsEmpty then []
-            else [xc "fix" (feedback |> List.map (fun f -> xt "issue" f))]
-        
-        xc "R" ([xml] @ feedbackEl @ [
-            xc "action" [
-                xt "scope" $"Implement ONLY Task {s.Id}: {s.Name}. Other tasks are NOT your concern."
-                xt "step" $"Read .tools/ralph/BACKLOG.md section '### Task {s.Id}' for full context"
-                xt "step" "Implement code AND tests together"
-                xt "step" "Run: dotnet build -c Release && dotnet test -c Release"
-                xt "step" "Verify each DoD criterion for THIS task"
-                xt "step" "Commit changes"
-                xt "signal" "SUBTASK_COMPLETE"
-            ]
-        ]) |> XmlPrompt.toPrompt
-
-    let arbiter (originalRequest: string) (errorReason: string) (sprintId: int option) (iterationsSpent: int) =
-        let sprintInfo = match sprintId with Some id -> $"Sprint {id}" | None -> "Pre-sprint (planning)"
-        xc "R" [
-            xt "role" "ARBITER - conflict resolver when normal sprint execution has failed"
-            xt "backlog" backlogRef
-            xc "error" [
-                xt "failed_at" sprintInfo
-                xt "iterations" (string iterationsSpent)
-                xt "reason" errorReason
-            ]
-            xt "request" originalRequest
-            xc "task" [
-                xt "analyze" "What went wrong? Root cause of failure"
-                xt "decide" "Should remaining work be restructured?"
-                xt "action" "Update .tools/ralph/BACKLOG.md with revised plan (keep completed tasks, restructure remaining)"
-            ]
-            xt "signal" "ARBITER_COMPLETE"
-        ] |> XmlPrompt.toPrompt
-
-let buildDashboard () =
-    let elapsed = DateTime.Now - state.StartTime
-    let elapsedStr = elapsed.ToString("hh\\:mm\\:ss")
-    
-    // Calculate progress
-    let totalItems = state.Backlog.Length
-    let completedItems = state.Backlog |> List.filter (fun (_, s, _) -> match s with Done _ -> true | _ -> false) |> List.length
-    let currentItem = state.Backlog |> List.tryFind (fun (_, s, _) -> match s with Running _ -> true | _ -> false)
-    let progress = 
-        if state.TotalEstimatedIterations > 0 then
-            float state.CompletedIterations / float state.TotalEstimatedIterations * 100.0
-        else
-            float completedItems / float (max 1 totalItems) * 100.0
-    
-    // Compact header with phase and progress
-    let headerLine = 
-        let phaseColor = 
-            match state.CurrentPhase with
-            | "Complete" -> "green"
-            | "Planning" -> "cyan"
-            | _ -> "yellow"
-        let pct = sprintf "%.0f" progress
-        let barWidth = 30
-        let filled = min barWidth (max 0 (int (float barWidth * progress / 100.0)))
-        let empty = max 0 (barWidth - filled)
-        let barStr = String.replicate filled "█" + String.replicate empty "░"
-        Markup($"[yellow bold]RALPH[/] │ [{phaseColor}]{escapeMarkup state.CurrentPhase}[/] │ {barStr} {pct}%% │ {completedItems}/{totalItems} sprints │ {elapsedStr}")
-    
-    // Current activity - single line showing what agent is doing
-    let activityLine =
-        match state.AgentStartTime with
-        | Some startTime ->
-            let agentElapsed = DateTime.Now - startTime
-            let agentElapsedStr = agentElapsed.ToString("mm\\:ss")
-            let task = if String.IsNullOrEmpty state.CurrentAgentTask then "Working..." else state.CurrentAgentTask
-            Markup($"[green]▶ AGENT[/] ({agentElapsedStr}): {escapeMarkup task}")
-        | None ->
-            Markup($"[dim]Agent idle[/]")
-    
-    // Build Sprint Board table - compact with key info
-    let verifierNames = Verifiers.listAll ()
-    let t = Table().Border(TableBorder.Rounded).Expand()
-    t.AddColumn(TableColumn("#").Width(3)) |> ignore
-    t.AddColumn(TableColumn("Sprint").Width(25)) |> ignore
-    t.AddColumn(TableColumn("Status").Width(12)) |> ignore
-    t.AddColumn(TableColumn("Iter").Width(5)) |> ignore
-    t.AddColumn(TableColumn("Time").Width(7)) |> ignore
-    // Add verifier columns with compact headers
-    for name in verifierNames do
-        let shortName = if name.Length > 8 then name.Substring(0, 7) + "…" else name
-        let filePath = getVerifierFilePath name
-        let header = $"[link=file://{filePath}]{shortName}[/]"
-        t.AddColumn(TableColumn(Markup(header)).Width(8)) |> ignore
-    
-    for (item, status, timing) in state.Backlog do
-        let now = DateTime.Now
-        let shortName = if item.Name.Length > 24 then item.Name.Substring(0, 21) + "..." else item.Name
-        let statusStr, iterStr = 
-            match status with
-            | Todo -> "[dim]Todo[/]", "[dim]-[/]"
-            | Running (_, iter) -> 
-                $"[yellow]⏳ Run[/]", if iter > 1 then $"[yellow]⟲{iter}[/]" else $"[yellow]{iter}[/]"
-            | Done iters -> "[green]✓ Done[/]", $"[green]{iters}[/]"
-        let timeStr = 
-            match status, timing.EndTime with
-            | Done _, Some endT -> 
-                let mins = (endT - timing.StartTime).TotalMinutes
-                if mins >= 60.0 then $"[green]{mins / 60.0:F1}h[/]" else $"[green]{int mins}m[/]"
-            | Running _, _ -> 
-                let mins = (now - timing.StartTime).TotalMinutes
-                if mins >= 60.0 then $"[yellow]{mins / 60.0:F1}h[/]" else $"[yellow]{int mins}m[/]"
-            | _ -> "[dim]-[/]"
-        
-        // Verifier columns - compact icons
-        let verifierIcon name =
-            match timing.VerifierResults.TryFind name with
-            | Some (Passed iters) -> if iters > 1 then $"[green]✓{iters}[/]" else "[green]✓[/]"
-            | Some (Failed iters) -> if iters > 1 then $"[red]✗{iters}[/]" else "[red]✗[/]"
-            | Some NotStarted | None -> "[dim]○[/]"
-        
-        let verifierCells = verifierNames |> List.map verifierIcon
-        let allCells = [string item.Id; escapeMarkup shortName; statusStr; iterStr; timeStr] @ verifierCells
-        t.AddRow(allCells |> Array.ofList) |> ignore
-    
-    // Current task detail panel - shows DoD status and last failure reason
-    let currentTaskPanel : IRenderable =
-        match currentItem with
-        | Some (item, Running (phase, iter), timing) ->
-            let dodItems = 
-                if timing.LastDoDResults.Length > 0 then
-                    timing.LastDoDResults |> List.map (fun r ->
-                        let icon = match r.Passed with Some true -> "[green]✓[/]" | Some false -> "[red]✗[/]" | None -> "[dim]○[/]"
-                        let criterion = if r.Criterion.Length > 60 then r.Criterion.Substring(0, 57) + "..." else r.Criterion
-                        $"{icon} {escapeMarkup criterion}")
-                else
-                    item.DoD |> List.map (fun c -> 
-                        let criterion = if c.Length > 60 then c.Substring(0, 57) + "..." else c
-                        $"[dim]○[/] {escapeMarkup criterion}")
-            let dodSection = dodItems |> String.concat "\n"
-            let lastFailure = 
-                match timing.IterationReasons |> List.tryLast with
-                | Some (i, r) -> 
-                    let reason = if r.Length > 80 then r.Substring(0, 77) + "..." else r
-                    $"\n[red]Last issue (iter {i}):[/] {escapeMarkup reason}"
-                | None -> ""
-            Panel(Markup($"[bold]{escapeMarkup item.Name}[/]\n{dodSection}{lastFailure}"))
-                .Header($"[cyan]Current: Sprint {item.Id} (iter {iter})[/]")
-                .Expand()
-            :> IRenderable
-        | _ when not (String.IsNullOrEmpty state.PlanOverview) && state.CurrentPhase = "Planning" ->
-            Panel(Markup($"[dim]{escapeMarkup state.PlanOverview}[/]")).Header("[cyan]Planning...[/]").Expand() :> IRenderable
-        | _ -> 
-            Text("") :> IRenderable
-    
-    // Last verifier result - single line summary
-    let lastVerifierLine : IRenderable =
-        match state.LastVerifierLog with
-        | Some (name, passed, summary) ->
-            let icon = if passed then "[green]✓[/]" else "[red]✗[/]"
-            let summaryText = if summary.Length > 70 then summary.Substring(0, 67) + "..." else summary
-            Markup($"{icon} [bold]{escapeMarkup name}[/]: {escapeMarkup summaryText}") :> IRenderable
-        | None -> Text("") :> IRenderable
-    
-    // Final verification table - compact, only shown when there are results
-    let finalVerificationPanel : IRenderable =
-        if state.FinalVerifierResults.IsEmpty then
-            Text("") :> IRenderable
-        else
-            let ft = Table().Border(TableBorder.Simple).Expand()
-            ft.AddColumn(TableColumn("Final Verifier").Width(15)) |> ignore
-            ft.AddColumn(TableColumn("").Width(8)) |> ignore
-            ft.AddColumn(TableColumn("Summary").NoWrap()) |> ignore
-            for name in verifierNames do
-                let status = 
-                    match state.FinalVerifierResults.TryFind name with
-                    | Some (Passed i) -> if i > 1 then $"[green]✓({i})[/]" else "[green]✓ Pass[/]"
-                    | Some (Failed i) -> if i > 1 then $"[red]✗({i})[/]" else "[red]✗ Fail[/]"
-                    | Some NotStarted | None -> "[dim]○[/]"
-                let summary = 
-                    state.FinalVerifierSummaries.TryFind name 
-                    |> Option.defaultValue "" 
-                    |> fun s -> if s.Length > 50 then s.Substring(0, 47) + "..." else s
-                    |> escapeMarkup
-                ft.AddRow([| Markup(escapeMarkup name) :> IRenderable; Markup(status) :> IRenderable; Markup(summary) :> IRenderable |]) |> ignore
-            ft :> IRenderable
-    
-    // Error display - if there's an error
-    let errorLine : IRenderable =
-        match state.ErrorLog with
-        | Some err -> 
-            let errText = if err.Length > 100 then err.Substring(0, 97) + "..." else err
-            Markup($"[red bold]Error:[/] {escapeMarkup errText}") :> IRenderable
-        | None -> Text("") :> IRenderable
-    
-    // Message line
-    let messageLine : IRenderable =
-        if String.IsNullOrEmpty state.Message then Text("") :> IRenderable
-        else Markup(state.Message) :> IRenderable
-    
-    // Build compact single-screen layout
-    let rows = [
-        yield Rule("").RuleStyle("dim") :> IRenderable
-        yield headerLine :> IRenderable
-        yield activityLine :> IRenderable
-        yield Rule("").RuleStyle("dim") :> IRenderable
-        if state.Backlog.Length > 0 then
-            yield t :> IRenderable
-        yield currentTaskPanel
-        yield lastVerifierLine
-        if not state.FinalVerifierResults.IsEmpty then
-            yield Rule("[cyan]Final Verification[/]").RuleStyle("cyan") :> IRenderable
-            yield finalVerificationPanel
-        yield errorLine
-        yield messageLine
-    ]
-    
-    Rows(rows)
-
-let updateStatus itemId status msg =
-    let newBacklog = state.Backlog |> List.map (fun (s, st, timing) -> 
-        if s.Id = itemId then (s, status, timing) else (s, st, timing))
-    state <- { state with Backlog = newBacklog; Message = msg }
-    liveCtx |> Option.iter (fun ctx -> ctx.Refresh())
-
-let updateTiming itemId (f: BacklogItemTiming -> BacklogItemTiming) =
-    let newBacklog = state.Backlog |> List.map (fun (s, st, timing) -> 
-        if s.Id = itemId then (s, st, f timing) else (s, st, timing))
-    state <- { state with Backlog = newBacklog }
-
-let addIterationReason itemId iter reason =
-    updateTiming itemId (fun t -> { t with IterationReasons = t.IterationReasons @ [(iter, reason)] })
-
-let addIterationRecord itemId (record: IterationRecord) =
-    updateTiming itemId (fun t -> { t with IterationHistory = t.IterationHistory @ [record] })
-
-let updateDoDResults itemId (results: DoDResult list) =
-    updateTiming itemId (fun t -> { t with LastDoDResults = results })
-
-let startItemTiming itemId =
-    updateTiming itemId (fun t -> { t with StartTime = DateTime.Now })
-
-let endItemTiming itemId summary =
-    updateTiming itemId (fun t -> { t with EndTime = Some DateTime.Now; Summary = Some summary })
-    updateSharedContext 
-        (state.Backlog |> List.find (fun (s, _, _) -> s.Id = itemId) |> fun (s, _, _) -> s) 
-        summary
-    liveCtx |> Option.iter (fun ctx -> ctx.Refresh())
-
-let getItemTiming itemId =
-    state.Backlog |> List.tryFind (fun (s, _, _) -> s.Id = itemId) |> Option.map (fun (_, _, t) -> t)
+let getItemTiming sprintPath =
+    StateOps.getItemTiming state sprintPath
 
 let setMessage msg =
-    state <- { state with Message = msg }
-    liveCtx |> Option.iter (fun ctx -> ctx.Refresh())
+    StateOps.setMessage &state liveCtx msg
+
+// ============================================================================
+// DASHBOARD
+// ============================================================================
+
+let buildDashboard () =
+    GUI.buildDashboard state (Verifiers.listAll ())
 
 // ============================================================================
 // AGENT EXECUTION
 // ============================================================================
 
 let runAgent (prompt: string) (title: string) (_showWindow: bool) = async {
-    Directory.CreateDirectory ralphDir |> ignore
+    Directory.CreateDirectory Config.ralphDir |> ignore
     
     // Mark agent as running with task info
     state <- { state with AgentStartTime = Some DateTime.Now; CurrentAgentTask = title }
@@ -799,7 +91,7 @@ let runAgent (prompt: string) (title: string) (_showWindow: bool) = async {
     let result = 
         cli {
             Exec "copilot"
-            Arguments [| "--allow-all-tools"; "--allow-all-paths"; "--no-ask-user";"--no-color";"--plain-diff";"-s";"--model"; Model; "--stream"; "off" |]
+            Arguments [| "--allow-all-tools"; "--allow-all-paths"; "--no-ask-user";"--no-color";"--plain-diff";"-s";"--model"; Config.Model; "--stream"; "off" |]
             Input prompt
         }
         |> Command.execute
@@ -810,85 +102,62 @@ let runAgent (prompt: string) (title: string) (_showWindow: bool) = async {
     return result.Text |> Option.defaultValue ""
 }
 
-// Verifier prompts read from verifiers/*.md files at runtime (no caching)
-let getVerifierPrompt (name: VerifierName) : string =
-    Verifiers.getPrompt name
+// ============================================================================
+// VERIFICATION
+// ============================================================================
 
-// Standard suffix added to all verifier prompts for structured output
-let verifierSuffix = """
-
-=== OUTPUT FORMAT ===
-At the very end of your response, provide:
-<ManagementSummary>A 1-2 sentence executive summary of what you found</ManagementSummary>
-"""
-
-// Parse ManagementSummary from verifier output
-let parseManagementSummary (output: string) : string option =
-    let m = Regex.Match(output, @"<ManagementSummary>([^<]+)</ManagementSummary>", RegexOptions.Singleline)
-    if m.Success then Some (m.Groups.[1].Value.Trim())
-    else None
-
-let verifyStage showWin subtaskId (verifierName: VerifierName) (sprintItem: BacklogItem) = async {
+let verifyStage showWin sprintFilePath (verifierName: VerifierName) (sprintItem: BacklogItem) = async {
     setMessage $"Verifying {verifierName}..."
     
-    // ALL verifiers get sprint-specific context so they know their scope
-    let sprintContext = 
-        [
-            ""
-            "=== YOUR VERIFICATION SCOPE ==="
-            $"Sprint {sprintItem.Id}: {sprintItem.Name}"
-            $"Description: {sprintItem.Description}"
-            ""
-            "Definition of Done for THIS sprint ONLY:"
-            yield! sprintItem.DoD |> List.map (fun d -> $"  - {d}")
-            ""
-            "IMPORTANT: Verify ONLY this sprint's work. Other sprints are NOT your concern."
-            $"Backlog file: .tools/ralph/BACKLOG.md (your task: ### Task {sprintItem.Id})"
-            ""
-        ] |> String.concat "\n"
-    
-    let prompt = getVerifierPrompt verifierName + sprintContext + verifierSuffix
+    let timing = getItemTiming sprintFilePath |> Option.defaultValue emptyTiming
+    let approvedCommits = timing.ApprovedCommits
+    let currentCommit = Git.getHeadCommit()
+    let sprintContext = buildSprintVerificationContext sprintItem approvedCommits currentCommit verifierName
+    let prompt = Verifiers.getPrompt verifierName + sprintContext + verifierSuffix
     let! out = runAgent prompt $"Verify-{verifierName}" showWin
     
-    // Extract management summary
-    let summary = parseManagementSummary out |> Option.defaultValue "(no summary)"
-    
-    if hasSignal "VERIFY_PASSED" out || hasSignal "VERIFY PASSED" out then
+    match interpretVerifierOutput out with
+    | VPassed summary ->
         state <- { state with LastVerifierLog = Some (verifierName, true, summary) }
         setMessage $"[green]✓ {verifierName} passed[/]"
         return Ok ()
-    elif hasSignal "VERIFY_FAILED" out || hasSignal "VERIFY FAILED" out then
+    | VFailed summary ->
         state <- { state with LastVerifierLog = Some (verifierName, false, summary) }
         setMessage $"[red]✗ {verifierName} failed[/]"
         return Error $"{verifierName}: {summary}"
-    else
+    | VInconclusive summary ->
         state <- { state with LastVerifierLog = Some (verifierName, false, summary) }
         setMessage $"[yellow]{verifierName} inconclusive[/]"
         return Error $"{verifierName} verification did not output VERIFY_PASSED or VERIFY_FAILED"
 }
 
-// Update verifier status while preserving/incrementing iteration count
-let updateVerifierStatus itemId (verifierName: VerifierName) (passed: bool) =
-    updateTiming itemId (fun t -> 
+let updateVerifierStatus sprintFilePath (verifierName: VerifierName) (passed: bool) =
+    updateTiming sprintFilePath (fun t -> 
         let prevCount = 
             match t.VerifierResults.TryFind verifierName with
             | Some (Passed n) | Some (Failed n) -> n
             | _ -> 0
         let newStatus = if passed then Passed (prevCount + 1) else Failed (prevCount + 1)
-        { t with VerifierResults = t.VerifierResults.Add(verifierName, newStatus) })
+        // Capture commit hash when verifier passes (for incremental verification)
+        let approvedCommits = 
+            if passed then
+                match Git.getHeadCommit() with
+                | Some commit -> t.ApprovedCommits.Add(verifierName, commit)
+                | None -> t.ApprovedCommits
+            else t.ApprovedCommits
+        { t with VerifierResults = t.VerifierResults.Add(verifierName, newStatus); ApprovedCommits = approvedCommits })
     liveCtx |> Option.iter (fun ctx -> ctx.Refresh())
 
-let runAllVerifiers showWin subtaskId (sprintItem: BacklogItem) = async {
-    // Discover verifiers from files
+let runAllVerifiers showWin sprintFilePath (sprintItem: BacklogItem) = async {
     let verifierNames = Verifiers.listAll ()
     let mutable allPassed = true
     
     for name in verifierNames do
-        match! verifyStage showWin subtaskId name sprintItem with
+        match! verifyStage showWin sprintFilePath name sprintItem with
         | Ok () -> 
-            updateVerifierStatus subtaskId name true
+            updateVerifierStatus sprintFilePath name true
         | Error e -> 
-            updateVerifierStatus subtaskId name false
+            updateVerifierStatus sprintFilePath name false
             allPassed <- false
     
     if allPassed then
@@ -897,8 +166,8 @@ let runAllVerifiers showWin subtaskId (sprintItem: BacklogItem) = async {
         return Error "One or more verifiers failed"
 }
 
-let showPlan plan =
-    state <- { state with PlanOverview = $"{plan.Overview} ({plan.Subtasks.Length} sprints)" }
+let showPlan (sprints: BacklogItem list) (overview: string) =
+    state <- { state with PlanOverview = $"{overview} ({sprints.Length} sprints)" }
     liveCtx |> Option.iter (fun ctx -> ctx.Refresh())
 
 // ============================================================================
@@ -906,26 +175,22 @@ let showPlan plan =
 // ============================================================================
 
 let rec runBacklogItem (item: BacklogItem) iter totalIter feedback showWin = async {
-    if iter > MaxIterations then return Error "Max iterations"
+    if iter > Config.MaxIterations then return Error "Max iterations"
     else
-        // Start timing on first iteration
         if iter = 1 then
-            startItemTiming item.Id
+            startItemTiming item.FilePath
         
-        // Get previous DoD results and history for this item
-        let timing = getItemTiming item.Id |> Option.defaultValue emptyTiming
+        let timing = getItemTiming item.FilePath |> Option.defaultValue emptyTiming
         let prevDoDResults = timing.LastDoDResults
         
-        // Build past sprints context (completed sprints before this one)
         let pastSprints: XmlPrompt.SprintHistory list = 
             state.Backlog 
-            |> List.filter (fun (s, status, _) -> s.Id < item.Id && match status with Done _ -> true | _ -> false)
+            |> List.filter (fun (s, status, _) -> s.Order < item.Order && match status with Done _ -> true | _ -> false)
             |> List.map (fun (s, _, t) -> 
-                { SprintId = s.Id
+                { SprintId = s.Order
                   SprintName = s.Name
                   Summary = t.Summary |> Option.defaultValue "Completed" } : XmlPrompt.SprintHistory)
         
-        // Build past steps context (previous iterations of THIS sprint)
         let pastSteps: XmlPrompt.StepHistory list =
             timing.IterationReasons 
             |> List.map (fun (i, reason) ->
@@ -933,7 +198,6 @@ let rec runBacklogItem (item: BacklogItem) iter totalIter feedback showWin = asy
                   Passed = false
                   Summary = reason } : XmlPrompt.StepHistory)
         
-        // Build iteration history (only for retries - full exchange)
         let iterHistory: XmlPrompt.IterationHistory list =
             timing.IterationHistory 
             |> List.map (fun r ->
@@ -941,41 +205,36 @@ let rec runBacklogItem (item: BacklogItem) iter totalIter feedback showWin = asy
                   AgentOutput = r.AgentOutput
                   VerifierResults = r.VerifierResults } : XmlPrompt.IterationHistory)
         
-        updateStatus item.Id (Running (Implement, iter)) $"Sprint {item.Id}: Implement iteration {iter}"
+        updateStatus item.FilePath (Running (Implement, iter)) $"Sprint {item.Order}: Implement iteration {iter}"
         
         let prompt = Prompts.implement item iter feedback prevDoDResults pastSprints pastSteps iterHistory
         
-        let! out = runAgent prompt ($"Implement-{item.Id}") showWin
+        let! out = runAgent prompt ($"Implement-{item.Order}") showWin
         
-        // Record this iteration for future retries
         let currentRecord: IterationRecord = {
             Iteration = iter
             AgentOutput = out
             VerifierResults = []
         }
-        addIterationRecord item.Id currentRecord
+        addIterationRecord item.FilePath currentRecord
         
         let retry fb dodResults = 
             let reason = fb |> List.tryHead |> Option.defaultValue "Unknown"
-            addIterationReason item.Id iter reason
-            updateDoDResults item.Id dodResults
+            addIterationReason item.FilePath iter reason
+            updateDoDResults item.FilePath dodResults
             state <- { state with CompletedIterations = state.CompletedIterations + 1 }
             runBacklogItem item (iter + 1) (totalIter + 1) fb showWin
         
-        // Check for completion signals (case-insensitive, flexible matching)
-        let checkSignal (signal: string) = hasSignal signal out
-        let isComplete = checkSignal "SUBTASK_COMPLETE" || checkSignal "SUBTASK COMPLETE"
+        let isComplete = hasSignal "SUBTASK_COMPLETE" out || hasSignal "SUBTASK COMPLETE" out
         
         if isComplete then
             state <- { state with CompletedIterations = state.CompletedIterations + 1 }
-            // Run verifiers - on success, sprint is done
-            match! runAllVerifiers showWin item.Id item with 
+            match! runAllVerifiers showWin item.FilePath item with 
             | Ok _ -> 
-                // Mark all DoD as passed
                 let allPassed = item.DoD |> List.map (fun c -> { Criterion = c; Passed = Some true })
-                updateDoDResults item.Id allPassed
-                endItemTiming item.Id $"Completed in {totalIter + 1} iterations"
-                updateStatus item.Id (Done (totalIter + 1)) $"Sprint {item.Id} complete in {totalIter + 1} iterations"
+                updateDoDResults item.FilePath allPassed
+                endItemTiming item.FilePath $"Completed in {totalIter + 1} iterations"
+                updateStatus item.FilePath (Done (totalIter + 1)) $"Sprint {item.Order} complete in {totalIter + 1} iterations"
                 return Ok ()
             | Error e -> return! retry [e] prevDoDResults
         else
@@ -988,7 +247,7 @@ let rec runAllBacklogItems items showWin = async {
     | item :: rest ->
         match! runBacklogItem item 1 0 [] showWin with
         | Ok () -> return! runAllBacklogItems rest showWin
-        | Error e -> return Error $"Sprint {item.Id} failed: {e}"
+        | Error e -> return Error $"Sprint {item.Order} ({item.Name}) failed: {e}"
 }
 
 // ============================================================================
@@ -999,45 +258,36 @@ let runFinalVerifiers showWin = async {
     state <- { state with CurrentPhase = "Final Verification" }
     liveCtx |> Option.iter (fun ctx -> ctx.Refresh())
     
-    // Discover verifiers from files
     let verifierNames = Verifiers.listAll ()
     let mutable allPassed = true
+    
+    let sprintFiles = SprintFiles.listSprints()
+    let finalContext = buildFinalVerificationContext sprintFiles
     
     for name in verifierNames do
         setMessage $"Final verification: {name}..."
         
-        // Get previous iteration count
         let prevCount = 
             match state.FinalVerifierResults.TryFind name with
             | Some (Passed n) | Some (Failed n) -> n
             | _ -> 0
         
-        // Update state to show verifier is running
         state <- { state with FinalVerifierResults = state.FinalVerifierResults.Add(name, NotStarted) }
         liveCtx |> Option.iter (fun ctx -> ctx.Refresh())
         
-        let prompt = Verifiers.getPrompt name + verifierSuffix
+        let prompt = Verifiers.getPrompt name + finalContext + verifierSuffix
         let! out = runAgent prompt $"FinalVerify-{name}" showWin
         
-        // Extract management summary
-        let summary = parseManagementSummary out |> Option.defaultValue "(no summary)"
-        
-        // Store summary for dashboard display
-        state <- { state with FinalVerifierSummaries = state.FinalVerifierSummaries.Add(name, summary) }
-        
-        // All verifiers use the same signal detection - update state instead of printing
-        if hasSignal "VERIFY_PASSED" out || hasSignal "VERIFY PASSED" out then
+        match interpretVerifierOutput out with
+        | VPassed summary ->
             state <- { state with 
                         FinalVerifierResults = state.FinalVerifierResults.Add(name, Passed (prevCount + 1))
+                        FinalVerifierSummaries = state.FinalVerifierSummaries.Add(name, summary)
                         LastVerifierLog = Some (name, true, summary) }
-        elif hasSignal "VERIFY_FAILED" out || hasSignal "VERIFY FAILED" out then
+        | VFailed summary | VInconclusive summary ->
             state <- { state with 
                         FinalVerifierResults = state.FinalVerifierResults.Add(name, Failed (prevCount + 1))
-                        LastVerifierLog = Some (name, false, summary) }
-            allPassed <- false
-        else
-            state <- { state with 
-                        FinalVerifierResults = state.FinalVerifierResults.Add(name, Failed (prevCount + 1))
+                        FinalVerifierSummaries = state.FinalVerifierSummaries.Add(name, summary)
                         LastVerifierLog = Some (name, false, summary) }
             allPassed <- false
         
@@ -1046,17 +296,17 @@ let runFinalVerifiers showWin = async {
     return allPassed
 }
 
-// Create a synthetic fixup sprint for failed final verifiers
-// This goes through the FULL implement → verify cycle
 let createFixupSprint (failedVerifiers: VerifierName list) (fixupNumber: int) : BacklogItem =
     let failedNames = failedVerifiers |> String.concat ", "
-    let nextId = 
+    let nextOrder = 
         state.Backlog 
-        |> List.map (fun (item, _, _) -> item.Id) 
+        |> List.map (fun (item, _, _) -> item.Order) 
         |> List.max 
         |> (+) 1
+    let fixupPath = Path.Combine(Config.sprintsDir, $"{nextOrder:D2}_Fixup_{fixupNumber}.md")
     {
-        Id = nextId
+        FilePath = fixupPath
+        Order = nextOrder
         Name = $"Fixup #{fixupNumber}"
         Description = $"Fix issues identified by final verification. The following verifiers FAILED on the complete feature: {failedNames}. Review their feedback and make targeted fixes WITHOUT breaking existing functionality."
         DoD = [
@@ -1077,7 +327,6 @@ let rec finalChecksWithFixup showWin maxFixupSprints currentFixup = async {
         liveCtx |> Option.iter (fun ctx -> ctx.Refresh())
         return false
     else
-        // Get failed verifiers
         let failed = 
             state.FinalVerifierResults 
             |> Map.toList 
@@ -1087,20 +336,16 @@ let rec finalChecksWithFixup showWin maxFixupSprints currentFixup = async {
         let failedNames = failed |> String.concat ", "
         setMessage $"Fixup #{currentFixup + 1}: {failedNames}"
         
-        // Create and run a proper fixup sprint through the full cycle
         let fixupItem = createFixupSprint failed (currentFixup + 1)
         
-        // Add to backlog and state for tracking
         state <- { state with 
                        Backlog = state.Backlog @ [(fixupItem, Todo, emptyTiming)]
                        TotalEstimatedIterations = state.TotalEstimatedIterations + 3
                  }
         liveCtx |> Option.iter (fun ctx -> ctx.Refresh())
         
-        // Run full implement → verify cycle
         match! runBacklogItem fixupItem 1 0 [] showWin with
         | Ok () ->
-            // Recurse to re-run final verification (counts are preserved and incremented)
             return! finalChecksWithFixup showWin maxFixupSprints (currentFixup + 1)
         | Error e ->
             state <- { state with ErrorLog = Some $"Fixup sprint failed: {e}" }
@@ -1110,49 +355,58 @@ let rec finalChecksWithFixup showWin maxFixupSprints currentFixup = async {
 
 let finalChecks showWin =
     setMessage "Running final verification on complete feature..."
-    finalChecksWithFixup showWin 3 0 |> Async.RunSynchronously  // Allow up to 3 fixup sprints
+    finalChecksWithFixup showWin 3 0 |> Async.RunSynchronously
 
 // ============================================================================
 // MAIN APPLICATION FLOW
 // ============================================================================
 
-let runWithLive (plan: Plan) showWin (originalRequest: string) = 
-    // Estimate ~2 iterations per sprint (implement, maybe retry)
-    let estimatedIterations = plan.Subtasks.Length * 3
+let runWithLive (sprints: BacklogItem list) showWin (originalRequest: string) = 
+    let estimatedIterations = sprints.Length * 3
+    
+    let overview = BacklogFile.readOverview() |> Option.defaultValue originalRequest
+    
+    let existingByPath = 
+        state.Backlog 
+        |> List.map (fun (item, status, timing) -> (item.FilePath, (item, status, timing)))
+        |> Map.ofList
+    
+    let mergedBacklog = 
+        sprints 
+        |> List.map (fun s ->
+            match existingByPath.TryFind s.FilePath with
+            | Some (_, (Done _ as status), timing) -> (s, status, timing)
+            | Some (_, status, timing) when state.CurrentPhase = "Arbiter" -> (s, Todo, emptyTiming)
+            | Some (_, status, timing) -> (s, status, timing)
+            | None -> (s, Todo, emptyTiming))
     
     state <- { 
-        Backlog = plan.Subtasks |> List.map (fun s -> (s, Todo, emptyTiming))
-        StartTime = DateTime.Now
+        Backlog = mergedBacklog
+        StartTime = if state.StartTime = DateTime.MinValue then DateTime.Now else state.StartTime
         Message = "Starting..."
         AgentStartTime = None
         TotalEstimatedIterations = estimatedIterations
-        CompletedIterations = 0
+        CompletedIterations = state.CompletedIterations
         FinalVerifierResults = Map.empty
         FinalVerifierSummaries = Map.empty
         CIStatus = None
         CurrentPhase = "Executing"
         CurrentAgentTask = ""
         LastVerifierLog = None
-        PlanOverview = plan.Overview
+        PlanOverview = overview
         ErrorLog = None
     }
     
-    Directory.CreateDirectory ralphDir |> ignore
-    
-    // Write initial BACKLOG.md with plan
-    let initialBacklog: BacklogFile.BacklogData = {
-        Overview = $"{originalRequest}\n\n**Approach:** {plan.Overview}"
-        Tasks = plan.Subtasks |> List.map (fun s -> (s, Todo, Map.empty, None))
-    }
-    BacklogFile.write initialBacklog
+    Directory.CreateDirectory Config.ralphDir |> ignore
+    SprintFiles.ensureDir()
     
     let mutable result: Result<unit, string> = Ok ()
     let mutable finished = false
     
-    // Start the main work in a .NET Task (actually runs in background)
     let workTask = Task.Run(fun () ->
         try
-            let r = runAllBacklogItems plan.Subtasks showWin |> Async.RunSynchronously
+            let sprintsToRun = mergedBacklog |> List.filter (fun (_, status, _) -> match status with Done _ -> false | _ -> true) |> List.map (fun (s, _, _) -> s)
+            let r = runAllBacklogItems sprintsToRun showWin |> Async.RunSynchronously
             result <- r
             match r with
             | Ok () ->
@@ -1169,7 +423,6 @@ let runWithLive (plan: Plan) showWin (originalRequest: string) =
         finished <- true
     )
     
-    // Run the live display with refresh loop
     AnsiConsole.Live(buildDashboard())
         .AutoClear(true)
         .Overflow(VerticalOverflow.Ellipsis)
@@ -1180,13 +433,12 @@ let runWithLive (plan: Plan) showWin (originalRequest: string) =
                 ctx.Refresh()
                 Thread.Sleep(500)
             ctx.UpdateTarget(buildDashboard())
-            ctx.Refresh() // Final refresh
+            ctx.Refresh()
             liveCtx <- None
         )
     
-    workTask.Wait() // Ensure task completes
+    workTask.Wait()
     
-    // Brief completion message
     AnsiConsole.WriteLine()
     match result with
     | Ok () -> 
@@ -1196,59 +448,49 @@ let runWithLive (plan: Plan) showWin (originalRequest: string) =
     
     result
 
-// Arbiter: Invoked when normal execution fails, attempts recovery with full context
-// Returns Result<Plan, string> - caller decides what to do with the plan
-let invokeArbiter (originalRequest: string) (errorReason: string) (failedSprintId: int option) (showWin: bool) : Result<Plan, string> =
+let invokeArbiter (originalRequest: string) (errorReason: string) (failedSprintOrder: int option) (showWin: bool) : Result<BacklogItem list, string> =
     state <- { state with CurrentPhase = "Arbiter"; Message = "Invoking arbiter for recovery..." }
     liveCtx |> Option.iter (fun ctx -> ctx.Refresh())
     
-    // Run arbiter agent with Prompts.arbiter and 'Arbiter' name
-    let arbiterPrompt = Prompts.arbiter originalRequest errorReason failedSprintId 0
+    let finishedSprints = 
+        state.Backlog 
+        |> List.choose (fun (item, status, _) -> 
+            match status with Done _ -> Some (item.Order, item.Name) | _ -> None)
+    let pendingSprints = 
+        state.Backlog 
+        |> List.choose (fun (item, status, _) -> 
+            match status with Done _ -> None | _ -> Some (item.Order, item.Name))
+    
+    let completedBacklogItems = 
+        state.Backlog 
+        |> List.filter (fun (_, status, _) -> match status with Done _ -> true | _ -> false)
+    let completedFilePaths = completedBacklogItems |> List.map (fun (item, _, _) -> item.FilePath) |> Set.ofList
+    
+    let arbiterPrompt = Prompts.arbiter originalRequest errorReason failedSprintOrder 0 finishedSprints pendingSprints
     let arbiterResult = runAgent arbiterPrompt "Arbiter" showWin |> Async.RunSynchronously
     
-    // Arbiter updates BACKLOG.md directly, read the result
-    match BacklogFile.readAsPlan() with
-    | Some plan ->
-        // Log arbiter decision on success
-        let timestamp = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss")
-        let sprintStr = match failedSprintId with Some id -> string id | None -> "Planning"
+    let newSprintsFromDisk = SprintFiles.readAllSprints()
+    
+    let newUncompletedSprints = 
+        newSprintsFromDisk 
+        |> List.filter (fun s -> not (completedFilePaths.Contains s.FilePath))
+    
+    let completedItems = completedBacklogItems |> List.map (fun (item, _, _) -> item)
+    let mergedSprints = completedItems @ newUncompletedSprints
+    
+    if mergedSprints.Length > 0 then
         setMessage "[green]Arbiter produced recovery plan[/]"
-        Ok plan
-    | None ->
-        state <- { state with ErrorLog = Some "Arbiter failed: BACKLOG.md not updated or invalid" }
+        Ok mergedSprints
+    else
+        state <- { state with ErrorLog = Some "Arbiter failed: No sprint files found" }
         liveCtx |> Option.iter (fun ctx -> ctx.Refresh())
         Error "Arbiter could not produce valid plan"
 
-// Helper that wraps invokeArbiter with retry logic and execution for run loop integration
-let rec invokeArbiterWithRetry (originalRequest: string) (errorReason: string) (sprintId: int option) showWin arbiterCount =
-    if arbiterCount > 3 then
-        state <- { state with ErrorLog = Some "Arbiter failed to recover after 3 attempts" }
-        liveCtx |> Option.iter (fun ctx -> ctx.Refresh())
-        1
-    else
-        setMessage $"Arbiter attempt {arbiterCount + 1}/3..."
-        match invokeArbiter originalRequest errorReason sprintId showWin with
-        | Ok plan ->
-            showPlan plan
-            match runWithLive plan showWin originalRequest with
-            | Ok () -> 0
-            | Error e when e.StartsWith("REPLAN_REQUESTED") ->
-                setMessage "Recovery requested replanning"
-                invokeArbiterWithRetry originalRequest e None showWin (arbiterCount + 1)
-            | Error e ->
-                invokeArbiterWithRetry originalRequest e None showWin (arbiterCount + 1)
-        | Error _ ->
-            invokeArbiterWithRetry originalRequest "Arbiter parse failed" sprintId showWin (arbiterCount + 1)
-
-let rec run request showWin autoApprove replanCount arbiterCount = 
+let rec run request showWin autoApprove arbiterCount = 
     if arbiterCount >= 3 then
         AnsiConsole.MarkupLine "[red]Max arbiter attempts (3). Stopping.[/]"
         1
-    elif replanCount > 5 then
-        AnsiConsole.MarkupLine "[red]Too many replans (5). Stopping.[/]"
-        1
     else
-        // Initialize state for planning phase
         state <- { 
             Backlog = []; StartTime = DateTime.Now; Message = "Planning..."
             AgentStartTime = None; TotalEstimatedIterations = 0; CompletedIterations = 0
@@ -1257,22 +499,21 @@ let rec run request showWin autoApprove replanCount arbiterCount =
             LastVerifierLog = None; PlanOverview = request; ErrorLog = None
         }
         
-        Directory.CreateDirectory ralphDir |> ignore
+        Directory.CreateDirectory Config.ralphDir |> ignore
+        SprintFiles.ensureDir()
         
-        let mutable planResult: Plan option = None
+        let mutable sprintsResult: BacklogItem list = []
         let mutable planFinished = false
         
-        // Run planning phase with Live display
         let planTask = Task.Run(fun () ->
             try
                 let _ = runAgent (Prompts.architect request) "Architect" showWin |> Async.RunSynchronously
-                planResult <- BacklogFile.readAsPlan()
+                sprintsResult <- SprintFiles.readAllSprints()
             with ex ->
                 state <- { state with ErrorLog = Some ex.Message }
             planFinished <- true
         )
         
-        // Run the live display during planning
         AnsiConsole.Live(buildDashboard())
             .AutoClear(true)
             .Overflow(VerticalOverflow.Ellipsis)
@@ -1289,185 +530,52 @@ let rec run request showWin autoApprove replanCount arbiterCount =
         
         planTask.Wait()
         
-        match planResult with
-        | None -> 
-            state <- { state with ErrorLog = Some "Planning failed: BACKLOG.md not found or invalid" }
-            match invokeArbiter request "Planning failed: BACKLOG.md not created or invalid" None showWin with
-            | Ok newPlan ->
-                showPlan newPlan
-                match runWithLive newPlan showWin request with
+        let overview = BacklogFile.readOverview() |> Option.defaultValue request
+        
+        if sprintsResult.Length = 0 then
+            state <- { state with ErrorLog = Some "Planning failed: No sprint files created" }
+            match invokeArbiter request "Planning failed: No sprint files created" None showWin with
+            | Ok newSprints ->
+                showPlan newSprints overview
+                match runWithLive newSprints showWin request with
                 | Ok () -> 0
-                | Error e2 -> run request showWin autoApprove 0 (arbiterCount + 1)
+                | Error e2 -> run request showWin autoApprove (arbiterCount + 1)
             | Error _ ->
-                run request showWin autoApprove 0 (arbiterCount + 1)
-        | Some plan ->
-            showPlan plan
+                run request showWin autoApprove (arbiterCount + 1)
+        else
+            showPlan sprintsResult overview
             if autoApprove || AnsiConsole.Confirm("Execute? ", true) then
-                match runWithLive plan showWin request with
+                match runWithLive sprintsResult showWin request with
                 | Ok () -> 0
-                | Error e when e.StartsWith("REPLAN_REQUESTED") ->
-                    run request showWin autoApprove (replanCount + 1) 0  // Reset arbiterCount on explicit replan
                 | Error e -> 
                     match invokeArbiter request e None showWin with
-                    | Ok newPlan ->
-                        showPlan newPlan
-                        match runWithLive newPlan showWin request with
+                    | Ok newSprints ->
+                        showPlan newSprints overview
+                        match runWithLive newSprints showWin request with
                         | Ok () -> 0
-                        | Error e2 -> run request showWin autoApprove 0 (arbiterCount + 1)
+                        | Error e2 -> run request showWin autoApprove (arbiterCount + 1)
                     | Error _ ->
-                        run request showWin autoApprove 0 (arbiterCount + 1)
+                        run request showWin autoApprove (arbiterCount + 1)
             else 0
 
-// CI/AzDo Monitoring module
-module CIMonitor =
-    type BuildStatus = Pending | Success | Failed of failures: string list
-    
-    let runGitPush () =
-        try
-            let result = cli { Exec "git"; Arguments [| "push" |] } |> Command.execute
-            if result.ExitCode = 0 then Ok (result.Text |> Option.defaultValue "")
-            else Error (result.Error |> Option.defaultValue "" |> fun e -> e + (result.Text |> Option.defaultValue ""))
-        with ex -> Error ex.Message
-    
-    let extractUniqueFailuresWithLLM (buildOutput: string) showWin = async {
-        // Use LLM to extract unique test/build failures
-        let prompt = Prompts.lines [
-            "--- CI FAILURE ANALYZER ---"
-            ""
-            "Your job is to extract UNIQUE failures from CI build output."
-            "This CI has many dimensions (OS, config, product switches) so same failure may appear multiple times."
-            ""
-            "ANALYZE THIS OUTPUT AND LIST:"
-            "1. UNIQUE build failures (don't repeat the same error)"
-            "2. UNIQUE test failures (don't repeat the same failing test)"
-            ""
-            "Format your response as:"
-            "BUILD_FAILURES:"
-            "- error 1"
-            "- error 2"
-            ""
-            "TEST_FAILURES:"
-            "- TestName1"
-            "- TestName2"
-            ""
-            "If no failures, output: NO_FAILURES"
-            ""
-            "BUILD OUTPUT:"
-            buildOutput
-        ]
-        let! result = runAgent prompt "CI-FailureAnalyzer" showWin
-        if result.Contains("NO_FAILURES") then return []
-        else 
-            // Parse the failure lists
-            let lines = result.Split('\n') |> Array.filter (fun l -> l.StartsWith("- "))
-            return lines |> Array.map (fun l -> l.Substring(2).Trim()) |> Array.toList
-    }
-    
-    let checkBuildStatus showWin = async {
-        // Check AzDo/GitHub Actions status via gh CLI
-        try
-            let result = cli { Exec "gh"; Arguments [| "pr"; "checks"; "--fail-fast" |] } |> Command.execute
-            let output = result.Text |> Option.defaultValue ""
-            let errors = result.Error |> Option.defaultValue ""
-            
-            if output.Contains("pass") && not (output.Contains("fail")) then
-                return Success
-            elif output.Contains("pending") || output.Contains("in_progress") then
-                return Pending
-            else
-                let! failures = extractUniqueFailuresWithLLM (output + "\n" + errors) showWin
-                return Failed failures
-        with _ ->
-            return Pending  // If we can't check, assume pending
-    }
-    
-    let monitorCI showWin maxWaitMinutes = async {
-        let mutable status = Pending
-        let mutable waited = 0
-        let intervalMinutes = 30
-        
-        setMessage "Starting CI monitoring..."
-        
-        while status = Pending && waited < maxWaitMinutes do
-            let! s = checkBuildStatus showWin
-            status <- s
-            
-            match status with
-            | Success ->
-                setMessage "[green]✓ CI passed![/]"
-            | Failed failures ->
-                setMessage $"[red]✗ CI failed with {failures.Length} unique failures[/]"
-            | Pending ->
-                setMessage $"[yellow]CI pending... waiting {intervalMinutes}min (total: {waited}min)[/]"
-                Thread.Sleep(intervalMinutes * 60 * 1000)
-                waited <- waited + intervalMinutes
-        
-        return status
-    }
-    
-    let runCIFixupLoop request showWin = async {
-        let mutable status = Pending
-        let mutable iteration = 0
-        let maxIterations = 5
-        
-        while not (status = Success) && iteration < maxIterations do
-            iteration <- iteration + 1
-            setMessage $"CI Fixup iteration {iteration}/{maxIterations}"
-            
-            // Monitor CI
-            let! s = monitorCI showWin 180  // Max 3 hours wait
-            status <- s
-            
-            match status with
-            | Success -> ()
-            | Pending -> 
-                setMessage "[yellow]CI still pending after max wait[/]"
-            | Failed failures ->
-                if iteration < maxIterations then
-                    // Create a fixup task
-                    let failureLines = failures |> List.map (fun f -> "- " + f)
-                    let fixupPromptLines = 
-                        [
-                            "--- CI FIXUP AGENT ---"
-                            ""
-                            "CI has failed with the following UNIQUE issues:"
-                        ] @ failureLines @ [
-                            ""
-                            "Your job is to fix these CI failures."
-                            ""
-                            "1. Read .tools/ralph/BACKLOG.md to understand the feature"
-                            "2. Investigate each failure"
-                            "3. Make targeted fixes"
-                            "4. Commit and push the fixes"
-                            ""
-                            "Focus only on fixing CI failures, not redesigning."
-                        ]
-                    let fixupPrompt = fixupPromptLines |> String.concat "\n"
-                    
-                    let! _ = runAgent fixupPrompt "CI-Fixup" showWin
-                    
-                    // Push the fixes
-                    match runGitPush() with
-                    | Ok _ -> setMessage "[green]Pushed fixes[/]"
-                    | Error e -> setMessage $"[red]Push failed[/]"
-        
-        return status
-    }
+// ============================================================================
+// ENTRY POINT
+// ============================================================================
 
 let runInteractive () = 
     AnsiConsole.Write(FigletText("RALPH").Color(Color.Yellow))
     let showWin = AnsiConsole.Confirm("Show agent windows? ", true)
     let request = AnsiConsole.Ask<string> "[green]Request:[/] "
-    run request showWin false 0 0
+    run request showWin false 0
 
 let runWithPush request showWin auto =
-    let result = run request showWin auto 0 0
+    let result = run request showWin auto 0
     if result = 0 then
         setMessage "[cyan]Pushing changes and monitoring CI...[/]"
         match CIMonitor.runGitPush() with
         | Ok _ ->
             setMessage "[green]✓ Pushed successfully[/]"
-            let status = CIMonitor.runCIFixupLoop request showWin |> Async.RunSynchronously
+            let status = CIMonitor.runCIFixupLoop runAgent setMessage request showWin |> Async.RunSynchronously
             match status with
             | CIMonitor.Success -> 0
             | CIMonitor.Pending -> 0
@@ -1494,4 +602,4 @@ match fsi.CommandLineArgs |> Array.toList |> List.tail with
     let push = List.contains "--push" args
     if String.IsNullOrWhiteSpace request then printfn "No request.  Use --help"; exit 1
     if push then runWithPush request showWin auto |> exit
-    else run request showWin auto 0 0 |> exit
+    else run request showWin auto 0 |> exit
