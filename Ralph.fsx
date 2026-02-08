@@ -54,6 +54,9 @@ let addIterationReason sprintPath iter reason =
 let addIterationRecord sprintPath (record: IterationRecord) =
     StateOps.addIterationRecord &state sprintPath record
 
+let addVerifierResultToLastIteration sprintPath verifierName passed summary =
+    StateOps.addVerifierResultToLastIteration &state sprintPath verifierName passed summary
+
 let updateDoDResults sprintPath (results: DoDResult list) =
     StateOps.updateDoDResults &state sprintPath results
 
@@ -119,14 +122,17 @@ let verifyStage showWin sprintFilePath (verifierName: VerifierName) (sprintItem:
     match interpretVerifierOutput out with
     | VPassed summary ->
         state <- { state with LastVerifierLog = Some (verifierName, true, summary) }
+        addVerifierResultToLastIteration sprintFilePath verifierName true summary
         setMessage $"[green]✓ {verifierName} passed[/]"
         return Ok ()
     | VFailed summary ->
         state <- { state with LastVerifierLog = Some (verifierName, false, summary) }
+        addVerifierResultToLastIteration sprintFilePath verifierName false summary
         setMessage $"[red]✗ {verifierName} failed[/]"
         return Error $"{verifierName}: {summary}"
     | VInconclusive summary ->
         state <- { state with LastVerifierLog = Some (verifierName, false, summary) }
+        addVerifierResultToLastIteration sprintFilePath verifierName false summary
         setMessage $"[yellow]{verifierName} inconclusive[/]"
         return Error $"{verifierName} verification did not output VERIFY_PASSED or VERIFY_FAILED"
 }
@@ -175,7 +181,10 @@ let showPlan (sprints: BacklogItem list) (overview: string) =
 // ============================================================================
 
 let rec runBacklogItem (item: BacklogItem) iter totalIter feedback showWin = async {
+    // Hard limit - give up completely
     if iter > Config.MaxIterations then return Error "Max iterations"
+    // Arbiter threshold - request arbiter intervention (recoverable)
+    elif iter > Config.ArbiterThreshold then return Error "ARBITER_NEEDED"
     else
         if iter = 1 then
             startItemTiming item.FilePath
@@ -448,25 +457,77 @@ let runWithLive (sprints: BacklogItem list) showWin (originalRequest: string) =
     
     result
 
-let invokeArbiter (originalRequest: string) (errorReason: string) (failedSprintOrder: int option) (showWin: bool) : Result<BacklogItem list, string> =
+let invokeArbiter (originalRequest: string) (showWin: bool) : Result<BacklogItem list, string> =
     state <- { state with CurrentPhase = "Arbiter"; Message = "Invoking arbiter for recovery..." }
     liveCtx |> Option.iter (fun ctx -> ctx.Refresh())
     
-    let finishedSprints = 
+    // Find the failed sprint (the one that's Running or first non-Done)
+    let failedItem = 
+        state.Backlog 
+        |> List.tryFind (fun (_, status, _) -> 
+            match status with Running _ -> true | _ -> false)
+        |> Option.orElse (
+            state.Backlog 
+            |> List.tryFind (fun (_, status, _) -> 
+                match status with Done _ -> false | _ -> true))
+        |> Option.map (fun (item, _, _) -> item)
+    
+    // Build completed sprints as SprintHistory
+    let completedSprints: XmlPrompt.SprintHistory list = 
+        state.Backlog 
+        |> List.choose (fun (item, status, timing) -> 
+            match status with 
+            | Done iters -> 
+                Some { SprintId = item.Order
+                       SprintName = item.Name
+                       Summary = timing.Summary |> Option.defaultValue $"Completed in {iters} iterations" }
+            | _ -> None)
+    
+    // Build pending sprints with file paths
+    let pendingSprints: (int * string * string) list = 
         state.Backlog 
         |> List.choose (fun (item, status, _) -> 
-            match status with Done _ -> Some (item.Order, item.Name) | _ -> None)
-    let pendingSprints = 
-        state.Backlog 
-        |> List.choose (fun (item, status, _) -> 
-            match status with Done _ -> None | _ -> Some (item.Order, item.Name))
+            match status with Done _ -> None | _ -> Some (item.Order, item.Name, item.FilePath))
+    
+    // Build failed sprint context with iteration history
+    let failedContext: XmlPrompt.FailedSprintContext option =
+        failedItem |> Option.bind (fun item ->
+            let timing = getItemTiming item.FilePath
+            timing |> Option.map (fun t ->
+                // Count verifier failures
+                let verifierFailureCounts = 
+                    t.IterationHistory 
+                    |> List.collect (fun h -> h.VerifierResults)
+                    |> List.filter (fun (_, passed, _) -> not passed)
+                    |> List.groupBy (fun (name, _, _) -> name)
+                    |> List.map (fun (name, failures) -> (name, failures.Length))
+                    |> Map.ofList
+                
+                // Get last 3 iterations for context (avoid token bloat)
+                let lastIterations = 
+                    t.IterationHistory 
+                    |> List.sortByDescending (fun h -> h.Iteration)
+                    |> List.truncate 3
+                    |> List.sortBy (fun h -> h.Iteration)
+                    |> List.map (fun h -> 
+                        { Iteration = h.Iteration
+                          AgentOutput = h.AgentOutput
+                          VerifierResults = h.VerifierResults } : XmlPrompt.IterationHistory)
+                
+                { SprintOrder = item.Order
+                  SprintName = item.Name
+                  SprintFilePath = item.FilePath
+                  IterationsSpent = t.IterationHistory.Length
+                  LastIterations = lastIterations
+                  VerifierFailureCounts = verifierFailureCounts } : XmlPrompt.FailedSprintContext
+            ))
     
     let completedBacklogItems = 
         state.Backlog 
         |> List.filter (fun (_, status, _) -> match status with Done _ -> true | _ -> false)
     let completedFilePaths = completedBacklogItems |> List.map (fun (item, _, _) -> item.FilePath) |> Set.ofList
     
-    let arbiterPrompt = Prompts.arbiter originalRequest errorReason failedSprintOrder 0 finishedSprints pendingSprints
+    let arbiterPrompt = Prompts.arbiter originalRequest failedContext completedSprints pendingSprints
     let arbiterResult = runAgent arbiterPrompt "Arbiter" showWin |> Async.RunSynchronously
     
     let newSprintsFromDisk = SprintFiles.readAllSprints()
@@ -486,7 +547,7 @@ let invokeArbiter (originalRequest: string) (errorReason: string) (failedSprintO
         liveCtx |> Option.iter (fun ctx -> ctx.Refresh())
         Error "Arbiter could not produce valid plan"
 
-let rec run request showWin autoApprove arbiterCount = 
+let rec run request showWin autoApprove arbiterCount (ciFailureContext: string option) = 
     if arbiterCount >= 3 then
         AnsiConsole.MarkupLine "[red]Max arbiter attempts (3). Stopping.[/]"
         1
@@ -505,9 +566,15 @@ let rec run request showWin autoApprove arbiterCount =
         let mutable sprintsResult: BacklogItem list = []
         let mutable planFinished = false
         
+        // Use CI-aware architect if we have failure context
+        let architectPrompt = 
+            match ciFailureContext with
+            | Some ciOutput -> Prompts.architectWithCIContext request ciOutput
+            | None -> Prompts.architect request
+        
         let planTask = Task.Run(fun () ->
             try
-                let _ = runAgent (Prompts.architect request) "Architect" showWin |> Async.RunSynchronously
+                let _ = runAgent architectPrompt "Architect" showWin |> Async.RunSynchronously
                 sprintsResult <- SprintFiles.readAllSprints()
             with ex ->
                 state <- { state with ErrorLog = Some ex.Message }
@@ -534,28 +601,28 @@ let rec run request showWin autoApprove arbiterCount =
         
         if sprintsResult.Length = 0 then
             state <- { state with ErrorLog = Some "Planning failed: No sprint files created" }
-            match invokeArbiter request "Planning failed: No sprint files created" None showWin with
+            match invokeArbiter request showWin with
             | Ok newSprints ->
                 showPlan newSprints overview
                 match runWithLive newSprints showWin request with
                 | Ok () -> 0
-                | Error e2 -> run request showWin autoApprove (arbiterCount + 1)
+                | Error e2 -> run request showWin autoApprove (arbiterCount + 1) None
             | Error _ ->
-                run request showWin autoApprove (arbiterCount + 1)
+                run request showWin autoApprove (arbiterCount + 1) None
         else
             showPlan sprintsResult overview
             if autoApprove || AnsiConsole.Confirm("Execute? ", true) then
                 match runWithLive sprintsResult showWin request with
                 | Ok () -> 0
                 | Error e -> 
-                    match invokeArbiter request e None showWin with
+                    match invokeArbiter request showWin with
                     | Ok newSprints ->
                         showPlan newSprints overview
                         match runWithLive newSprints showWin request with
                         | Ok () -> 0
-                        | Error e2 -> run request showWin autoApprove (arbiterCount + 1)
+                        | Error e2 -> run request showWin autoApprove (arbiterCount + 1) None
                     | Error _ ->
-                        run request showWin autoApprove (arbiterCount + 1)
+                        run request showWin autoApprove (arbiterCount + 1) None
             else 0
 
 // ============================================================================
@@ -566,20 +633,53 @@ let runInteractive () =
     AnsiConsole.Write(FigletText("RALPH").Color(Color.Yellow))
     let showWin = AnsiConsole.Confirm("Show agent windows? ", true)
     let request = AnsiConsole.Ask<string> "[green]Request:[/] "
-    run request showWin false 0
+    run request showWin false 0 None
 
-let runWithPush request showWin auto =
-    let result = run request showWin auto 0
+let rec runWithPush request showWin auto ciAttempt =
+    if ciAttempt >= 3 then
+        AnsiConsole.MarkupLine "[red]Max CI retry attempts (3). Stopping.[/]"
+        1
+    else
+        let result = run request showWin auto 0 None
+        if result = 0 then
+            setMessage "[cyan]Pushing changes and monitoring CI...[/]"
+            match CIMonitor.runGitPush() with
+            | Ok _ ->
+                setMessage "[green]✓ Pushed successfully[/]"
+                let status = CIMonitor.pollCI setMessage 120 |> Async.RunSynchronously  // 2 hour timeout
+                match status with
+                | CIMonitor.Success -> 
+                    AnsiConsole.MarkupLine "[green]✓ CI passed![/]"
+                    0
+                | CIMonitor.Pending -> 
+                    AnsiConsole.MarkupLine "[yellow]CI still pending after timeout[/]"
+                    0  // Treat pending as success (user can check manually)
+                | CIMonitor.Failed ciOutput ->
+                    AnsiConsole.MarkupLine "[red]✗ CI failed - restarting with CI context...[/]"
+                    // Restart the ENTIRE flow with CI failure context
+                    // Architect will see the failure and can create fixup sprints
+                    runWithCIContext request showWin auto (ciAttempt + 1) ciOutput
+            | Error e ->
+                state <- { state with ErrorLog = Some $"Push failed: {e}" }
+                1
+        else result
+
+and runWithCIContext request showWin auto ciAttempt ciOutput =
+    let result = run request showWin auto 0 (Some ciOutput)
     if result = 0 then
-        setMessage "[cyan]Pushing changes and monitoring CI...[/]"
+        setMessage "[cyan]Pushing CI fixes...[/]"
         match CIMonitor.runGitPush() with
         | Ok _ ->
-            setMessage "[green]✓ Pushed successfully[/]"
-            let status = CIMonitor.runCIFixupLoop runAgent setMessage request showWin |> Async.RunSynchronously
+            setMessage "[green]✓ Pushed fixes[/]"
+            let status = CIMonitor.pollCI setMessage 120 |> Async.RunSynchronously
             match status with
-            | CIMonitor.Success -> 0
+            | CIMonitor.Success -> 
+                AnsiConsole.MarkupLine "[green]✓ CI passed after fixes![/]"
+                0
             | CIMonitor.Pending -> 0
-            | CIMonitor.Failed _ -> 1
+            | CIMonitor.Failed newCiOutput ->
+                AnsiConsole.MarkupLine "[red]✗ CI still failing - another retry...[/]"
+                runWithCIContext request showWin auto (ciAttempt + 1) newCiOutput
         | Error e ->
             state <- { state with ErrorLog = Some $"Push failed: {e}" }
             1
@@ -601,5 +701,5 @@ match fsi.CommandLineArgs |> Array.toList |> List.tail with
     let auto = List.contains "--yes" args
     let push = List.contains "--push" args
     if String.IsNullOrWhiteSpace request then printfn "No request.  Use --help"; exit 1
-    if push then runWithPush request showWin auto |> exit
-    else run request showWin auto 0 |> exit
+    if push then runWithPush request showWin auto 0 |> exit
+    else run request showWin auto 0 None |> exit

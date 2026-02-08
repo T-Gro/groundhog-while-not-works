@@ -12,7 +12,8 @@ open YamlDotNet.Serialization
 
 module Config =
     let Model = "claude-opus-4.6"
-    let MaxIterations = 8  // Invoke arbiter/replanner after 8 iterations
+    let MaxIterations = 15  // Hard limit before giving up
+    let ArbiterThreshold = 4  // Invoke arbiter after this many failures (recoverable)
     // Use script location for verifiers, working directory for ralph output
     let scriptDir = __SOURCE_DIRECTORY__
     let ralphDir = Path.Combine(Directory.GetCurrentDirectory(), ".tools", "ralph")

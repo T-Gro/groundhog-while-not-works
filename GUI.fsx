@@ -226,6 +226,18 @@ module StateOps =
     let addIterationRecord (state: byref<State>) sprintPath (record: IterationRecord) =
         updateTiming &state sprintPath (fun t -> { t with IterationHistory = t.IterationHistory @ [record] })
 
+    /// Add verifier result to the last iteration record
+    let addVerifierResultToLastIteration (state: byref<State>) sprintPath (verifierName: VerifierName) (passed: bool) (summary: string) =
+        updateTiming &state sprintPath (fun t -> 
+            match t.IterationHistory with
+            | [] -> t  // No iteration yet, shouldn't happen
+            | history ->
+                let lastIdx = history.Length - 1
+                let lastRecord = history.[lastIdx]
+                let updatedRecord = { lastRecord with VerifierResults = lastRecord.VerifierResults @ [(verifierName, passed, summary)] }
+                { t with IterationHistory = history.[..lastIdx-1] @ [updatedRecord] }
+        )
+
     /// Update DoD results
     let updateDoDResults (state: byref<State>) sprintPath (results: DoDResult list) =
         updateTiming &state sprintPath (fun t -> { t with LastDoDResults = results })

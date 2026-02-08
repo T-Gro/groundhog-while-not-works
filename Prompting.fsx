@@ -163,7 +163,7 @@ module BacklogFile =
 
 /// XML prompt builder for subagents
 module XmlPrompt =
-    type Role = Implementor
+    type Role = Implementor | Arbiter
     
     type IterationHistory = {
         Iteration: int
@@ -183,10 +183,22 @@ module XmlPrompt =
         Summary: string
     }
     
+    /// Failed sprint context for Arbiter
+    type FailedSprintContext = {
+        SprintOrder: int
+        SprintName: string
+        SprintFilePath: string
+        IterationsSpent: int
+        LastIterations: IterationHistory list  // Last 3-4 iterations for context
+        VerifierFailureCounts: Map<VerifierName, int>  // Which verifiers failed most
+    }
+    
     let private roleElement (role: Role) =
         match role with
         | Implementor ->
             xt "Implementor" "YOU ARE AN IMPLEMENTOR for F# compiler. Write code fulfilling sprint requirements. Follow DoD. Minimize breaking changes. Reuse existing helpers. Minimize allocations. Build and tests MUST pass."
+        | Arbiter ->
+            xt "Arbiter" "YOU ARE THE ARBITER. A sprint has failed despite multiple attempts. Analyze WHY, then restructure the plan to fix the root cause."
     
     let private dodElement (dod: DoDResult list) =
         let criteria = dod |> List.map (fun d ->
@@ -247,6 +259,101 @@ module XmlPrompt =
         ] @ 
         (match iterationHistoryElement iterationHistory with Some el -> [el] | None -> []))
     
+    /// Build XML prompt for Arbiter with full failure context
+    let buildArbiter 
+        (originalRequest: string)
+        (failedSprint: FailedSprintContext option)
+        (completedSprints: SprintHistory list)
+        (pendingSprints: (int * string * string) list)  // (order, name, filePath)
+        =
+        
+        let completedSprintsEl = 
+            if completedSprints.IsEmpty then [xt "none" "No sprints completed yet"]
+            else completedSprints |> List.map (fun s -> 
+                xat "done" [("order", string s.SprintId)] $"{s.SprintName}: {s.Summary}")
+        
+        let pendingSprintsEl = 
+            if pendingSprints.IsEmpty then [xt "none" "No pending sprints"]
+            else pendingSprints |> List.map (fun (order, name, path) -> 
+                xac "pending" [("order", string order); ("path", path)] [xt "name" name])
+        
+        let failureContextEl = 
+            match failedSprint with
+            | None -> [xt "failed_at" "Pre-sprint (planning phase)"]
+            | Some ctx ->
+                let verifierIssues = 
+                    ctx.VerifierFailureCounts 
+                    |> Map.toList 
+                    |> List.sortByDescending snd
+                    |> List.map (fun (name, count) -> 
+                        xat "verifier_issue" [("name", name); ("failures", string count)] 
+                            $"{name} failed {count} times")
+                
+                let lastIterationsEl =
+                    ctx.LastIterations 
+                    |> List.map (fun h ->
+                        let verifiers = h.VerifierResults |> List.map (fun (name, passed, summary) ->
+                            let passedStr = if passed then "true" else "false"
+                            xat name [("passed", passedStr)] summary)
+                        xac "iteration" [("n", string h.Iteration)] (
+                            [xt "agent_output" (if h.AgentOutput.Length > 2000 then h.AgentOutput.Substring(0, 2000) + "..." else h.AgentOutput)] 
+                            @ verifiers))
+                
+                [
+                    xc "failed_sprint" [
+                        xat "info" [("order", string ctx.SprintOrder); ("path", ctx.SprintFilePath)] ctx.SprintName
+                        xt "iterations_spent" (string ctx.IterationsSpent)
+                    ]
+                    xc "why_it_failed" verifierIssues
+                    xc "last_iterations" lastIterationsEl
+                ]
+        
+        xc "R" [
+            roleElement Arbiter
+            xt "original_request" originalRequest
+            
+            xc "FIRST_READ_THESE" [
+                xat "backlog" [("path", Config.backlogFile)] "READ THIS FIRST - contains original plan, analysis, and approach"
+                xat "failed_sprint" [("path", match failedSprint with Some s -> s.SprintFilePath | None -> "N/A")] "The sprint that failed - understand what was attempted"
+            ]
+            
+            xc "system_context" [
+                xt "sprints_dir" Config.sprintsDir
+                xt "template" Config.templateFile
+            ]
+            
+            xc "sprint_status" [
+                xc "completed_DO_NOT_TOUCH" completedSprintsEl
+                xc "remaining_CAN_MODIFY" pendingSprintsEl
+            ]
+            
+            xc "failure_context" failureContextEl
+            
+            xc "your_analysis_steps" [
+                xt "step1" "READ BACKLOG.md to understand the ORIGINAL PLAN and approach"
+                xt "step2" "READ the failed sprint file to see what was attempted"
+                xt "step3" "ANALYZE the iteration history - what did the agent try? What did verifiers reject?"
+                xt "step4" "IDENTIFY the root cause - is the sprint too ambitious? Missing context? Wrong approach? Original plan flawed?"
+                xt "step5" "DECIDE: split into smaller sprints? Add missing context? Change approach? Update BACKLOG.md if plan was wrong?"
+            ]
+            
+            xc "your_powers" [
+                xt "power" "DELETE any remaining sprint file"
+                xt "power" "CREATE new sprint files (use higher numbers: 10_, 11_, etc.)"
+                xt "power" "MODIFY remaining sprint files to add missing context or simplify"
+                xt "power" "Update BACKLOG.md notes"
+            ]
+            
+            xc "critical_rules" [
+                xt "rule" "Each new/modified sprint must be SELF-CONTAINED with ALL context"
+                xt "rule" "Include specific guidance based on what went wrong"
+                xt "rule" "If verifier X kept failing, address that specifically in the new sprint"
+                xt "rule" "DoD format: each item on its own line starting with '- '"
+            ]
+            
+            xt "when_done" "Output: ARBITER_COMPLETE"
+        ]
+    
     let toPrompt (el: XElement) = el.ToString()
 
 /// All prompt templates
@@ -298,17 +405,76 @@ module Prompts =
             ]
             
             xc "critical_rules" [
-                xt "rule1" "Each sprint file is SELF-CONTAINED. Include ALL context in the file itself."
-                xt "rule2" "Implementor has NO knowledge of the codebase except what YOU tell them in the sprint file."
-                xt "rule3" "Include: file paths, function names, code patterns to follow, examples."
-                xt "rule4" "Each sprint must be INDEPENDENTLY TESTABLE - include tests in same sprint, never separate."
-                xt "rule5" "Definition of Done items must be CONCRETE: 'Tests pass' not 'Code is good'."
+                xt "rule" "Each sprint file is SELF-CONTAINED. Include ALL context in the file itself."
+                xt "rule" "Implementor has NO knowledge of the codebase except what YOU tell them in the sprint file."
+                xt "rule" "Include: file paths, function names, code patterns to follow, examples."
+                xt "rule" "Each sprint must be INDEPENDENTLY TESTABLE - include tests in same sprint, never separate."
+                xt "rule" "Definition of Done items must be CONCRETE: 'Tests pass' not 'Code is good'."
             ]
             
             xc "dod_format" [
                 xt "format" "Each criterion on its own line starting with '- ' (dash space)"
                 xt "example" "- Build succeeds with no warnings\n- Function X returns correct value for input Y\n- Tests pass locally"
                 xt "bad" "Do NOT use '- [ ]' checkboxes. Just '- text'."
+            ]
+            
+            xt "when_done" "Output: PLAN_COMPLETE"
+        ] |> XmlPrompt.toPrompt
+
+    /// Architect with CI failure context - sprints already exist, CI failed
+    let architectWithCIContext request (ciFailureOutput: string) = 
+        let templatePath = Config.templateFile
+        let sprintsDir = Config.sprintsDir
+        let backlogPath = Config.backlogFile
+        xc "R" [
+            xt "role" "ARCHITECT. Previous implementation passed local verification but FAILED CI. Your job: fix the sprint plan."
+            xt "request" request
+            
+            xc "situation" [
+                xt "fact" "Previous sprints were implemented and passed ALL local verifiers."
+                xt "fact" "Code was pushed but CI (continuous integration) FAILED."
+                xt "fact" "Existing sprint files are in the sprints directory."
+                xt "fact" "BACKLOG.md contains the original plan."
+            ]
+            
+            xc "ci_failure_output" [
+                xt "raw" ciFailureOutput
+            ]
+            
+            xc "your_options" [
+                xt "option1" "CREATE new fixup sprint(s) to address CI failures specifically"
+                xt "option2" "MODIFY existing sprint files if the original approach was flawed"
+                xt "option3" "REPLACE a sprint entirely if needed"
+                xt "tip" "Often a single targeted fixup sprint (e.g., 99_CI_Fixup.md) is sufficient"
+            ]
+            
+            xc "locations" [
+                xt "backlog" backlogPath
+                xt "sprints_dir" sprintsDir
+                xt "template" templatePath
+            ]
+            
+            xc "analyze_first" [
+                xt "step1" "Read BACKLOG.md to understand the feature"
+                xt "step2" "Read existing sprint files to see what was implemented"
+                xt "step3" "Analyze CI failure output to identify root causes"
+                xt "step4" "Decide: new fixup sprint vs modify existing"
+            ]
+            
+            xc "sprint_file_format" [
+                xt "line1" "---"
+                xt "line2" "---"
+                xt "required" "# Sprint: [title]"
+                xt "required" "## Context - WHY this sprint exists (mention CI failure!)"
+                xt "required" "## Description - WHAT to fix with DETAILED guidance"
+                xt "required" "## Definition of Done - bullet list starting with '- '"
+            ]
+            
+            xc "critical_rules" [
+                xt "rule1" "Each sprint file is SELF-CONTAINED. Include ALL context."
+                xt "rule2" "For CI fixes, reference the SPECIFIC errors in the sprint file."
+                xt "rule3" "Implementor has NO knowledge of CI output unless you include it."
+                xt "rule4" "Include: exact error messages, file paths, what to change."
             ]
             
             xt "when_done" "Output: PLAN_COMPLETE"
@@ -335,62 +501,13 @@ module Prompts =
             ]
         ]) |> XmlPrompt.toPrompt
 
-    let arbiter (originalRequest: string) (errorReason: string) (sprintOrder: int option) (iterationsSpent: int) (finishedSprints: (int * string) list) (pendingSprints: (int * string) list) =
-        let sprintInfo = match sprintOrder with Some o -> $"Sprint {o}" | None -> "Pre-sprint (planning)"
-        let finishedList = 
-            if finishedSprints.IsEmpty then [xt "none" "No sprints completed yet"]
-            else finishedSprints |> List.map (fun (order, name) -> xt "done" $"{order}: {name}")
-        let pendingList = 
-            if pendingSprints.IsEmpty then [xt "none" "No pending sprints"]
-            else pendingSprints |> List.map (fun (order, name) -> xt "pending" $"{order}: {name}")
-        xc "R" [
-            xt "role" "ARBITER - you fix failed sprints by restructuring the plan"
-            
-            xc "how_this_system_works" [
-                xt "fact1" "Sprint files in sprints/ directory are executed one by one by separate agents"
-                xt "fact2" "Each agent ONLY sees its own sprint file - nothing else"
-                xt "fact3" "COMPLETED sprints are DONE and should NOT be touched"
-                xt "fact4" "You can DELETE/CREATE/MODIFY remaining sprint files to fix the problem"
-            ]
-            
-            xc "locations" [
-                xt "backlog" Config.backlogFile
-                xt "sprints_dir" Config.sprintsDir
-                xt "template" Config.templateFile
-            ]
-            
-            xc "sprint_status" [
-                xc "completed_DO_NOT_TOUCH" finishedList
-                xc "remaining_CAN_MODIFY" pendingList
-            ]
-            
-            xc "failure" [
-                xt "failed_at" sprintInfo
-                xt "iterations_spent" (string iterationsSpent)
-                xt "error" errorReason
-            ]
-            
-            xt "original_request" originalRequest
-            
-            xc "your_powers" [
-                xt "power" "DELETE any remaining sprint file"
-                xt "power" "CREATE new sprint files (use higher numbers: 10_, 11_, etc.)"
-                xt "power" "MODIFY remaining sprint files to add missing context"
-                xt "power" "Update BACKLOG.md notes"
-            ]
-            
-            xc "sprint_file_format" [
-                xt "reminder" "New sprints must follow format: ---\\n---\\n# Sprint: Title\\n## Context\\n## Description\\n## Definition of Done"
-                xt "dod_format" "Each DoD item on its own line starting with '- ' (dash space)"
-                xt "self_contained" "Include ALL context in each sprint file - implementor sees NOTHING else"
-            ]
-            
-            xc "task" [
-                xt "analyze" "What went wrong? Root cause?"
-                xt "decide" "How to restructure remaining work?"
-                xt "action" "Delete/create/modify sprint files, then output ARBITER_COMPLETE"
-            ]
-        ] |> XmlPrompt.toPrompt
+    let arbiter 
+        (originalRequest: string) 
+        (failedSprintContext: XmlPrompt.FailedSprintContext option)
+        (completedSprints: XmlPrompt.SprintHistory list)
+        (pendingSprints: (int * string * string) list) =  // (order, name, filePath)
+        XmlPrompt.buildArbiter originalRequest failedSprintContext completedSprints pendingSprints
+        |> XmlPrompt.toPrompt
 
 /// Standard suffix added to all verifier prompts
 let verifierSuffix = """
