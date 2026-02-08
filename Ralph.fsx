@@ -565,6 +565,7 @@ let rec run request showWin autoApprove arbiterCount (ciFailureContext: string o
         
         let mutable sprintsResult: BacklogItem list = []
         let mutable planFinished = false
+        let mutable architectOutput = ""
         
         // Use CI-aware architect if we have failure context
         let architectPrompt = 
@@ -574,7 +575,7 @@ let rec run request showWin autoApprove arbiterCount (ciFailureContext: string o
         
         let planTask = Task.Run(fun () ->
             try
-                let _ = runAgent architectPrompt "Architect" showWin |> Async.RunSynchronously
+                architectOutput <- runAgent architectPrompt "Architect" showWin |> Async.RunSynchronously
                 sprintsResult <- SprintFiles.readAllSprints()
             with ex ->
                 state <- { state with ErrorLog = Some ex.Message }
@@ -600,15 +601,40 @@ let rec run request showWin autoApprove arbiterCount (ciFailureContext: string o
         let overview = BacklogFile.readOverview() |> Option.defaultValue request
         
         if sprintsResult.Length = 0 then
-            state <- { state with ErrorLog = Some "Planning failed: No sprint files created" }
-            match invokeArbiter request showWin with
-            | Ok newSprints ->
-                showPlan newSprints overview
-                match runWithLive newSprints showWin request with
-                | Ok () -> 0
-                | Error e2 -> run request showWin autoApprove (arbiterCount + 1) None
-            | Error _ ->
-                run request showWin autoApprove (arbiterCount + 1) None
+            // 0 sprints is pathological - show output and let human decide
+            AnsiConsole.MarkupLine "[red bold]PLANNING PRODUCED 0 SPRINTS[/]"
+            AnsiConsole.WriteLine()
+            AnsiConsole.MarkupLine "[yellow]Architect output:[/]"
+            AnsiConsole.WriteLine()
+            
+            // Show truncated output in a panel
+            let truncatedOutput = 
+                if architectOutput.Length > 4000 then architectOutput.Substring(0, 4000) + "\n... (truncated)"
+                else architectOutput
+            AnsiConsole.Write(Panel(truncatedOutput).Header("Architect Response"))
+            
+            AnsiConsole.WriteLine()
+            AnsiConsole.MarkupLine "[yellow]Check:[/]"
+            AnsiConsole.MarkupLine $"  - Sprint files dir: {Config.sprintsDir}"
+            AnsiConsole.MarkupLine $"  - Backlog file: {Config.backlogFile}"
+            AnsiConsole.WriteLine()
+            
+            if autoApprove then
+                // In auto mode, can't ask user - just fail
+                AnsiConsole.MarkupLine "[red]Running in --yes mode, cannot prompt for input. Failing.[/]"
+                1
+            else
+                let choice = AnsiConsole.Prompt(
+                    SelectionPrompt<string>()
+                        .Title("[green]What would you like to do?[/]")
+                        .AddChoices([| "Retry with same request"; "Enter new request"; "Quit" |]))
+                
+                match choice with
+                | "Retry with same request" -> run request showWin autoApprove 0 ciFailureContext
+                | "Enter new request" ->
+                    let newRequest = AnsiConsole.Ask<string> "[green]New request:[/] "
+                    run newRequest showWin autoApprove 0 None
+                | _ -> 1
         else
             showPlan sprintsResult overview
             if autoApprove || AnsiConsole.Confirm("Execute? ", true) then
