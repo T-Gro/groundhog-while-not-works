@@ -15,6 +15,10 @@ module MarkupBuilder =
     let truncateRaw maxLen (suffix: string) (RawText s) : RawText =
         if s.Length > maxLen then RawText (s.[..maxLen - suffix.Length - 1] + suffix) else RawText s
     
+    let concat (parts: SafeMarkup list) = parts |> List.map (fun (SafeMarkup s) -> s) |> String.concat "" |> SafeMarkup
+    
+    let literal s = SafeMarkup s
+    
     let statusIcon = function
         | Passed 1 -> SafeMarkup "[green]✓[/]" 
         | Passed n -> SafeMarkup $"[green]✓{n}[/]"
@@ -29,6 +33,14 @@ module MarkupBuilder =
     
     let fileLink filePath displayName : SafeMarkup =
         SafeMarkup $"[link=file://{Markup.Escape filePath}]{Markup.Escape displayName}[/]"
+    
+    /// Build verifier log line with sprint context - all parts properly escaped
+    let verifierLogLine (sprintOrder: int) (verifierName: string) (passed: bool) (summary: string) : SafeMarkup =
+        let icon = if passed then literal "[green]✓[/]" else literal "[red]✗[/]"
+        let sprintLabel = if sprintOrder = 0 then "Final" else $"S{sprintOrder}"
+        let escapedName = escape (RawText verifierName)
+        let escapedSummary = summary |> RawText |> truncateRaw 60 "..." |> escape
+        concat [icon; literal $" [dim]({sprintLabel})[/] [bold]"; escapedName; literal "[/]: "; escapedSummary]
     
     let toString (SafeMarkup s) = s
 
@@ -156,10 +168,7 @@ module GUI =
         let lastVerifierLine : IRenderable =
             match state.LastVerifierLog with
             | Some (sprintOrder, name, passed, summary) ->
-                let icon = if passed then "[green]✓[/]" else "[red]✗[/]"
-                let sprintLabel = if sprintOrder = 0 then "Final" else $"S{sprintOrder}"
-                let summaryText = RawText summary |> truncateRaw 60 "..." |> escape |> toString
-                Markup($"{icon} [{sprintLabel}] [bold]{escapeMarkup name}[/]: {summaryText}") :> IRenderable
+                Markup(verifierLogLine sprintOrder name passed summary |> toString) :> IRenderable
             | None -> Text("") :> IRenderable
         
         // Final verification table
