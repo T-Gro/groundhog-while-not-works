@@ -155,10 +155,11 @@ module GUI =
         // Last verifier result
         let lastVerifierLine : IRenderable =
             match state.LastVerifierLog with
-            | Some (name, passed, summary) ->
+            | Some (sprintOrder, name, passed, summary) ->
                 let icon = if passed then "[green]✓[/]" else "[red]✗[/]"
-                let summaryText = RawText summary |> truncateRaw 70 "..." |> escape |> toString
-                Markup($"{icon} [bold]{escapeMarkup name}[/]: {summaryText}") :> IRenderable
+                let sprintLabel = if sprintOrder = 0 then "Final" else $"S{sprintOrder}"
+                let summaryText = RawText summary |> truncateRaw 60 "..." |> escape |> toString
+                Markup($"{icon} [{sprintLabel}] [bold]{escapeMarkup name}[/]: {summaryText}") :> IRenderable
             | None -> Text("") :> IRenderable
         
         // Final verification table

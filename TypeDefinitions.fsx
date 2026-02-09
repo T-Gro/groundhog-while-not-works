@@ -65,7 +65,7 @@ type State = {
     CIStatus: (string * bool option) option  // (PR URL, passed: None=pending, Some true=passed, Some false=failed)
     CurrentPhase: string  // "Planning", "Executing", "Final Verification", "Complete"
     CurrentAgentTask: string  // What agent is currently doing
-    LastVerifierLog: (string * bool * string) option  // (verifier name, passed, summary)
+    LastVerifierLog: (int * string * bool * string) option  // (sprint order, verifier name, passed, summary)
     PlanOverview: string  // Brief overview of the plan
     ErrorLog: string option  // Last error if any
 }

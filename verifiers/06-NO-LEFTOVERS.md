@@ -9,3 +9,9 @@ Important remarks
 - If you see many pointers to the same issue/URL in implemention, it is a bad symptom about code spread all over the place.
 - The code should explain what is being done via naming, functions, abstractions. Comments in code are only needed for high level concepts and general idea - this is SUPER RARE for individual bugfixes.
 - As a rule of thumb - it comment says what EITHER code below says (in code) or function/test name says - just drop the comment alltogether
+
+
+
+If you are fully happy and have 0 feedback, output plain VERIFY_PASSED.
+If you want any changes done, write those changes in your final output and write VERIFY_FAILED exactly as is.
+You must use this exact casing and form and not write the other one - an outer orchestrator decides what happens next based on that.

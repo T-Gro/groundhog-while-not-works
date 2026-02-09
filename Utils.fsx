@@ -11,7 +11,8 @@ open YamlDotNet.Serialization
 module Config =
     let Model = "claude-opus-4.6-fast"
     let MaxIterations = 15
-    let ArbiterThreshold = 4
+    let ArbiterThreshold = 6  // Iterations per sprint before calling arbiter
+    let MaxArbiterAttempts = 6  // Max arbiter invocations before giving up
     let scriptDir = __SOURCE_DIRECTORY__
     let ralphDir = Path.Combine(Directory.GetCurrentDirectory(), ".tools", "ralph")
     let sprintsDir = Path.Combine(ralphDir, "sprints")

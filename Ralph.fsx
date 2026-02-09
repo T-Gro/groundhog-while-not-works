@@ -99,17 +99,17 @@ let verifyStage showWin sprintFilePath (verifierName: string) (sprintItem: Backl
     
     match interpretVerifierOutput out with
     | VPassed summary ->
-        state <- { state with LastVerifierLog = Some (verifierName, true, summary) }
+        state <- { state with LastVerifierLog = Some (sprintItem.Order, verifierName, true, summary) }
         addVerifierResultToLastIteration sprintFilePath verifierName true summary
         setMessage $"[green]✓ {verifierName} passed[/]"
         return Ok ()
     | VFailed summary ->
-        state <- { state with LastVerifierLog = Some (verifierName, false, summary) }
+        state <- { state with LastVerifierLog = Some (sprintItem.Order, verifierName, false, summary) }
         addVerifierResultToLastIteration sprintFilePath verifierName false summary
         setMessage $"[red]✗ {verifierName} failed[/]"
         return Error $"{verifierName}: {summary}"
     | VInconclusive summary ->
-        state <- { state with LastVerifierLog = Some (verifierName, false, summary) }
+        state <- { state with LastVerifierLog = Some (sprintItem.Order, verifierName, false, summary) }
         addVerifierResultToLastIteration sprintFilePath verifierName false summary
         setMessage $"[yellow]{verifierName} inconclusive[/]"
         return Error $"{verifierName} verification did not output VERIFY_PASSED or VERIFY_FAILED"
@@ -275,12 +275,12 @@ let runFinalVerifiers showWin = async {
             state <- { state with 
                         FinalVerifierResults = state.FinalVerifierResults.Add(name, Passed (prevCount + 1))
                         FinalVerifierSummaries = state.FinalVerifierSummaries.Add(name, summary)
-                        LastVerifierLog = Some (name, true, summary) }
+                        LastVerifierLog = Some (0, name, true, summary) }
         | VFailed summary | VInconclusive summary ->
             state <- { state with 
                         FinalVerifierResults = state.FinalVerifierResults.Add(name, Failed (prevCount + 1))
                         FinalVerifierSummaries = state.FinalVerifierSummaries.Add(name, summary)
-                        LastVerifierLog = Some (name, false, summary) }
+                        LastVerifierLog = Some (0, name, false, summary) }
             allPassed <- false
         
         liveCtx |> Option.iter (fun ctx -> ctx.Refresh())
@@ -568,9 +568,9 @@ let invokeArbiter (originalRequest: string) (showWin: bool) : Result<BacklogItem
 let rec run request showWin autoApprove arbiterCount (ciFailureContext: string option) = 
     Logging.info $"run() called: arbiterCount={arbiterCount}, autoApprove={autoApprove}"
     
-    if arbiterCount >= 3 then
-        Logging.error "Max arbiter attempts (3) reached"
-        AnsiConsole.MarkupLine "[red]Max arbiter attempts (3). Stopping.[/]"
+    if arbiterCount >= Config.MaxArbiterAttempts then
+        Logging.error $"Max arbiter attempts ({Config.MaxArbiterAttempts}) reached"
+        AnsiConsole.MarkupLine $"[red]Max arbiter attempts ({Config.MaxArbiterAttempts}). Stopping.[/]"
         1
     else
         state <- { 
