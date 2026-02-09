@@ -1,7 +1,3 @@
-// Prompting.fsx - All prompting logic, IO, verifiers, sprint files, backlog
-// Loaded by Ralph.fsx after TypeDefinitions.fsx
-// IMPORTANT: No #load here - Ralph.fsx loads all dependencies
-
 open System
 open System.IO
 open System.Text.RegularExpressions
@@ -10,187 +6,107 @@ open Utils
 open XmlHelpers
 open TypeDefinitions
 
-/// Verifier file system - verifiers are discovered from verifiers/*.md files
 module Verifiers =
-    /// Parse filename to extract order and display name
-    let private parseFileName (name: string) : int * string =
+    let private parseFileName (name: string) =
         let m = Regex.Match(name, @"^(\d+)-(.+)$")
         if m.Success then (int m.Groups.[1].Value, m.Groups.[2].Value)
         else (999, name)
     
-    /// List all available verifier names from the verifiers directory, ordered by prefix
-    let listAll () : VerifierName list =
+    let listAll () =
         if Directory.Exists(Config.verifiersDir) then
             Directory.GetFiles(Config.verifiersDir, "*.md")
             |> Array.map Path.GetFileNameWithoutExtension
-            |> Array.map (fun n -> (n, parseFileName n))
-            |> Array.sortBy (fun (_, (order, _)) -> order)
-            |> Array.map (fun (_, (_, displayName)) -> displayName)
+            |> Array.sortBy id  // "01-X" < "02-Y" alphabetically
+            |> Array.map (parseFileName >> snd)
             |> Array.toList
         else []
     
-    /// Get the raw filename (with prefix) for a display name
-    let private getFileName (displayName: string) : string option =
+    let isValid name = listAll() |> List.contains name
+    
+    let private getFileNameRaw displayName =
         if Directory.Exists(Config.verifiersDir) then
             Directory.GetFiles(Config.verifiersDir, "*.md")
             |> Array.map Path.GetFileNameWithoutExtension
-            |> Array.tryFind (fun n ->
-                let (_, name) = parseFileName n
-                name = displayName)
+            |> Array.tryFind (fun n -> snd (parseFileName n) = displayName)
         else None
     
-    /// Read a verifier file and return (roleDescription, fullPrompt)
-    let private readFile (displayName: string) : (string * string) option =
-        match getFileName displayName with
+    let getPrompt name =
+        match getFileNameRaw name with
         | Some fileName ->
-            let filePath = Path.Combine(Config.verifiersDir, fileName + ".md")
-            if File.Exists(filePath) then
-                let content = File.ReadAllText(filePath)
-                let lines = content.Split([|'\n'; '\r'|], StringSplitOptions.RemoveEmptyEntries)
-                if lines.Length > 0 then Some (lines.[0].Trim(), content)
-                else None
-            else None
-        | None -> None
+            let path = Path.Combine(Config.verifiersDir, fileName + ".md")
+            if File.Exists path then File.ReadAllText path
+            else $"Verifier {name}: No file found."
+        | None -> $"Verifier {name}: No file found."
     
-    /// Get the prompt for a verifier
-    let getPrompt (name: VerifierName) : string =
-        match readFile name with
-        | Some (_, prompt) -> prompt
-        | None -> $"Verifier {name}: No file found at verifiers/{name}.md. Please create one."
-    
-    /// Get the role description for a verifier (first line of file)
-    let getRoleDescription (name: VerifierName) : string =
-        match readFile name with
-        | Some (role, _) -> role
-        | None -> $"Verifier for {name}"
-    
-    /// Get the file path for a verifier by display name
-    let getFilePath (name: string) : string =
-        let files = 
-            if Directory.Exists(Config.verifiersDir) then
-                Directory.GetFiles(Config.verifiersDir, "*.md") 
-                |> Array.filter (fun f -> 
-                    let fn = Path.GetFileNameWithoutExtension(f)
-                    let displayName = 
-                        if fn.Length > 3 && fn.[2] = '-' && Char.IsDigit(fn.[0]) && Char.IsDigit(fn.[1]) 
-                        then fn.Substring(3) else fn
-                    displayName = name)
-                |> Array.tryHead
-            else None
-        files |> Option.defaultValue (Path.Combine(Config.verifiersDir, $"{name}.md"))
+    let getFilePath name =
+        match getFileNameRaw name with
+        | Some fileName -> Path.Combine(Config.verifiersDir, fileName + ".md")
+        | None -> Path.Combine(Config.verifiersDir, $"{name}.md")
 
-/// Sprint files management - individual files per sprint
 module SprintFiles =
-    let private parseFileName (name: string) : int * string =
+    let private parseFileName name =
         let m = Regex.Match(name, @"^(\d+)_(.+)\.md$")
         if m.Success then (int m.Groups.[1].Value, m.Groups.[2].Value.Replace("_", " "))
         else (999, Path.GetFileNameWithoutExtension(name))
     
-    let listSprints () : string list =
+    let listSprints () =
         if Directory.Exists(Config.sprintsDir) then
             Directory.GetFiles(Config.sprintsDir, "*.md")
-            |> Array.map (fun p -> (p, parseFileName (Path.GetFileName p)))
-            |> Array.sortBy (fun (_, (order, _)) -> order)
-            |> Array.map fst
+            |> Array.sortBy Path.GetFileName
             |> Array.toList
         else []
     
-    let private parseDoD (body: string) : string list =
+    let private findDoDIndex (lines: string[]) =
+        lines |> Array.tryFindIndex (fun l -> 
+            l.TrimStart().StartsWith("## Definition of Done") || l.TrimStart().StartsWith("## DoD"))
+    
+    let private parseDoD (body: string) =
         let lines = body.Split('\n')
-        let dodStart = lines |> Array.tryFindIndex (fun l -> 
-            l.TrimStart().StartsWith("## Definition of Done") || 
-            l.TrimStart().StartsWith("## DoD"))
-        match dodStart with
+        match findDoDIndex lines with
         | Some idx ->
             lines.[(idx + 1)..]
             |> Array.takeWhile (fun l -> not (l.TrimStart().StartsWith("## ")))
             |> Array.filter (fun l -> l.TrimStart().StartsWith("- "))
-            |> Array.map (fun l -> 
-                let trimmed = l.TrimStart()
-                let content = Regex.Replace(trimmed, @"^- \[[x ]\] ", "")
-                let content = if content.StartsWith("- ") then content.Substring(2) else content
-                content.Trim())
+            |> Array.map (fun l -> Regex.Replace(l.TrimStart(), @"^- (\[[x ]\] )?", "").Trim())
             |> Array.toList
         | None -> []
     
-    let private parseDescription (body: string) : string =
+    let private parseDescription (body: string) =
         let lines = body.Split('\n')
-        let dodStart = lines |> Array.tryFindIndex (fun l -> 
-            l.TrimStart().StartsWith("## Definition of Done") || 
-            l.TrimStart().StartsWith("## DoD"))
-        match dodStart with
+        match findDoDIndex lines with
         | Some idx -> lines.[0..(idx - 1)] |> String.concat "\n" |> fun s -> s.Trim()
         | None -> body.Trim()
     
-    let readSprint (filePath: string) : BacklogItem option =
+    let readSprint filePath =
         if not (File.Exists filePath) then None
         else
             try
-                let content = File.ReadAllText(filePath)
-                let body = YamlFrontmatter.extractBody content
+                let body = File.ReadAllText filePath |> YamlFrontmatter.extractBody
                 let (order, name) = parseFileName (Path.GetFileName filePath)
-                Some {
-                    FilePath = filePath
-                    Order = order
-                    Name = name
-                    Description = parseDescription body
-                    DoD = parseDoD body
-                }
+                Some { FilePath = filePath; Order = order; Name = name; Description = parseDescription body; DoD = parseDoD body }
             with _ -> None
     
-    let readAllSprints () : BacklogItem list =
-        listSprints () |> List.choose readSprint
-    
-    let ensureDir () =
-        Directory.CreateDirectory(Config.sprintsDir) |> ignore
-    
-    let clearSprints () =
-        if Directory.Exists(Config.sprintsDir) then
-            Directory.GetFiles(Config.sprintsDir, "*.md") |> Array.iter File.Delete
+    let readAllSprints () = listSprints () |> List.choose readSprint
+    let ensureDir () = Directory.CreateDirectory(Config.sprintsDir) |> ignore
+    let clearSprints () = if Directory.Exists(Config.sprintsDir) then Directory.GetFiles(Config.sprintsDir, "*.md") |> Array.iter File.Delete
 
-/// Backlog file management - overview only
 module BacklogFile =
-    let writeOverview (overview: string) =
+    let writeOverview overview =
         Directory.CreateDirectory(Config.ralphDir) |> ignore
         File.WriteAllText(Config.backlogFile, $"# BACKLOG\n\n{overview}")
     
-    let readOverview () : string option =
-        if File.Exists(Config.backlogFile) then Some (File.ReadAllText(Config.backlogFile))
-        else None
-    
-    let hasValidPlan () : bool =
-        File.Exists(Config.backlogFile) && SprintFiles.listSprints().Length > 0
+    let readOverview () = if File.Exists(Config.backlogFile) then Some (File.ReadAllText(Config.backlogFile)) else None
+    let hasValidPlan () = File.Exists(Config.backlogFile) && SprintFiles.listSprints().Length > 0
 
-/// XML prompt builder for subagents
 module XmlPrompt =
     type Role = Implementor | Arbiter
     
-    type IterationHistory = {
-        Iteration: int
-        AgentOutput: string
-        VerifierResults: (VerifierName * bool * string) list
-    }
-    
-    type SprintHistory = {
-        SprintId: int
-        SprintName: string
-        Summary: string
-    }
-    
-    type StepHistory = {
-        Iteration: int
-        Passed: bool
-        Summary: string
-    }
-    
-    /// Failed sprint context for Arbiter
+    type IterationHistory = { Iteration: int; AgentOutput: string; VerifierResults: (string * bool * string) list }
+    type SprintHistory = { SprintId: int; SprintName: string; Summary: string }
+    type StepHistory = { Iteration: int; Passed: bool; Summary: string }
     type FailedSprintContext = {
-        SprintOrder: int
-        SprintName: string
-        SprintFilePath: string
-        IterationsSpent: int
-        LastIterations: IterationHistory list  // Last 3-4 iterations for context
-        VerifierFailureCounts: Map<VerifierName, int>  // Which verifiers failed most
+        SprintOrder: int; SprintName: string; SprintFilePath: string; IterationsSpent: int
+        LastIterations: IterationHistory list; VerifierFailureCounts: Map<string, int>
     }
     
     let private roleElement (role: Role) =
@@ -224,8 +140,18 @@ module XmlPrompt =
     let private iterationHistoryElement (history: IterationHistory list) =
         if history.IsEmpty then None
         else
+            // Only keep last 3 iterations for prompt size, but preserve iteration numbers
+            let maxHistory = 3
+            let skippedCount = max 0 (history.Length - maxHistory)
+            let recentHistory = history |> List.skip skippedCount
+            
+            let skippedNote = 
+                if skippedCount > 0 then 
+                    [xt "note" $"({skippedCount} earlier iteration(s) omitted for brevity)"]
+                else []
+            
             let items = 
-                history |> List.collect (fun h ->
+                recentHistory |> List.collect (fun h ->
                     let verifierPart = 
                         h.VerifierResults |> List.map (fun (verifierName, passed, feedback) ->
                             let elName = verifierName.ToLowerInvariant().Replace("-", "_")
@@ -234,7 +160,7 @@ module XmlPrompt =
                     let exchanges = [xt "out" h.AgentOutput] @ verifierPart
                     [xac ("i" + string h.Iteration) [] exchanges]
                 )
-            Some (xc "history" items)
+            Some (xc "history" (skippedNote @ items))
     
     let build 
         (role: Role) 
@@ -259,13 +185,7 @@ module XmlPrompt =
         ] @ 
         (match iterationHistoryElement iterationHistory with Some el -> [el] | None -> []))
     
-    /// Build XML prompt for Arbiter with full failure context
-    let buildArbiter 
-        (originalRequest: string)
-        (failedSprint: FailedSprintContext option)
-        (completedSprints: SprintHistory list)
-        (pendingSprints: (int * string * string) list)  // (order, name, filePath)
-        =
+    let buildArbiter (originalRequest: string) (failedSprint: FailedSprintContext option) (completedSprints: SprintHistory list) (pendingSprints: (int * string * string) list) =
         
         let completedSprintsEl = 
             if completedSprints.IsEmpty then [xt "none" "No sprints completed yet"]
@@ -356,11 +276,7 @@ module XmlPrompt =
     
     let toPrompt (el: XElement) = el.ToString()
 
-/// All prompt templates
 module Prompts =
-    let lines items = items |> String.concat "\n"
-    let bullets items = items |> List.map (fun c -> $"- {c}") |> lines
-    
     let architect request = 
         let templatePath = Config.templateFile
         let sprintsDir = Config.sprintsDir
@@ -480,6 +396,61 @@ module Prompts =
             xt "when_done" "Output: PLAN_COMPLETE"
         ] |> XmlPrompt.toPrompt
 
+    /// Architect for restart - learn from previous failed run and clean up
+    let architectRestart (originalRequest: string) (sprintsSummary: string) (logContent: string) (gitDiff: string) = 
+        let templatePath = Config.templateFile
+        let sprintsDir = Config.sprintsDir
+        let backlogPath = Config.backlogFile
+        xc "R" [
+            xt "role" "ARCHITECT. Previous run CRASHED or FAILED. Your job: learn from the failure and create a NEW plan."
+            xt "request" originalRequest
+            
+            xc "situation" [
+                xt "fact" "A previous attempt to complete this request failed or crashed midway."
+                xt "fact" "You have access to: sprint files from previous run, execution log, git diff of changes made."
+                xt "fact" "Your job is to LEARN from what went wrong and create a BETTER plan."
+                xt "instruction" "After analyzing, DELETE old sprint files and create new ones."
+            ]
+            
+            xc "previous_sprints" [
+                xt "files" sprintsSummary
+            ]
+            
+            xc "execution_log" [
+                xt "log" (if logContent.Length > 10000 then logContent.Substring(logContent.Length - 10000) else logContent)
+            ]
+            
+            xc "changes_made" [
+                xt "git_diff" (if gitDiff.Length > 15000 then gitDiff.Substring(0, 15000) + "\n... (truncated)" else gitDiff)
+            ]
+            
+            xc "your_task" [
+                xt "step1" "Analyze the log to understand what went wrong (verifier failures, errors, loops)"
+                xt "step2" "Analyze the git diff to see what was partially implemented"
+                xt "step3" "Decide: continue from where it left off, OR start fresh with different approach"
+                xt "step4" "DELETE all files in the sprints directory using rm command"
+                xt "step5" "Create NEW sprint files with improved approach"
+                xt "step6" "Update BACKLOG.md with lessons learned"
+            ]
+            
+            xc "locations" [
+                xt "backlog" backlogPath
+                xt "sprints_dir" sprintsDir
+                xt "template" templatePath
+            ]
+            
+            xc "sprint_file_format" [
+                xt "line1" "---"
+                xt "line2" "---"
+                xt "required" "# Sprint: [title]"
+                xt "required" "## Context - Include lessons from failed attempt"
+                xt "required" "## Description - WHAT to implement"
+                xt "required" "## Definition of Done - bullet list starting with '- '"
+            ]
+            
+            xt "when_done" "Output: PLAN_COMPLETE"
+        ] |> XmlPrompt.toPrompt
+
     let implement (s: BacklogItem) (iter: int) (feedback: string list) (prevDoDResults: DoDResult list) (pastSprints: XmlPrompt.SprintHistory list) (pastSteps: XmlPrompt.StepHistory list) (iterHistory: XmlPrompt.IterationHistory list) = 
         let dod = s.DoD |> List.map (fun c -> 
             let passed = prevDoDResults |> List.tryFind (fun r -> r.Criterion = c) |> Option.bind (fun r -> r.Passed)
@@ -524,7 +495,7 @@ let parseManagementSummary (output: string) : string option =
     else None
 
 /// Build context for sprint-level verification
-let buildSprintVerificationContext (sprintItem: BacklogItem) (approvedCommits: Map<VerifierName, string>) (currentCommit: string option) (currentVerifier: VerifierName) =
+let buildSprintVerificationContext (sprintItem: BacklogItem) (approvedCommits: Map<string, string>) (currentCommit: string option) (currentVerifier: string) =
     let commitSection = 
         if approvedCommits.IsEmpty then []
         else

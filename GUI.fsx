@@ -1,7 +1,3 @@
-// GUI.fsx - Terminal dashboard and state management
-// Loaded by Ralph.fsx after Prompting.fsx
-// IMPORTANT: No #load here - Ralph.fsx loads all dependencies
-
 #r "nuget: Spectre.Console"
 
 open System
@@ -13,17 +9,36 @@ open Utils
 open TypeDefinitions
 open Prompting
 
-/// Terminal GUI helpers and display functions
+module MarkupBuilder =
+    let escape (raw: RawText) : SafeMarkup = RawText.escapeForMarkup raw
+    
+    let truncateRaw maxLen (suffix: string) (RawText s) : RawText =
+        if s.Length > maxLen then RawText (s.[..maxLen - suffix.Length - 1] + suffix) else RawText s
+    
+    let statusIcon = function
+        | Passed 1 -> SafeMarkup "[green]✓[/]" 
+        | Passed n -> SafeMarkup $"[green]✓{n}[/]"
+        | Failed 1 -> SafeMarkup "[red]✗[/]" 
+        | Failed n -> SafeMarkup $"[red]✗{n}[/]"
+        | NotStarted -> SafeMarkup "[dim]○[/]"
+    
+    let dodIcon = function
+        | Some true -> SafeMarkup "[green]✓[/]"
+        | Some false -> SafeMarkup "[red]✗[/]"
+        | None -> SafeMarkup "[dim]○[/]"
+    
+    let fileLink filePath displayName : SafeMarkup =
+        SafeMarkup $"[link=file://{Markup.Escape filePath}]{Markup.Escape displayName}[/]"
+    
+    let toString (SafeMarkup s) = s
+
 module GUI =
+    open MarkupBuilder
+    
     let escapeMarkup (s: string) = Markup.Escape(s)
     
-    let phaseName = function Implement -> "Implement"
-    
-    /// Format sprint name from filename for display (underscores to spaces, remove prefix)
-    let sprintDisplayName (filePath: string) =
-        let fileName = Path.GetFileNameWithoutExtension(filePath)
-        let withoutPrefix = Regex.Replace(fileName, @"^\d+_", "")
-        withoutPrefix.Replace("_", " ")
+    let sprintDisplayName (filePath: string) = 
+        Regex.Replace(Path.GetFileNameWithoutExtension(filePath), @"^\d+_", "").Replace("_", " ")
     
     /// Build the main dashboard widget
     let buildDashboard (state: State) (verifierNames: string list) =
@@ -75,14 +90,14 @@ module GUI =
         for name in verifierNames do
             let shortName = if name.Length > 8 then name.Substring(0, 7) + "…" else name
             let filePath = Verifiers.getFilePath name
-            let header = $"[link=file://{filePath}]{shortName}[/]"
+            let header = fileLink filePath shortName |> toString
             t.AddColumn(TableColumn(Markup(header)).Width(8)) |> ignore
         
         for (item, status, timing) in state.Backlog do
             let now = DateTime.Now
             let displayName = sprintDisplayName item.FilePath
             let shortDisplayName = if displayName.Length > 24 then displayName.Substring(0, 21) + "..." else displayName
-            let clickableName = $"[link=file://{item.FilePath}]{escapeMarkup shortDisplayName}[/]"
+            let clickableName = fileLink item.FilePath shortDisplayName |> toString
             let statusStr, iterStr = 
                 match status with
                 | Todo -> "[dim]Todo[/]", "[dim]-[/]"
@@ -100,10 +115,8 @@ module GUI =
                 | _ -> "[dim]-[/]"
             
             let verifierIcon name =
-                match timing.VerifierResults.TryFind name with
-                | Some (Passed iters) -> if iters > 1 then $"[green]✓{iters}[/]" else "[green]✓[/]"
-                | Some (Failed iters) -> if iters > 1 then $"[red]✗{iters}[/]" else "[red]✗[/]"
-                | Some NotStarted | None -> "[dim]○[/]"
+                let status = timing.VerifierResults.TryFind name |> Option.defaultValue NotStarted
+                statusIcon status |> toString
             
             let verifierCells = verifierNames |> List.map verifierIcon
             let allCells = [string item.Order; clickableName; statusStr; iterStr; timeStr] @ verifierCells
@@ -116,19 +129,19 @@ module GUI =
                 let dodItems = 
                     if timing.LastDoDResults.Length > 0 then
                         timing.LastDoDResults |> List.map (fun r ->
-                            let icon = match r.Passed with Some true -> "[green]✓[/]" | Some false -> "[red]✗[/]" | None -> "[dim]○[/]"
-                            let criterion = if r.Criterion.Length > 60 then r.Criterion.Substring(0, 57) + "..." else r.Criterion
+                            let icon = dodIcon r.Passed |> toString
+                            let criterion = RawText r.Criterion |> truncateRaw 60 "..." |> RawText.value
                             $"{icon} {escapeMarkup criterion}")
                     else
                         item.DoD |> List.map (fun c -> 
-                            let criterion = if c.Length > 60 then c.Substring(0, 57) + "..." else c
-                            $"[dim]○[/] {escapeMarkup criterion}")
+                            let criterion = RawText c |> truncateRaw 60 "..." |> RawText.value
+                            $"{dodIcon None |> toString} {escapeMarkup criterion}")
                 let dodSection = dodItems |> String.concat "\n"
                 let lastFailure = 
                     match timing.IterationReasons |> List.tryLast with
                     | Some (i, r) -> 
-                        let reason = if r.Length > 80 then r.Substring(0, 77) + "..." else r
-                        $"\n[red]Last issue (iter {i}):[/] {escapeMarkup reason}"
+                        let reason = RawText r |> truncateRaw 80 "..." |> escape |> toString
+                        $"\n[red]Last issue (iter {i}):[/] {reason}"
                     | None -> ""
                 Panel(Markup($"[bold]{escapeMarkup item.Name}[/]\n{dodSection}{lastFailure}"))
                     .Header($"[cyan]Current: Sprint {item.Order} (iter {iter})[/]")
@@ -144,8 +157,8 @@ module GUI =
             match state.LastVerifierLog with
             | Some (name, passed, summary) ->
                 let icon = if passed then "[green]✓[/]" else "[red]✗[/]"
-                let summaryText = if summary.Length > 70 then summary.Substring(0, 67) + "..." else summary
-                Markup($"{icon} [bold]{escapeMarkup name}[/]: {escapeMarkup summaryText}") :> IRenderable
+                let summaryText = RawText summary |> truncateRaw 70 "..." |> escape |> toString
+                Markup($"{icon} [bold]{escapeMarkup name}[/]: {summaryText}") :> IRenderable
             | None -> Text("") :> IRenderable
         
         // Final verification table
@@ -158,17 +171,16 @@ module GUI =
                 ft.AddColumn(TableColumn("").Width(8)) |> ignore
                 ft.AddColumn(TableColumn("Summary").NoWrap()) |> ignore
                 for name in verifierNames do
-                    let status = 
-                        match state.FinalVerifierResults.TryFind name with
-                        | Some (Passed i) -> if i > 1 then $"[green]✓({i})[/]" else "[green]✓ Pass[/]"
-                        | Some (Failed i) -> if i > 1 then $"[red]✗({i})[/]" else "[red]✗ Fail[/]"
-                        | Some NotStarted | None -> "[dim]○[/]"
+                    let verifierStatus = state.FinalVerifierResults.TryFind name |> Option.defaultValue NotStarted
+                    let statusStr = statusIcon verifierStatus |> toString
                     let summary = 
                         state.FinalVerifierSummaries.TryFind name 
                         |> Option.defaultValue "" 
-                        |> fun s -> if s.Length > 50 then s.Substring(0, 47) + "..." else s
-                        |> escapeMarkup
-                    ft.AddRow([| Markup(escapeMarkup name) :> IRenderable; Markup(status) :> IRenderable; Markup(summary) :> IRenderable |]) |> ignore
+                        |> RawText
+                        |> truncateRaw 50 "..."
+                        |> escape
+                        |> toString
+                    ft.AddRow([| Markup(escapeMarkup name) :> IRenderable; Markup(statusStr) :> IRenderable; Markup(summary) :> IRenderable |]) |> ignore
                 ft :> IRenderable
         
         // Error display
@@ -203,59 +215,80 @@ module GUI =
         
         Rows(rows)
 
-/// State update operations (functions that modify state)
-module StateOps =
-    /// Update status of a sprint
-    let updateStatus (state: byref<State>) (liveCtx: LiveDisplayContext option) sprintPath status msg =
+module StateTrans =
+    let withStatus sprintPath status msg (state: State) : State =
         let newBacklog = state.Backlog |> List.map (fun (s, st, timing) -> 
             if s.FilePath = sprintPath then (s, status, timing) else (s, st, timing))
-        state <- { state with Backlog = newBacklog; Message = msg }
-        liveCtx |> Option.iter (fun ctx -> ctx.Refresh())
+        { state with Backlog = newBacklog; Message = msg }
 
-    /// Update timing of a sprint
-    let updateTiming (state: byref<State>) sprintPath (f: BacklogItemTiming -> BacklogItemTiming) =
+    /// Apply timing transformation to a sprint
+    let withTiming sprintPath (f: BacklogItemTiming -> BacklogItemTiming) (state: State) : State =
         let newBacklog = state.Backlog |> List.map (fun (s, st, timing) -> 
             if s.FilePath = sprintPath then (s, st, f timing) else (s, st, timing))
-        state <- { state with Backlog = newBacklog }
+        { state with Backlog = newBacklog }
 
-    /// Add iteration reason for debugging
-    let addIterationReason (state: byref<State>) sprintPath iter reason =
-        updateTiming &state sprintPath (fun t -> { t with IterationReasons = t.IterationReasons @ [(iter, reason)] })
+    let withIterationReason sprintPath iter reason state =
+        withTiming sprintPath (fun t -> { t with IterationReasons = t.IterationReasons @ [(iter, reason)] }) state
 
-    /// Add iteration record for history
-    let addIterationRecord (state: byref<State>) sprintPath (record: IterationRecord) =
-        updateTiming &state sprintPath (fun t -> { t with IterationHistory = t.IterationHistory @ [record] })
+    let withIterationRecord sprintPath (record: IterationRecord) state =
+        withTiming sprintPath (fun t -> { t with IterationHistory = t.IterationHistory @ [record] }) state
 
-    /// Add verifier result to the last iteration record
-    let addVerifierResultToLastIteration (state: byref<State>) sprintPath (verifierName: VerifierName) (passed: bool) (summary: string) =
-        updateTiming &state sprintPath (fun t -> 
+    let withVerifierResult sprintPath verifierName passed summary state =
+        withTiming sprintPath (fun t -> 
             match t.IterationHistory with
-            | [] -> t  // No iteration yet, shouldn't happen
+            | [] -> t
             | history ->
                 let lastIdx = history.Length - 1
                 let lastRecord = history.[lastIdx]
                 let updatedRecord = { lastRecord with VerifierResults = lastRecord.VerifierResults @ [(verifierName, passed, summary)] }
                 { t with IterationHistory = history.[..lastIdx-1] @ [updatedRecord] }
-        )
+        ) state
 
-    /// Update DoD results
-    let updateDoDResults (state: byref<State>) sprintPath (results: DoDResult list) =
-        updateTiming &state sprintPath (fun t -> { t with LastDoDResults = results })
+    let withDoDResults sprintPath results state =
+        withTiming sprintPath (fun t -> { t with LastDoDResults = results }) state
 
-    /// Start timing for an item
-    let startItemTiming (state: byref<State>) sprintPath =
-        updateTiming &state sprintPath (fun t -> { t with StartTime = DateTime.Now })
+    let withTimingStarted sprintPath state =
+        withTiming sprintPath (fun t -> { t with StartTime = DateTime.Now }) state
 
-    /// End timing for an item
-    let endItemTiming (state: byref<State>) (liveCtx: LiveDisplayContext option) sprintPath summary =
-        updateTiming &state sprintPath (fun t -> { t with EndTime = Some DateTime.Now; Summary = Some summary })
-        liveCtx |> Option.iter (fun ctx -> ctx.Refresh())
+    let withTimingEnded sprintPath summary state =
+        withTiming sprintPath (fun t -> { t with EndTime = Some DateTime.Now; Summary = Some summary }) state
 
-    /// Get timing for an item
-    let getItemTiming (state: State) sprintPath =
+    let withMessage msg (state: State) : State =
+        { state with Message = msg }
+
+    let getItemTiming sprintPath (state: State) : BacklogItemTiming option =
         state.Backlog |> List.tryFind (fun (s, _, _) -> s.FilePath = sprintPath) |> Option.map (fun (_, _, t) -> t)
 
-    /// Set status message
+module StateOps =
+    let updateStatus (state: byref<State>) (liveCtx: LiveDisplayContext option) sprintPath status msg =
+        state <- StateTrans.withStatus sprintPath status msg state
+        liveCtx |> Option.iter (fun ctx -> ctx.Refresh())
+
+    let updateTiming (state: byref<State>) sprintPath f =
+        state <- StateTrans.withTiming sprintPath f state
+
+    let addIterationReason (state: byref<State>) sprintPath iter reason =
+        state <- StateTrans.withIterationReason sprintPath iter reason state
+
+    let addIterationRecord (state: byref<State>) sprintPath record =
+        state <- StateTrans.withIterationRecord sprintPath record state
+
+    let addVerifierResultToLastIteration (state: byref<State>) sprintPath verifierName passed summary =
+        state <- StateTrans.withVerifierResult sprintPath verifierName passed summary state
+
+    let updateDoDResults (state: byref<State>) sprintPath results =
+        state <- StateTrans.withDoDResults sprintPath results state
+
+    let startItemTiming (state: byref<State>) sprintPath =
+        state <- StateTrans.withTimingStarted sprintPath state
+
+    let endItemTiming (state: byref<State>) (liveCtx: LiveDisplayContext option) sprintPath summary =
+        state <- StateTrans.withTimingEnded sprintPath summary state
+        liveCtx |> Option.iter (fun ctx -> ctx.Refresh())
+
+    let getItemTiming (state: State) (sprintPath: string) =
+        StateTrans.getItemTiming sprintPath state
+
     let setMessage (state: byref<State>) (liveCtx: LiveDisplayContext option) msg =
-        state <- { state with Message = msg }
+        state <- StateTrans.withMessage msg state
         liveCtx |> Option.iter (fun ctx -> ctx.Refresh())

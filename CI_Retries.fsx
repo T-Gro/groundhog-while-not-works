@@ -1,22 +1,11 @@
-// CI_Retries.fsx - CI monitoring (simplified)
-// Loaded by Ralph.fsx after GUI.fsx
-// IMPORTANT: No #load here - Ralph.fsx loads all dependencies
-//
-// Design: CI failures restart the main run() loop with augmented context.
-// This module only handles push and polling - no separate CI fixup agents.
-
 #r "nuget: Fli"
 
 open System
 open System.Threading
 open Fli
 
-/// CI monitoring - push and poll only, failures handled by restarting main loop
 module CIMonitor =
-    type CIResult = 
-        | Success 
-        | Pending 
-        | Failed of rawOutput: string  // Raw CI output for context augmentation
+    type CIResult = Success | Pending | Failed of rawOutput: string
     
     /// Run git push command
     let runGitPush () =

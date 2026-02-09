@@ -1,8 +1,16 @@
-// TypeDefinitions.fsx - All type definitions for Ralph
-// Loaded by Ralph.fsx after Utils.fsx
-// IMPORTANT: No #load here - Ralph.fsx loads all dependencies
-
 open System
+
+type SafeMarkup = SafeMarkup of string
+type RawText = RawText of string
+
+module SafeMarkup =
+    let value (SafeMarkup s) = s
+    let literal s = SafeMarkup s
+    let concat (parts: SafeMarkup list) = parts |> List.map value |> String.concat "" |> SafeMarkup
+
+module RawText =
+    let value (RawText s) = s
+    let escapeForMarkup (RawText s) = SafeMarkup (s.Replace("[", "[[").Replace("]", "]]"))
 
 // DoD = Definition of Done - each item is a technically executable criterion
 type DoDResult = { Criterion: string; Passed: bool option }  // None = not yet evaluated
@@ -19,9 +27,6 @@ type BacklogItem = {
 // Phase is just Implement - verifiers handle all validation
 type Phase = Implement
 
-// Verifier names are now strings discovered from verifiers/*.md files
-type VerifierName = string
-
 // Track status AND iteration count for each verifier
 type VerifierStatus = NotStarted | Passed of iterations: int | Failed of iterations: int
 
@@ -29,7 +34,7 @@ type VerifierStatus = NotStarted | Passed of iterations: int | Failed of iterati
 type IterationRecord = {
     Iteration: int
     AgentOutput: string
-    VerifierResults: (VerifierName * bool * string) list
+    VerifierResults: (string * bool * string) list  // (verifierName, passed, summary)
 }
 
 type BacklogItemTiming = {
@@ -38,9 +43,9 @@ type BacklogItemTiming = {
     IterationReasons: (int * string) list  // (iteration, reason for retry)
     Summary: string option
     LastDoDResults: DoDResult list         // DoD results from last iteration
-    VerifierResults: Map<VerifierName, VerifierStatus>  // Track each verifier
+    VerifierResults: Map<string, VerifierStatus>  // Track each verifier
     IterationHistory: IterationRecord list  // Full history for retry context
-    ApprovedCommits: Map<VerifierName, string>  // Commit hash when verifier passed (for incremental checks)
+    ApprovedCommits: Map<string, string>  // Commit hash when verifier passed (for incremental checks)
 }
 
 type BacklogStatus = 
@@ -55,8 +60,8 @@ type State = {
     AgentStartTime: DateTime option  // When agent started (None = idle)
     TotalEstimatedIterations: int  // For progress calculation
     CompletedIterations: int
-    FinalVerifierResults: Map<VerifierName, VerifierStatus>  // Final verification after all sprints
-    FinalVerifierSummaries: Map<VerifierName, string>  // Management summaries from final verifiers
+    FinalVerifierResults: Map<string, VerifierStatus>  // Final verification after all sprints
+    FinalVerifierSummaries: Map<string, string>  // Management summaries from final verifiers
     CIStatus: (string * bool option) option  // (PR URL, passed: None=pending, Some true=passed, Some false=failed)
     CurrentPhase: string  // "Planning", "Executing", "Final Verification", "Complete"
     CurrentAgentTask: string  // What agent is currently doing

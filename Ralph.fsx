@@ -1,29 +1,23 @@
 #!/usr/bin/env dotnet fsi
 
-// Ralph.fsx - Main orchestration script
-// Loads satellite modules and provides agent execution + state management
-
-// Load satellite files in dependency order
 #load "Utils.fsx"
 #load "TypeDefinitions.fsx"
 #load "Prompting.fsx"
 #load "GUI.fsx"
 #load "CI_Retries.fsx"
 
-// Additional dependencies not in satellites
 #r "nuget: Fli"
 #r "nuget: Spectre.Console"
 
 open System
 open System.IO
+open System.Diagnostics
 open System.Text.RegularExpressions
 open System.Threading
 open System.Threading.Tasks
 open Fli
 open Spectre.Console
 open Spectre.Console.Rendering
-
-// Import from satellite modules
 open Utils
 open XmlHelpers
 open TypeDefinitions
@@ -31,85 +25,69 @@ open Prompting
 open GUI
 open CI_Retries
 
-// ============================================================================
-// MUTABLE STATE
-// ============================================================================
-
 let mutable state: State = emptyState
 let mutable liveCtx: LiveDisplayContext option = None
 
-// ============================================================================
-// STATE UPDATE HELPERS (wrappers around StateOps for mutable state access)
-// ============================================================================
+let updateStatus sprintPath status msg = StateOps.updateStatus &state liveCtx sprintPath status msg
+let updateTiming sprintPath f = StateOps.updateTiming &state sprintPath f
+let addIterationReason sprintPath iter reason = StateOps.addIterationReason &state sprintPath iter reason
+let addIterationRecord sprintPath record = StateOps.addIterationRecord &state sprintPath record
+let addVerifierResultToLastIteration sprintPath verifierName passed summary = StateOps.addVerifierResultToLastIteration &state sprintPath verifierName passed summary
+let updateDoDResults sprintPath results = StateOps.updateDoDResults &state sprintPath results
+let startItemTiming sprintPath = StateOps.startItemTiming &state sprintPath
+let endItemTiming sprintPath summary = StateOps.endItemTiming &state liveCtx sprintPath summary
+let getItemTiming sprintPath = StateOps.getItemTiming state sprintPath
+let setMessage msg = StateOps.setMessage &state liveCtx msg
 
-let updateStatus sprintPath status msg =
-    StateOps.updateStatus &state liveCtx sprintPath status msg
+let buildDashboard () = GUI.buildDashboard state (Verifiers.listAll ())
 
-let updateTiming sprintPath (f: BacklogItemTiming -> BacklogItemTiming) =
-    StateOps.updateTiming &state sprintPath f
-
-let addIterationReason sprintPath iter reason =
-    StateOps.addIterationReason &state sprintPath iter reason
-
-let addIterationRecord sprintPath (record: IterationRecord) =
-    StateOps.addIterationRecord &state sprintPath record
-
-let addVerifierResultToLastIteration sprintPath verifierName passed summary =
-    StateOps.addVerifierResultToLastIteration &state sprintPath verifierName passed summary
-
-let updateDoDResults sprintPath (results: DoDResult list) =
-    StateOps.updateDoDResults &state sprintPath results
-
-let startItemTiming sprintPath =
-    StateOps.startItemTiming &state sprintPath
-
-let endItemTiming sprintPath summary =
-    StateOps.endItemTiming &state liveCtx sprintPath summary
-
-let getItemTiming sprintPath =
-    StateOps.getItemTiming state sprintPath
-
-let setMessage msg =
-    StateOps.setMessage &state liveCtx msg
-
-// ============================================================================
-// DASHBOARD
-// ============================================================================
-
-let buildDashboard () =
-    GUI.buildDashboard state (Verifiers.listAll ())
-
-// ============================================================================
-// AGENT EXECUTION
-// ============================================================================
 
 let runAgent (prompt: string) (title: string) (_showWindow: bool) = async {
     Directory.CreateDirectory Config.ralphDir |> ignore
+    
+    Logging.info $"Starting agent: {title}"
     
     // Mark agent as running with task info
     state <- { state with AgentStartTime = Some DateTime.Now; CurrentAgentTask = title }
     liveCtx |> Option.iter (fun ctx -> ctx.UpdateTarget(buildDashboard()); ctx.Refresh())
     
-    // Run copilot via Fli
-    let result = 
-        cli {
-            Exec "copilot"
-            Arguments [| "--allow-all-tools"; "--allow-all-paths"; "--no-ask-user";"--no-color";"--plain-diff";"-s";"--model"; Config.Model; "--stream"; "off" |]
-            Input prompt
-        }
-        |> Command.execute
+    let mutable output = ""
+    let mutable exn: exn option = None
+    try
+        // Escape curly braces - Fli uses StreamWriter.WriteLine(format, arg) internally
+        // which interprets { and } as format placeholders
+        let escapedPrompt = prompt.Replace("{", "{{").Replace("}", "}}")
+        
+        // Run copilot via Fli
+        let result = 
+            cli {
+                Exec "copilot"
+                Arguments [| "--allow-all-tools"; "--allow-all-paths"; "--no-ask-user";"--no-color";"--plain-diff";"-s";"--model"; Config.Model; "--stream"; "off" |]
+                Input escapedPrompt
+            }
+            |> Command.execute
+        
+        output <- result.Text |> Option.defaultValue ""
+        Logging.info $"Agent {title} completed, output length: {output.Length}"
+        
+        if result.ExitCode <> 0 then
+            let err = result.Error |> Option.defaultValue "(no error text)"
+            Logging.error $"Agent {title} exited with code {result.ExitCode}: {err}"
+    with ex ->
+        Logging.exn ex $"runAgent({title})"
+        exn <- Some ex
     
+    // Always cleanup agent state
     state <- { state with AgentStartTime = None; CurrentAgentTask = "" }
     liveCtx |> Option.iter (fun ctx -> ctx.UpdateTarget(buildDashboard()); ctx.Refresh())
     
-    return result.Text |> Option.defaultValue ""
+    match exn with
+    | Some ex -> return raise ex
+    | None -> return output
 }
 
-// ============================================================================
-// VERIFICATION
-// ============================================================================
 
-let verifyStage showWin sprintFilePath (verifierName: VerifierName) (sprintItem: BacklogItem) = async {
+let verifyStage showWin sprintFilePath (verifierName: string) (sprintItem: BacklogItem) = async {
     setMessage $"Verifying {verifierName}..."
     
     let timing = getItemTiming sprintFilePath |> Option.defaultValue emptyTiming
@@ -137,7 +115,7 @@ let verifyStage showWin sprintFilePath (verifierName: VerifierName) (sprintItem:
         return Error $"{verifierName} verification did not output VERIFY_PASSED or VERIFY_FAILED"
 }
 
-let updateVerifierStatus sprintFilePath (verifierName: VerifierName) (passed: bool) =
+let updateVerifierStatus sprintFilePath (verifierName: string) (passed: bool) =
     updateTiming sprintFilePath (fun t -> 
         let prevCount = 
             match t.VerifierResults.TryFind verifierName with
@@ -176,15 +154,18 @@ let showPlan (sprints: BacklogItem list) (overview: string) =
     state <- { state with PlanOverview = $"{overview} ({sprints.Length} sprints)" }
     liveCtx |> Option.iter (fun ctx -> ctx.Refresh())
 
-// ============================================================================
-// BACKLOG EXECUTION
-// ============================================================================
 
 let rec runBacklogItem (item: BacklogItem) iter totalIter feedback showWin = async {
+    Logging.info $"runBacklogItem: Sprint {item.Order} ({item.Name}), iteration {iter}"
+    
     // Hard limit - give up completely
-    if iter > Config.MaxIterations then return Error "Max iterations"
+    if iter > Config.MaxIterations then 
+        Logging.error $"Sprint {item.Order} exceeded MaxIterations ({Config.MaxIterations})"
+        return Error "Max iterations"
     // Arbiter threshold - request arbiter intervention (recoverable)
-    elif iter > Config.ArbiterThreshold then return Error "ARBITER_NEEDED"
+    elif iter > Config.ArbiterThreshold then 
+        Logging.info $"Sprint {item.Order} exceeded ArbiterThreshold ({Config.ArbiterThreshold}), requesting arbiter"
+        return Error "ARBITER_NEEDED"
     else
         if iter = 1 then
             startItemTiming item.FilePath
@@ -250,18 +231,20 @@ let rec runBacklogItem (item: BacklogItem) iter totalIter feedback showWin = asy
             return! retry (feedback @ [$"Did not output SUBTASK_COMPLETE"]) prevDoDResults
 }
 
-let rec runAllBacklogItems items showWin = async {
+let rec runAllBacklogItems (items: BacklogItem list) showWin = async {
+    Logging.info $"runAllBacklogItems: {items.Length} items remaining"
     match items with
-    | [] -> return Ok ()
+    | [] -> 
+        Logging.info "All backlog items completed successfully"
+        return Ok ()
     | item :: rest ->
         match! runBacklogItem item 1 0 [] showWin with
         | Ok () -> return! runAllBacklogItems rest showWin
-        | Error e -> return Error $"Sprint {item.Order} ({item.Name}) failed: {e}"
+        | Error e -> 
+            Logging.error $"Sprint {item.Order} failed: {e}"
+            return Error $"Sprint {item.Order} ({item.Name}) failed: {e}"
 }
 
-// ============================================================================
-// FINAL VERIFICATION
-// ============================================================================
 
 let runFinalVerifiers showWin = async {
     state <- { state with CurrentPhase = "Final Verification" }
@@ -305,7 +288,7 @@ let runFinalVerifiers showWin = async {
     return allPassed
 }
 
-let createFixupSprint (failedVerifiers: VerifierName list) (fixupNumber: int) : BacklogItem =
+let createFixupSprint (failedVerifiers: string list) (fixupNumber: int) : BacklogItem =
     let failedNames = failedVerifiers |> String.concat ", "
     let nextOrder = 
         state.Backlog 
@@ -366,9 +349,6 @@ let finalChecks showWin =
     setMessage "Running final verification on complete feature..."
     finalChecksWithFixup showWin 3 0 |> Async.RunSynchronously
 
-// ============================================================================
-// MAIN APPLICATION FLOW
-// ============================================================================
 
 let runWithLive (sprints: BacklogItem list) showWin (originalRequest: string) = 
     let estimatedIterations = sprints.Length * 3
@@ -409,26 +389,45 @@ let runWithLive (sprints: BacklogItem list) showWin (originalRequest: string) =
     Directory.CreateDirectory Config.ralphDir |> ignore
     SprintFiles.ensureDir()
     
+    Logging.info $"Starting execution with {sprints.Length} sprints"
+    
     let mutable result: Result<unit, string> = Ok ()
     let mutable finished = false
     
     let workTask = Task.Run(fun () ->
         try
             let sprintsToRun = mergedBacklog |> List.filter (fun (_, status, _) -> match status with Done _ -> false | _ -> true) |> List.map (fun (s, _, _) -> s)
+            Logging.info $"Running {sprintsToRun.Length} sprints (skipping {mergedBacklog.Length - sprintsToRun.Length} already done)"
+            
+            // Sanity check: if we have 0 sprints to run but mergedBacklog has items, something's wrong
+            if sprintsToRun.Length = 0 && mergedBacklog.Length > 0 then
+                Logging.error "WARNING: All sprints marked as Done - this may indicate state corruption"
+                for (item, status, _) in mergedBacklog do
+                    Logging.info $"  Sprint {item.Order} ({item.Name}): {status}"
+            
+            if sprintsToRun.Length = 0 then
+                Logging.info "No sprints to run, going directly to final checks"
+            
             let r = runAllBacklogItems sprintsToRun showWin |> Async.RunSynchronously
             result <- r
             match r with
             | Ok () ->
+                Logging.info "All sprints completed, running final checks"
                 let passed = finalChecks showWin
                 if passed then
+                    Logging.info "Final checks passed"
                     state <- { state with CurrentPhase = "Complete"; Message = "[green bold]WORKFLOW COMPLETE[/]" }
                 else
+                    Logging.info "Final checks had issues"
                     state <- { state with CurrentPhase = "Complete"; Message = "[yellow]Completed with some issues[/]" }
             | Error e ->
+                Logging.error $"Sprint execution failed: {e}"
                 state <- { state with ErrorLog = Some e }
         with ex ->
-            result <- Error ex.Message
-            state <- { state with ErrorLog = Some ex.Message }
+            Logging.exn ex "workTask execution"
+            let fullError = $"{ex.GetType().Name}: {ex.Message}\n{ex.StackTrace}"
+            result <- Error fullError
+            state <- { state with ErrorLog = Some fullError }
         finished <- true
     )
     
@@ -452,12 +451,24 @@ let runWithLive (sprints: BacklogItem list) showWin (originalRequest: string) =
     match result with
     | Ok () -> 
         AnsiConsole.Write(FigletText("COMPLETE").Color(Color.Green))
-    | Error _ -> 
+    | Error e when e.Contains("ARBITER_NEEDED") -> 
+        // Don't show FAILED for arbiter threshold - it's recoverable
+        AnsiConsole.Write(FigletText("ARBITER").Color(Color.Yellow))
+        AnsiConsole.MarkupLine "[yellow]Sprint exceeded iteration threshold. Invoking arbiter for recovery...[/]"
+    | Error e -> 
         AnsiConsole.Write(FigletText("FAILED").Color(Color.Red))
+        AnsiConsole.WriteLine()
+        AnsiConsole.MarkupLine "[red bold]Error details:[/]"
+        // Escape markup characters in error message
+        let safeError = e.Replace("[", "[[").Replace("]", "]]")
+        AnsiConsole.WriteLine(safeError)
+        AnsiConsole.WriteLine()
+        AnsiConsole.MarkupLine $"[yellow]Full log: {Logging.logPath.Value}[/]"
     
     result
 
 let invokeArbiter (originalRequest: string) (showWin: bool) : Result<BacklogItem list, string> =
+    Logging.info "invokeArbiter called"
     state <- { state with CurrentPhase = "Arbiter"; Message = "Invoking arbiter for recovery..." }
     liveCtx |> Option.iter (fun ctx -> ctx.Refresh())
     
@@ -530,7 +541,10 @@ let invokeArbiter (originalRequest: string) (showWin: bool) : Result<BacklogItem
     let arbiterPrompt = Prompts.arbiter originalRequest failedContext completedSprints pendingSprints
     let arbiterResult = runAgent arbiterPrompt "Arbiter" showWin |> Async.RunSynchronously
     
+    Logging.info $"Arbiter completed, output length: {arbiterResult.Length}"
+    
     let newSprintsFromDisk = SprintFiles.readAllSprints()
+    Logging.info $"Arbiter: found {newSprintsFromDisk.Length} sprint files on disk"
     
     let newUncompletedSprints = 
         newSprintsFromDisk 
@@ -539,16 +553,23 @@ let invokeArbiter (originalRequest: string) (showWin: bool) : Result<BacklogItem
     let completedItems = completedBacklogItems |> List.map (fun (item, _, _) -> item)
     let mergedSprints = completedItems @ newUncompletedSprints
     
+    Logging.info $"Arbiter: {completedItems.Length} completed + {newUncompletedSprints.Length} new = {mergedSprints.Length} total sprints"
+    
     if mergedSprints.Length > 0 then
         setMessage "[green]Arbiter produced recovery plan[/]"
+        Logging.info "Arbiter produced valid recovery plan"
         Ok mergedSprints
     else
+        Logging.error "Arbiter failed: No sprint files found"
         state <- { state with ErrorLog = Some "Arbiter failed: No sprint files found" }
         liveCtx |> Option.iter (fun ctx -> ctx.Refresh())
         Error "Arbiter could not produce valid plan"
 
 let rec run request showWin autoApprove arbiterCount (ciFailureContext: string option) = 
+    Logging.info $"run() called: arbiterCount={arbiterCount}, autoApprove={autoApprove}"
+    
     if arbiterCount >= 3 then
+        Logging.error "Max arbiter attempts (3) reached"
         AnsiConsole.MarkupLine "[red]Max arbiter attempts (3). Stopping.[/]"
         1
     else
@@ -573,12 +594,16 @@ let rec run request showWin autoApprove arbiterCount (ciFailureContext: string o
             | Some ciOutput -> Prompts.architectWithCIContext request ciOutput
             | None -> Prompts.architect request
         
+        Logging.info "Starting Architect agent"
+        
         let planTask = Task.Run(fun () ->
             try
                 architectOutput <- runAgent architectPrompt "Architect" showWin |> Async.RunSynchronously
                 sprintsResult <- SprintFiles.readAllSprints()
+                Logging.info $"Planning completed: {sprintsResult.Length} sprints found"
             with ex ->
-                state <- { state with ErrorLog = Some ex.Message }
+                Logging.exn ex "planTask (Architect)"
+                state <- { state with ErrorLog = Some $"{ex.GetType().Name}: {ex.Message}" }
             planFinished <- true
         )
         
@@ -611,7 +636,9 @@ let rec run request showWin autoApprove arbiterCount (ciFailureContext: string o
             let truncatedOutput = 
                 if architectOutput.Length > 4000 then architectOutput.Substring(0, 4000) + "\n... (truncated)"
                 else architectOutput
-            AnsiConsole.Write(Panel(truncatedOutput).Header("Architect Response"))
+            // Escape brackets so Spectre.Console doesn't interpret them as markup
+            let safeOutput = truncatedOutput.Replace("[", "[[").Replace("]", "]]")
+            AnsiConsole.Write(Panel(safeOutput).Header("Architect Response"))
             
             AnsiConsole.WriteLine()
             AnsiConsole.MarkupLine "[yellow]Check:[/]"
@@ -651,15 +678,82 @@ let rec run request showWin autoApprove arbiterCount (ciFailureContext: string o
                         run request showWin autoApprove (arbiterCount + 1) None
             else 0
 
-// ============================================================================
-// ENTRY POINT
-// ============================================================================
 
 let runInteractive () = 
     AnsiConsole.Write(FigletText("RALPH").Color(Color.Yellow))
     let showWin = AnsiConsole.Confirm("Show agent windows? ", true)
     let request = AnsiConsole.Ask<string> "[green]Request:[/] "
     run request showWin false 0 None
+
+/// Restart: Learn from previous failed run and create new plan
+let runRestart (request: string) showWin autoApprove =
+    AnsiConsole.Write(FigletText("RESTART").Color(Color.Yellow))
+    AnsiConsole.MarkupLine "[yellow]Learning from previous run...[/]"
+    
+    // Gather context from previous run
+    let sprintsSummary = 
+        if Directory.Exists Config.sprintsDir then
+            Directory.GetFiles(Config.sprintsDir, "*.md")
+            |> Array.map (fun f -> 
+                let name = Path.GetFileName f
+                let content = File.ReadAllText f
+                let lines = content.Split('\n') |> Array.truncate 20 |> String.concat "\n"
+                $"=== {name} ===\n{lines}\n...")
+            |> String.concat "\n\n"
+        else "(no previous sprints)"
+    
+    let logContent = 
+        let logPath = Path.Combine(Config.ralphDir, "ralph.log")
+        if File.Exists logPath then File.ReadAllText logPath
+        else "(no log file)"
+    
+    let gitDiff =
+        try
+            let psi = ProcessStartInfo("git", "diff HEAD~5 --stat -p")
+            psi.RedirectStandardOutput <- true
+            psi.UseShellExecute <- false
+            psi.CreateNoWindow <- true
+            use p = Process.Start(psi)
+            let output = p.StandardOutput.ReadToEnd()
+            p.WaitForExit()
+            if p.ExitCode = 0 then output else "(git diff failed)"
+        with _ -> "(could not get git diff)"
+    
+    Logging.info "Restart: gathered context from previous run"
+    Logging.info $"Sprints summary: {sprintsSummary.Length} chars"
+    Logging.info $"Log content: {logContent.Length} chars"
+    Logging.info $"Git diff: {gitDiff.Length} chars"
+    
+    // Call restart architect
+    state <- { 
+        Backlog = []; StartTime = DateTime.Now; Message = "Restart planning..."
+        AgentStartTime = None; TotalEstimatedIterations = 0; CompletedIterations = 0
+        FinalVerifierResults = Map.empty; FinalVerifierSummaries = Map.empty; CIStatus = None
+        CurrentPhase = "Restart Planning"; CurrentAgentTask = "Architect"
+        LastVerifierLog = None; PlanOverview = request; ErrorLog = None
+    }
+    
+    let restartPrompt = Prompts.architectRestart request sprintsSummary logContent gitDiff
+    let architectOutput = runAgent restartPrompt "Restart-Architect" showWin |> Async.RunSynchronously
+    
+    Logging.info "Restart architect completed"
+    
+    // Continue with normal execution
+    let sprints = SprintFiles.readAllSprints()
+    if sprints.IsEmpty then
+        AnsiConsole.MarkupLine "[red]Restart architect did not create any sprints[/]"
+        1
+    else
+        AnsiConsole.MarkupLine $"[green]Restart created {sprints.Length} new sprints[/]"
+        let overview = BacklogFile.readOverview() |> Option.defaultValue request
+        showPlan sprints overview
+        if autoApprove || AnsiConsole.Confirm("Execute new plan? ", true) then
+            match runWithLive sprints showWin request with
+            | Ok () -> 0
+            | Error e -> 
+                AnsiConsole.MarkupLine $"[red]Restart failed: {e}[/]"
+                1
+        else 0
 
 let rec runWithPush request showWin auto ciAttempt =
     if ciAttempt >= 3 then
@@ -715,17 +809,20 @@ match fsi.CommandLineArgs |> Array.toList |> List.tail with
 | [] -> runInteractive () |> ignore
 | ["--help"] | ["-h"] ->
     printfn "Ralph - Autonomous AI Coding Loop\n"
-    printfn "Usage:  dotnet fsi Ralph.fsx [request] [--yes] [--hidden] [--push] [--help]"
+    printfn "Usage:  dotnet fsi Ralph.fsx [request] [--yes] [--hidden] [--push] [--restart] [--help]"
     printfn ""
     printfn "Options:"
     printfn "  --yes       Auto-approve all prompts"
     printfn "  --hidden    Hide agent windows"
     printfn "  --push      Push after completion and monitor CI, fix failures"
+    printfn "  --restart   Learn from previous failed run and restart with new plan"
 | args ->
     let request = args |> List.filter (fun a -> not (a.StartsWith "--")) |> String.concat " "
     let showWin = not (List.contains "--hidden" args)
     let auto = List.contains "--yes" args
     let push = List.contains "--push" args
+    let restart = List.contains "--restart" args
     if String.IsNullOrWhiteSpace request then printfn "No request.  Use --help"; exit 1
-    if push then runWithPush request showWin auto 0 |> exit
+    if restart then runRestart request showWin auto |> exit
+    elif push then runWithPush request showWin auto 0 |> exit
     else run request showWin auto 0 None |> exit
