@@ -360,7 +360,15 @@ let runWithLive (sprints: BacklogItem list) showWin (originalRequest: string) =
         |> List.map (fun (item, status, timing) -> (item.FilePath, (item, status, timing)))
         |> Map.ofList
     
-    let mergedBacklog = 
+    let newPaths = sprints |> List.map (fun s -> s.FilePath) |> Set.ofList
+    
+    // Keep old backlog items not in the new sprints list (historical context for display)
+    let oldHistorical = 
+        state.Backlog 
+        |> List.filter (fun (item, _, _) -> not (newPaths.Contains item.FilePath))
+    
+    // New items from sprints parameter, preserving Done status/timing from existing state
+    let newItems = 
         sprints 
         |> List.map (fun s ->
             match existingByPath.TryFind s.FilePath with
@@ -368,6 +376,8 @@ let runWithLive (sprints: BacklogItem list) showWin (originalRequest: string) =
             | Some (_, status, timing) when state.CurrentPhase = "Arbiter" -> (s, Todo, emptyTiming)
             | Some (_, status, timing) -> (s, status, timing)
             | None -> (s, Todo, emptyTiming))
+    
+    let mergedBacklog = oldHistorical @ newItems
     
     state <- { 
         Backlog = mergedBacklog
@@ -389,14 +399,15 @@ let runWithLive (sprints: BacklogItem list) showWin (originalRequest: string) =
     Directory.CreateDirectory Config.ralphDir |> ignore
     SprintFiles.ensureDir()
     
-    Logging.info $"Starting execution with {sprints.Length} sprints"
+    Logging.info $"Starting execution with {sprints.Length} sprints ({oldHistorical.Length} historical preserved)"
     
     let mutable result: Result<unit, string> = Ok ()
     let mutable finished = false
     
     let workTask = Task.Run(fun () ->
         try
-            let sprintsToRun = mergedBacklog |> List.filter (fun (_, status, _) -> match status with Done _ -> false | _ -> true) |> List.map (fun (s, _, _) -> s)
+            // Only run items from the NEW sprints list that aren't Done (skip historical items)
+            let sprintsToRun = mergedBacklog |> List.filter (fun (s, status, _) -> newPaths.Contains s.FilePath && (match status with Done _ -> false | _ -> true)) |> List.map (fun (s, _, _) -> s)
             Logging.info $"Running {sprintsToRun.Length} sprints (skipping {mergedBacklog.Length - sprintsToRun.Length} already done)"
             
             // Sanity check: if we have 0 sprints to run but mergedBacklog has items, something's wrong
@@ -432,7 +443,7 @@ let runWithLive (sprints: BacklogItem list) showWin (originalRequest: string) =
     )
     
     AnsiConsole.Live(buildDashboard())
-        .AutoClear(true)
+        .AutoClear(false)
         .Overflow(VerticalOverflow.Ellipsis)
         .Start(fun ctx ->
             liveCtx <- Some ctx
@@ -608,7 +619,7 @@ let rec run request showWin autoApprove arbiterCount (ciFailureContext: string o
         )
         
         AnsiConsole.Live(buildDashboard())
-            .AutoClear(true)
+            .AutoClear(false)
             .Overflow(VerticalOverflow.Ellipsis)
             .Start(fun ctx ->
                 liveCtx <- Some ctx

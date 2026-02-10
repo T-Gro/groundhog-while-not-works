@@ -229,8 +229,13 @@ module XmlPrompt =
                 ]
         
         xc "R" [
+            // THE ORIGINAL REQUEST IS THE #1 PRIORITY - placed first and emphasized
+            xc "ORIGINAL_TASK_THIS_IS_THE_GOAL" [
+                xt "CRITICAL" "THIS IS THE MOST IMPORTANT CONTEXT. Everything below serves THIS goal. Never lose sight of what the user originally asked for. All sprint restructuring MUST serve this original request."
+                xt "user_request" originalRequest
+            ]
+            
             roleElement Arbiter
-            xt "original_request" originalRequest
             
             xc "FIRST_READ_THESE" [
                 xat "backlog" [("path", Config.backlogFile)] "READ THIS FIRST - contains original plan, analysis, and approach"
@@ -250,11 +255,12 @@ module XmlPrompt =
             xc "failure_context" failureContextEl
             
             xc "your_analysis_steps" [
-                xt "step1" "READ BACKLOG.md to understand the ORIGINAL PLAN and approach"
-                xt "step2" "READ the failed sprint file to see what was attempted"
-                xt "step3" "ANALYZE the iteration history - what did the agent try? What did verifiers reject?"
-                xt "step4" "IDENTIFY the root cause - is the sprint too ambitious? Missing context? Wrong approach? Original plan flawed?"
-                xt "step5" "DECIDE: split into smaller sprints? Add missing context? Change approach? Update BACKLOG.md if plan was wrong?"
+                xt "step" "RE-READ the ORIGINAL_TASK above. That is the end goal. Keep it front and center."
+                xt "step" "READ BACKLOG.md to understand the ORIGINAL PLAN and approach"
+                xt "step" "READ the failed sprint file to see what was attempted"
+                xt "step" "ANALYZE the iteration history - what did the agent try? What did verifiers reject?"
+                xt "step" "IDENTIFY the root cause - is the sprint too ambitious? Missing context? Wrong approach? Original plan flawed?"
+                xt "step" "DECIDE: split into smaller sprints? Add missing context? Change approach? Update BACKLOG.md if plan was wrong?"
             ]
             
             xc "your_powers" [
@@ -307,8 +313,8 @@ module Prompts =
             ]
             
             xc "sprint_file_format" [
-                xt "line1" "---"
-                xt "line2" "---"
+                xt "line" "---"
+                xt "line" "---"
                 xt "required" "# Sprint: [title]"
                 xt "required" "## Context - WHY this sprint exists"
                 xt "required" "## Description - WHAT to implement with DETAILED guidance"
@@ -358,9 +364,9 @@ module Prompts =
             ]
             
             xc "your_options" [
-                xt "option1" "CREATE new fixup sprint(s) to address CI failures specifically"
-                xt "option2" "MODIFY existing sprint files if the original approach was flawed"
-                xt "option3" "REPLACE a sprint entirely if needed"
+                xt "option" "CREATE new fixup sprint(s) to address CI failures specifically"
+                xt "option" "MODIFY existing sprint files if the original approach was flawed"
+                xt "option" "REPLACE a sprint entirely if needed"
                 xt "tip" "Often a single targeted fixup sprint (e.g., 99_CI_Fixup.md) is sufficient"
             ]
             
@@ -371,15 +377,15 @@ module Prompts =
             ]
             
             xc "analyze_first" [
-                xt "step1" "Read BACKLOG.md to understand the feature"
-                xt "step2" "Read existing sprint files to see what was implemented"
-                xt "step3" "Analyze CI failure output to identify root causes"
-                xt "step4" "Decide: new fixup sprint vs modify existing"
+                xt "step" "Read BACKLOG.md to understand the feature"
+                xt "step" "Read existing sprint files to see what was implemented"
+                xt "step" "Analyze CI failure output to identify root causes"
+                xt "step" "Decide: new fixup sprint vs modify existing"
             ]
             
             xc "sprint_file_format" [
-                xt "line1" "---"
-                xt "line2" "---"
+                xt "line" "---"
+                xt "line" "---"
                 xt "required" "# Sprint: [title]"
                 xt "required" "## Context - WHY this sprint exists (mention CI failure!)"
                 xt "required" "## Description - WHAT to fix with DETAILED guidance"
@@ -387,10 +393,10 @@ module Prompts =
             ]
             
             xc "critical_rules" [
-                xt "rule1" "Each sprint file is SELF-CONTAINED. Include ALL context."
-                xt "rule2" "For CI fixes, reference the SPECIFIC errors in the sprint file."
-                xt "rule3" "Implementor has NO knowledge of CI output unless you include it."
-                xt "rule4" "Include: exact error messages, file paths, what to change."
+                xt "rule" "Each sprint file is SELF-CONTAINED. Include ALL context."
+                xt "rule" "For CI fixes, reference the SPECIFIC errors in the sprint file."
+                xt "rule" "Implementor has NO knowledge of CI output unless you include it."
+                xt "rule" "Include: exact error messages, file paths, what to change."
             ]
             
             xt "when_done" "Output: PLAN_COMPLETE"
@@ -425,12 +431,12 @@ module Prompts =
             ]
             
             xc "your_task" [
-                xt "step1" "Analyze the log to understand what went wrong (verifier failures, errors, loops)"
-                xt "step2" "Analyze the git diff to see what was partially implemented"
-                xt "step3" "Decide: continue from where it left off, OR start fresh with different approach"
-                xt "step4" "DELETE all files in the sprints directory using rm command"
-                xt "step5" "Create NEW sprint files with improved approach"
-                xt "step6" "Update BACKLOG.md with lessons learned"
+                xt "step" "Analyze the log to understand what went wrong (verifier failures, errors, loops)"
+                xt "step" "Analyze the git diff to see what was partially implemented"
+                xt "step" "Decide: continue from where it left off, OR start fresh with different approach"
+                xt "step" "DELETE all files in the sprints directory using rm command"
+                xt "step" "Create NEW sprint files with improved approach"
+                xt "step" "Update BACKLOG.md with lessons learned"
             ]
             
             xc "locations" [
@@ -440,8 +446,8 @@ module Prompts =
             ]
             
             xc "sprint_file_format" [
-                xt "line1" "---"
-                xt "line2" "---"
+                xt "line" "---"
+                xt "line" "---"
                 xt "required" "# Sprint: [title]"
                 xt "required" "## Context - Include lessons from failed attempt"
                 xt "required" "## Description - WHAT to implement"
