@@ -15,4 +15,4 @@ INSTRUCTIONS:
 4. If anything is missing or incomplete, list it specifically.
 5. Drop obvious nitpicks, the 'review council' will try hard to say at least something - focus on big high level design, functinal correctness or code quality problems.
 
-BE BRUTALLY HONEST.
+BE BRUTALLY HONEST and FAIR. Only fail if you have legit suggestions for obvious improvement.
