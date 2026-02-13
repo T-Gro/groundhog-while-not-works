@@ -24,6 +24,7 @@ module MarkupBuilder =
         | Passed n -> SafeMarkup $"[green]✓{n}[/]"
         | Failed 1 -> SafeMarkup "[red]✗[/]" 
         | Failed n -> SafeMarkup $"[red]✗{n}[/]"
+        | Skipped -> SafeMarkup "[dim]–[/]"
         | NotStarted -> SafeMarkup "[dim]○[/]"
     
     let dodIcon = function
@@ -39,7 +40,7 @@ module MarkupBuilder =
         let icon = if passed then literal "[green]✓[/]" else literal "[red]✗[/]"
         let sprintLabel = if sprintOrder = 0 then "Final" else $"S{sprintOrder}"
         let escapedName = escape (RawText verifierName)
-        let escapedSummary = summary |> RawText |> truncateRaw 60 "..." |> escape
+        let escapedSummary = summary |> RawText |> truncateRaw 300 "..." |> escape
         concat [icon; literal $" [dim]({sprintLabel})[/] [bold]"; escapedName; literal "[/]: "; escapedSummary]
     
     let toString (SafeMarkup s) = s
@@ -73,13 +74,15 @@ module GUI =
                 match state.CurrentPhase with
                 | "Complete" -> "green"
                 | "Planning" -> "cyan"
+                | "Fixup" -> "magenta"
                 | _ -> "yellow"
             let pct = sprintf "%.0f" progress
             let barWidth = 30
             let filled = min barWidth (max 0 (int (float barWidth * progress / 100.0)))
             let empty = max 0 (barWidth - filled)
             let barStr = String.replicate filled "█" + String.replicate empty "░"
-            Markup($"[yellow bold]RALPH[/] │ [{phaseColor}]{escapeMarkup state.CurrentPhase}[/] │ {barStr} {pct}%% │ {completedItems}/{totalItems} sprints │ {elapsedStr}")
+            let retryStr = if state.ArbiterAttempt > 0 then $" (retry {state.ArbiterAttempt}/{Config.MaxArbiterAttempts})" else ""
+            Markup($"[yellow bold]RALPH[/] │ [{phaseColor}]{escapeMarkup state.CurrentPhase}{retryStr}[/] │ {barStr} {pct}%% │ {completedItems}/{totalItems} sprints │ {elapsedStr}")
         
         // Current activity - single line showing what agent is doing
         let activityLine =
@@ -164,6 +167,31 @@ module GUI =
             | _ -> 
                 Text("") :> IRenderable
         
+        // Restart reason panel — why was the previous attempt abandoned
+        let restartReasonPanel : IRenderable =
+            match state.RestartReason with
+            | Some reason when reason.Length > 0 ->
+                let escapedReason = 
+                    reason |> RawText |> truncateRaw 600 "..." |> escape |> toString
+                Panel(Markup(escapedReason))
+                    .Header($"[yellow]Previous Attempt Failed (retry {state.ArbiterAttempt}/{Config.MaxArbiterAttempts})[/]")
+                    .BorderColor(Color.Yellow)
+                    .Expand()
+                :> IRenderable
+            | _ -> Text("") :> IRenderable
+        
+        // Fixup reason panel — persistent display of what triggered fixup
+        let fixupReasonPanel : IRenderable =
+            match state.FixupReason with
+            | Some reason when reason.Length > 0 ->
+                let escapedReason = 
+                    reason |> RawText |> truncateRaw 600 "..." |> escape |> toString
+                Panel(Markup(escapedReason))
+                    .Header("[magenta]Fixup Triggered By[/]")
+                    .Expand()
+                :> IRenderable
+            | _ -> Text("") :> IRenderable
+        
         // Last verifier result
         let lastVerifierLine : IRenderable =
             match state.LastVerifierLog with
@@ -179,15 +207,18 @@ module GUI =
                 let ft = Table().Border(TableBorder.Simple).Expand()
                 ft.AddColumn(TableColumn("Final Verifier").Width(15)) |> ignore
                 ft.AddColumn(TableColumn("").Width(8)) |> ignore
-                ft.AddColumn(TableColumn("Summary").NoWrap()) |> ignore
+                ft.AddColumn(TableColumn("Summary")) |> ignore
                 for name in verifierNames do
                     let verifierStatus = state.FinalVerifierResults.TryFind name |> Option.defaultValue NotStarted
                     let statusStr = statusIcon verifierStatus |> toString
+                    let isFailed = match verifierStatus with Failed _ -> true | _ -> false
+                    // Failed verifiers get full summary (the user needs to see WHY); passed ones get truncated
+                    let maxLen = if isFailed then 2000 else 300
                     let summary = 
                         state.FinalVerifierSummaries.TryFind name 
                         |> Option.defaultValue "" 
                         |> RawText
-                        |> truncateRaw 50 "..."
+                        |> truncateRaw maxLen "..."
                         |> escape
                         |> toString
                     ft.AddRow([| Markup(escapeMarkup name) :> IRenderable; Markup(statusStr) :> IRenderable; Markup(summary) :> IRenderable |]) |> ignore
@@ -215,6 +246,8 @@ module GUI =
             if state.Backlog.Length > 0 then
                 yield t :> IRenderable
             yield currentTaskPanel
+            yield restartReasonPanel
+            yield fixupReasonPanel
             yield lastVerifierLine
             if not state.FinalVerifierResults.IsEmpty then
                 yield Rule("[cyan]Final Verification[/]").RuleStyle("cyan") :> IRenderable

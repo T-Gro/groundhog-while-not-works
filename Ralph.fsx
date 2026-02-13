@@ -42,10 +42,13 @@ let setMessage msg = StateOps.setMessage &state liveCtx msg
 let buildDashboard () = GUI.buildDashboard state (Verifiers.listAll ())
 
 
-let runAgent (prompt: string) (title: string) (_showWindow: bool) = async {
+/// Run a copilot agent session. Returns (output, sessionId) where sessionId can be used with askFollowUp.
+/// If resumeSessionId is provided (Some), resumes that session instead of starting a new one.
+let runAgent (prompt: string) (title: string) (_showWindow: bool) (resumeSessionId: string option) = async {
     Directory.CreateDirectory Config.ralphDir |> ignore
     
-    Logging.info $"Starting agent: {title}"
+    let sessionId = resumeSessionId |> Option.defaultWith (fun () -> Guid.NewGuid().ToString())
+    Logging.info $"Starting agent: {title} (session: {sessionId})"
     
     // Mark agent as running with task info
     state <- { state with AgentStartTime = Some DateTime.Now; CurrentAgentTask = title }
@@ -58,11 +61,14 @@ let runAgent (prompt: string) (title: string) (_showWindow: bool) = async {
         // which interprets { and } as format placeholders
         let escapedPrompt = prompt.Replace("{", "{{").Replace("}", "}}")
         
+        // Build arguments: include --resume {sessionId} for session tracking
+        let baseArgs = [| "--allow-all-tools"; "--allow-all-paths"; "--no-ask-user";"--no-color";"--plain-diff";"-s";"--model"; Config.Model; "--stream"; "off"; "--resume"; sessionId |]
+        
         // Run copilot via Fli
         let result = 
             cli {
                 Exec "copilot"
-                Arguments [| "--allow-all-tools"; "--allow-all-paths"; "--no-ask-user";"--no-color";"--plain-diff";"-s";"--model"; Config.Model; "--stream"; "off" |]
+                Arguments baseArgs
                 Input escapedPrompt
             }
             |> Command.execute
@@ -83,7 +89,53 @@ let runAgent (prompt: string) (title: string) (_showWindow: bool) = async {
     
     match exn with
     | Some ex -> return raise ex
-    | None -> return output
+    | None -> return (output, sessionId)
+}
+
+/// Resume a previous session with a short clarifying question.
+/// Returns only the follow-up response (not the original output).
+let askFollowUp (sessionId: string) (question: string) (title: string) = async {
+    Logging.info $"askFollowUp: resuming session {sessionId} for {title}"
+    let! (response, _) = runAgent question $"{title}-followup" false (Some sessionId)
+    Logging.info $"askFollowUp response length: {response.Length}"
+    return response
+}
+
+/// Generic disambiguation: ask a follow-up question and interpret two complementary signals.
+/// Returns true if positiveSignal is found, false if negativeSignal is found or still ambiguous.
+let disambiguateSignal (sessionId: string) (context: string) (question: string) (positiveSignal: string) (negativeSignal: string) = async {
+    let! response = askFollowUp sessionId question $"Disambiguate-{context}"
+    let hasPositive = hasSignalAny positiveSignal response
+    let hasNegative = hasSignalAny negativeSignal response
+    Logging.info $"disambiguate {context}: positive={hasPositive}, negative={hasNegative}, response='{response.Trim()}'"
+    if hasPositive && not hasNegative then return true
+    elif hasNegative && not hasPositive then return false
+    else
+        Logging.error $"disambiguateSignal: still ambiguous after follow-up for {context}"
+        return false
+}
+
+/// When verifier output is ambiguous (VInconclusive), resume the session to get a clear answer.
+let resolveVerifierAmbiguity (sessionId: string) (originalSummary: string) (verifierName: string) = async {
+    let! passed = disambiguateSignal sessionId verifierName
+                    "Your previous response did not contain a clear VERIFY_PASSED or VERIFY_FAILED signal (or contained both). Based on your full analysis above, is the final verdict VERIFY_PASSED or VERIFY_FAILED? Output ONLY that single token, nothing else."
+                    "VERIFY_PASSED" "VERIFY_FAILED"
+    return if passed then VPassed originalSummary else VFailed originalSummary
+}
+
+/// When implementor output is ambiguous about SUBTASK_COMPLETE, resume session to clarify.
+let resolveSubtaskAmbiguity (sessionId: string) (sprintName: string) =
+    disambiguateSignal sessionId $"Subtask-{sprintName}"
+        "Your previous response was unclear about completion status. Did you complete ALL work for this sprint? Output ONLY either SUBTASK_COMPLETE or SUBTASK_INCOMPLETE, nothing else."
+        "SUBTASK_COMPLETE" "SUBTASK_INCOMPLETE"
+
+/// Interpret verifier output and automatically disambiguate if inconclusive.
+let interpretAndDisambiguate (output: string) (sessionId: string) (verifierName: string) = async {
+    match interpretVerifierOutput output with
+    | VInconclusive summary ->
+        Logging.info $"Verifier {verifierName} inconclusive, attempting disambiguation"
+        return! resolveVerifierAmbiguity sessionId summary verifierName
+    | outcome -> return outcome
 }
 
 
@@ -94,25 +146,21 @@ let verifyStage showWin sprintFilePath (verifierName: string) (sprintItem: Backl
     let approvedCommits = timing.ApprovedCommits
     let currentCommit = Git.getHeadCommit()
     let sprintContext = buildSprintVerificationContext sprintItem approvedCommits currentCommit verifierName
-    let prompt = Verifiers.getPrompt verifierName + sprintContext + verifierSuffix
-    let! out = runAgent prompt $"Verify-{verifierName}" showWin
+    let prompt = verifierPreamble + Verifiers.getPrompt verifierName + sprintContext + verifierSuffix
+    let! (out, sessionId) = runAgent prompt $"Verify-{verifierName}" showWin None
+    let! outcome = interpretAndDisambiguate out sessionId verifierName
     
-    match interpretVerifierOutput out with
+    match outcome with
     | VPassed summary ->
         state <- { state with LastVerifierLog = Some (sprintItem.Order, verifierName, true, summary) }
         addVerifierResultToLastIteration sprintFilePath verifierName true summary
         setMessage $"[green]✓ {verifierName} passed[/]"
         return Ok ()
-    | VFailed summary ->
+    | VFailed summary | VInconclusive summary ->
         state <- { state with LastVerifierLog = Some (sprintItem.Order, verifierName, false, summary) }
         addVerifierResultToLastIteration sprintFilePath verifierName false summary
         setMessage $"[red]✗ {verifierName} failed[/]"
         return Error $"{verifierName}: {summary}"
-    | VInconclusive summary ->
-        state <- { state with LastVerifierLog = Some (sprintItem.Order, verifierName, false, summary) }
-        addVerifierResultToLastIteration sprintFilePath verifierName false summary
-        setMessage $"[yellow]{verifierName} inconclusive[/]"
-        return Error $"{verifierName} verification did not output VERIFY_PASSED or VERIFY_FAILED"
 }
 
 let updateVerifierStatus sprintFilePath (verifierName: string) (passed: bool) =
@@ -133,10 +181,22 @@ let updateVerifierStatus sprintFilePath (verifierName: string) (passed: bool) =
     liveCtx |> Option.iter (fun ctx -> ctx.Refresh())
 
 let runAllVerifiers showWin sprintFilePath (sprintItem: BacklogItem) = async {
-    let verifierNames = Verifiers.listAll ()
+    let allVerifiers = Verifiers.listAll ()
+    // Filter by TargetVerifiers (fixup sprints only run failed ones) then exclude EliminatedVerifiers (cutter)
+    let activeVerifiers =
+        match sprintItem.TargetVerifiers with
+        | Some targets -> targets |> List.filter (fun v -> Verifiers.isValid v)
+        | None -> allVerifiers
+        |> List.filter (fun v -> not (sprintItem.EliminatedVerifiers.Contains v))
+    
+    // Mark skipped verifiers in timing state
+    let skippedVerifiers = allVerifiers |> List.filter (fun v -> not (activeVerifiers |> List.contains v))
+    for name in skippedVerifiers do
+        updateVerifierStatus sprintFilePath name true  // count as pass for display
+    
     let mutable allPassed = true
     
-    for name in verifierNames do
+    for name in activeVerifiers do
         match! verifyStage showWin sprintFilePath name sprintItem with
         | Ok () -> 
             updateVerifierStatus sprintFilePath name true
@@ -150,9 +210,60 @@ let runAllVerifiers showWin sprintFilePath (sprintItem: BacklogItem) = async {
         return Error "One or more verifiers failed"
 }
 
+/// Run the live dashboard refresh loop while a task executes on a background thread.
+let withLiveDashboard (isFinished: unit -> bool) (task: Task) =
+    AnsiConsole.Live(buildDashboard())
+        .AutoClear(false)
+        .Overflow(VerticalOverflow.Ellipsis)
+        .Start(fun ctx ->
+            liveCtx <- Some ctx
+            while not (isFinished()) do
+                ctx.UpdateTarget(buildDashboard())
+                ctx.Refresh()
+                Thread.Sleep(500)
+            ctx.UpdateTarget(buildDashboard())
+            ctx.Refresh()
+            liveCtx <- None
+        )
+    task.Wait()
+
 let showPlan (sprints: BacklogItem list) (overview: string) =
     state <- { state with PlanOverview = $"{overview} ({sprints.Length} sprints)" }
     liveCtx |> Option.iter (fun ctx -> ctx.Refresh())
+
+/// Run the verifier cutter on each sprint to eliminate irrelevant verifiers.
+/// Returns updated sprint list with EliminatedVerifiers populated.
+let runCutter (sprints: BacklogItem list) showWin =
+    let allVerifiers = Verifiers.listAll ()
+    sprints |> List.map (fun sprint ->
+        try
+            let prompt = Prompts.cutter sprint.Name sprint.Description sprint.DoD allVerifiers
+            let (output, _) = runAgent prompt $"Cutter-{sprint.Order}" showWin None |> Async.RunSynchronously
+            
+            // Parse <EliminatedVerifiers>...</EliminatedVerifiers>
+            let m = Regex.Match(output, @"<EliminatedVerifiers>(.*?)</EliminatedVerifiers>", RegexOptions.Singleline)
+            if m.Success then
+                let raw = m.Groups.[1].Value.Trim()
+                if String.IsNullOrWhiteSpace raw then
+                    Logging.info $"Cutter for sprint {sprint.Order} ({sprint.Name}): no verifiers eliminated"
+                    sprint
+                else
+                    let eliminated = 
+                        raw.Split([|','; ';'|], StringSplitOptions.RemoveEmptyEntries)
+                        |> Array.map (fun s -> s.Trim())
+                        // Never allow eliminating FUNCTIONAL or HONEST-ASSESSMENT
+                        |> Array.filter (fun v -> v <> "FUNCTIONAL" && v <> "HONEST-ASSESSMENT" && Verifiers.isValid v)
+                        |> Set.ofArray
+                    let eliminatedStr = eliminated |> Set.toList |> String.concat ", "
+                    Logging.info $"Cutter for sprint {sprint.Order} ({sprint.Name}): eliminated {eliminatedStr}"
+                    { sprint with EliminatedVerifiers = eliminated }
+            else
+                Logging.info $"Cutter for sprint {sprint.Order} ({sprint.Name}): no tag found, keeping all verifiers"
+                sprint
+        with ex ->
+            Logging.error $"Cutter failed for sprint {sprint.Order}: {ex.Message}. Keeping all verifiers."
+            sprint
+    )
 
 
 let rec runBacklogItem (item: BacklogItem) iter totalIter feedback showWin = async {
@@ -199,7 +310,7 @@ let rec runBacklogItem (item: BacklogItem) iter totalIter feedback showWin = asy
         
         let prompt = Prompts.implement item iter feedback prevDoDResults pastSprints pastSteps iterHistory
         
-        let! out = runAgent prompt ($"Implement-{item.Order}") showWin
+        let! (out, sessionId) = runAgent prompt ($"Implement-{item.Order}") showWin None
         
         let currentRecord: IterationRecord = {
             Iteration = iter
@@ -215,7 +326,22 @@ let rec runBacklogItem (item: BacklogItem) iter totalIter feedback showWin = asy
             state <- { state with CompletedIterations = state.CompletedIterations + 1 }
             runBacklogItem item (iter + 1) (totalIter + 1) fb showWin
         
-        let isComplete = hasSignal "SUBTASK_COMPLETE" out || hasSignal "SUBTASK COMPLETE" out
+        let hasCompleteSignal = hasSignalAny "SUBTASK_COMPLETE" out
+        let hasIncompleteSignal = hasSignalAny "SUBTASK_INCOMPLETE" out
+        
+        // Determine completion: clear signal, or disambiguate via resume if ambiguous
+        let! isComplete = async {
+            if hasCompleteSignal && not hasIncompleteSignal then return true
+            elif hasIncompleteSignal && not hasCompleteSignal then return false
+            elif not hasCompleteSignal && not hasIncompleteSignal then
+                // No signal at all — try to disambiguate
+                Logging.info $"Sprint {item.Order}: no completion signal, attempting disambiguation"
+                return! resolveSubtaskAmbiguity sessionId item.Name
+            else
+                // Both signals — ambiguous, disambiguate
+                Logging.info $"Sprint {item.Order}: both complete/incomplete signals, attempting disambiguation"
+                return! resolveSubtaskAmbiguity sessionId item.Name
+        }
         
         if isComplete then
             state <- { state with CompletedIterations = state.CompletedIterations + 1 }
@@ -267,10 +393,11 @@ let runFinalVerifiers showWin = async {
         state <- { state with FinalVerifierResults = state.FinalVerifierResults.Add(name, NotStarted) }
         liveCtx |> Option.iter (fun ctx -> ctx.Refresh())
         
-        let prompt = Verifiers.getPrompt name + finalContext + verifierSuffix
-        let! out = runAgent prompt $"FinalVerify-{name}" showWin
+        let prompt = verifierPreamble + Verifiers.getPrompt name + finalContext + verifierSuffix
+        let! (out, sessionId) = runAgent prompt $"FinalVerify-{name}" showWin None
+        let! outcome = interpretAndDisambiguate out sessionId name
         
-        match interpretVerifierOutput out with
+        match outcome with
         | VPassed summary ->
             state <- { state with 
                         FinalVerifierResults = state.FinalVerifierResults.Add(name, Passed (prevCount + 1))
@@ -288,7 +415,7 @@ let runFinalVerifiers showWin = async {
     return allPassed
 }
 
-let createFixupSprint (failedVerifiers: string list) (fixupNumber: int) : BacklogItem =
+let createFixupSprint (failedVerifiers: string list) (fixupNumber: int) (summaries: Map<string, string>) : BacklogItem =
     let failedNames = failedVerifiers |> String.concat ", "
     let nextOrder = 
         state.Backlog 
@@ -296,6 +423,38 @@ let createFixupSprint (failedVerifiers: string list) (fixupNumber: int) : Backlo
         |> List.max 
         |> (+) 1
     let fixupPath = Path.Combine(Config.sprintsDir, $"{nextOrder:D2}_Fixup_{fixupNumber}.md")
+    
+    // Build the fixup sprint file content with verifier feedback
+    let summarySection =
+        failedVerifiers
+        |> List.map (fun v ->
+            let detail = summaries |> Map.tryFind v |> Option.defaultValue "(no summary available)"
+            $"### {v}\n{detail}")
+        |> String.concat "\n\n"
+    
+    let fileContent = $"""# Sprint: Fixup #{fixupNumber}
+
+## Context
+The following verifiers **FAILED** on the complete feature: {failedNames}.
+Review their feedback below and make targeted fixes WITHOUT breaking existing functionality.
+
+## Verifier Feedback
+{summarySection}
+
+## Description
+Fix the issues identified by the failed verifiers above. Each verifier's feedback describes exactly what went wrong.
+
+## Definition of Done
+- All previously passing tests still pass
+- Fixes address the specific issues flagged by verifiers
+- No new regressions introduced
+{failedVerifiers |> List.map (fun v -> $"- {v} verifier passes") |> String.concat "\n"}
+"""
+    
+    // Write the fixup sprint file to disk so agents can read it
+    File.WriteAllText(fixupPath, fileContent)
+    Logging.info $"Wrote fixup sprint file to {fixupPath}"
+    
     {
         FilePath = fixupPath
         Order = nextOrder
@@ -306,6 +465,8 @@ let createFixupSprint (failedVerifiers: string list) (fixupNumber: int) : Backlo
             "Fixes address the specific issues flagged by verifiers"
             "No new regressions introduced"
         ] @ (failedVerifiers |> List.map (fun v -> $"{v} verifier passes"))
+        TargetVerifiers = Some failedVerifiers
+        EliminatedVerifiers = Set.empty
     }
 
 let rec finalChecksWithFixup showWin maxFixupSprints currentFixup = async {
@@ -326,9 +487,23 @@ let rec finalChecksWithFixup showWin maxFixupSprints currentFixup = async {
             |> List.map fst
         
         let failedNames = failed |> String.concat ", "
+        
+        // Build fixup reason with verifier summaries for GUI visibility
+        let fixupReasonText =
+            failed
+            |> List.map (fun v ->
+                let summary = state.FinalVerifierSummaries |> Map.tryFind v |> Option.defaultValue "no details"
+                $"[red]{v}[/]: {Markup.Escape(summary)}")
+            |> String.concat "\n"
+        
+        state <- { state with 
+                       CurrentPhase = "Fixup"
+                       FixupReason = Some fixupReasonText }
+        liveCtx |> Option.iter (fun ctx -> ctx.Refresh())
+        
         setMessage $"Fixup #{currentFixup + 1}: {failedNames}"
         
-        let fixupItem = createFixupSprint failed (currentFixup + 1)
+        let fixupItem = createFixupSprint failed (currentFixup + 1) state.FinalVerifierSummaries
         
         state <- { state with 
                        Backlog = state.Backlog @ [(fixupItem, Todo, emptyTiming)]
@@ -394,6 +569,9 @@ let runWithLive (sprints: BacklogItem list) showWin (originalRequest: string) =
         LastVerifierLog = None
         PlanOverview = overview
         ErrorLog = None
+        FixupReason = None
+        ArbiterAttempt = state.ArbiterAttempt
+        RestartReason = state.RestartReason
     }
     
     Directory.CreateDirectory Config.ralphDir |> ignore
@@ -442,21 +620,7 @@ let runWithLive (sprints: BacklogItem list) showWin (originalRequest: string) =
         finished <- true
     )
     
-    AnsiConsole.Live(buildDashboard())
-        .AutoClear(false)
-        .Overflow(VerticalOverflow.Ellipsis)
-        .Start(fun ctx ->
-            liveCtx <- Some ctx
-            while not finished do
-                ctx.UpdateTarget(buildDashboard())
-                ctx.Refresh()
-                Thread.Sleep(500)
-            ctx.UpdateTarget(buildDashboard())
-            ctx.Refresh()
-            liveCtx <- None
-        )
-    
-    workTask.Wait()
+    withLiveDashboard (fun () -> finished) workTask
     
     AnsiConsole.WriteLine()
     match result with
@@ -550,7 +714,7 @@ let invokeArbiter (originalRequest: string) (showWin: bool) : Result<BacklogItem
     let completedFilePaths = completedBacklogItems |> List.map (fun (item, _, _) -> item.FilePath) |> Set.ofList
     
     let arbiterPrompt = Prompts.arbiter originalRequest failedContext completedSprints pendingSprints
-    let arbiterResult = runAgent arbiterPrompt "Arbiter" showWin |> Async.RunSynchronously
+    let (arbiterResult, _) = runAgent arbiterPrompt "Arbiter" showWin None |> Async.RunSynchronously
     
     Logging.info $"Arbiter completed, output length: {arbiterResult.Length}"
     
@@ -561,8 +725,11 @@ let invokeArbiter (originalRequest: string) (showWin: bool) : Result<BacklogItem
         newSprintsFromDisk 
         |> List.filter (fun s -> not (completedFilePaths.Contains s.FilePath))
     
+    // Run cutter on new sprints only (completed ones already ran)
+    let cutNewSprints = runCutter newUncompletedSprints showWin
+    
     let completedItems = completedBacklogItems |> List.map (fun (item, _, _) -> item)
-    let mergedSprints = completedItems @ newUncompletedSprints
+    let mergedSprints = completedItems @ cutNewSprints
     
     Logging.info $"Arbiter: {completedItems.Length} completed + {newUncompletedSprints.Length} new = {mergedSprints.Length} total sprints"
     
@@ -584,16 +751,32 @@ let rec run request showWin autoApprove arbiterCount (ciFailureContext: string o
         AnsiConsole.MarkupLine $"[red]Max arbiter attempts ({Config.MaxArbiterAttempts}). Stopping.[/]"
         1
     else
+        // Preserve Done items and original start time across arbiter-driven restarts
+        let preservedBacklog =
+            if arbiterCount > 0 then
+                state.Backlog |> List.filter (fun (_, s, _) -> match s with Done _ -> true | _ -> false)
+            else []
+        let preservedStart = if arbiterCount > 0 && state.StartTime > DateTime.MinValue then state.StartTime else DateTime.Now
+        let restartReason = if arbiterCount > 0 then state.ErrorLog |> Option.orElse (Some "Previous attempt failed") else None
+        
         state <- { 
-            Backlog = []; StartTime = DateTime.Now; Message = "Planning..."
+            Backlog = preservedBacklog; StartTime = preservedStart; Message = "Planning..."
             AgentStartTime = None; TotalEstimatedIterations = 0; CompletedIterations = 0
             FinalVerifierResults = Map.empty; FinalVerifierSummaries = Map.empty; CIStatus = None
             CurrentPhase = "Planning"; CurrentAgentTask = "Architect"
             LastVerifierLog = None; PlanOverview = request; ErrorLog = None
+            FixupReason = None
+            ArbiterAttempt = arbiterCount
+            RestartReason = restartReason
         }
         
         Directory.CreateDirectory Config.ralphDir |> ignore
         SprintFiles.ensureDir()
+        
+        // Clear stale sprint files — keep only those backing preserved Done items
+        let preservedPaths = preservedBacklog |> List.map (fun (item, _, _) -> item.FilePath) |> Set.ofList
+        SprintFiles.clearSprintsExcept preservedPaths
+        Logging.info $"Cleared stale sprint files (preserved {preservedPaths.Count} done sprint files)"
         
         let mutable sprintsResult: BacklogItem list = []
         let mutable planFinished = false
@@ -609,7 +792,8 @@ let rec run request showWin autoApprove arbiterCount (ciFailureContext: string o
         
         let planTask = Task.Run(fun () ->
             try
-                architectOutput <- runAgent architectPrompt "Architect" showWin |> Async.RunSynchronously
+                let (archOut, _) = runAgent architectPrompt "Architect" showWin None |> Async.RunSynchronously
+                architectOutput <- archOut
                 sprintsResult <- SprintFiles.readAllSprints()
                 Logging.info $"Planning completed: {sprintsResult.Length} sprints found"
             with ex ->
@@ -618,21 +802,7 @@ let rec run request showWin autoApprove arbiterCount (ciFailureContext: string o
             planFinished <- true
         )
         
-        AnsiConsole.Live(buildDashboard())
-            .AutoClear(false)
-            .Overflow(VerticalOverflow.Ellipsis)
-            .Start(fun ctx ->
-                liveCtx <- Some ctx
-                while not planFinished do
-                    ctx.UpdateTarget(buildDashboard())
-                    ctx.Refresh()
-                    Thread.Sleep(500)
-                ctx.UpdateTarget(buildDashboard())
-                ctx.Refresh()
-                liveCtx <- None
-            )
-        
-        planTask.Wait()
+        withLiveDashboard (fun () -> planFinished) planTask
         
         let overview = BacklogFile.readOverview() |> Option.defaultValue request
         
@@ -674,6 +844,10 @@ let rec run request showWin autoApprove arbiterCount (ciFailureContext: string o
                     run newRequest showWin autoApprove 0 None
                 | _ -> 1
         else
+            // Run cutter to eliminate irrelevant verifiers per sprint
+            setMessage "Running verifier cutter..."
+            let cutSprints = runCutter sprintsResult showWin
+            sprintsResult <- cutSprints
             showPlan sprintsResult overview
             if autoApprove || AnsiConsole.Confirm("Execute? ", true) then
                 match runWithLive sprintsResult showWin request with
@@ -684,8 +858,11 @@ let rec run request showWin autoApprove arbiterCount (ciFailureContext: string o
                         showPlan newSprints overview
                         match runWithLive newSprints showWin request with
                         | Ok () -> 0
-                        | Error e2 -> run request showWin autoApprove (arbiterCount + 1) None
-                    | Error _ ->
+                        | Error e2 -> 
+                            state <- { state with ErrorLog = Some $"Arbiter recovery also failed: {e2}" }
+                            run request showWin autoApprove (arbiterCount + 1) None
+                    | Error arbErr ->
+                        state <- { state with ErrorLog = Some $"Arbiter could not produce a valid plan" }
                         run request showWin autoApprove (arbiterCount + 1) None
             else 0
 
@@ -718,17 +895,7 @@ let runRestart (request: string) showWin autoApprove =
         if File.Exists logPath then File.ReadAllText logPath
         else "(no log file)"
     
-    let gitDiff =
-        try
-            let psi = ProcessStartInfo("git", "diff HEAD~5 --stat -p")
-            psi.RedirectStandardOutput <- true
-            psi.UseShellExecute <- false
-            psi.CreateNoWindow <- true
-            use p = Process.Start(psi)
-            let output = p.StandardOutput.ReadToEnd()
-            p.WaitForExit()
-            if p.ExitCode = 0 then output else "(git diff failed)"
-        with _ -> "(could not get git diff)"
+    let gitDiff = Git.runProcess "git" "diff HEAD~5 --stat -p" |> Option.defaultValue "(git diff failed)"
     
     Logging.info "Restart: gathered context from previous run"
     Logging.info $"Sprints summary: {sprintsSummary.Length} chars"
@@ -742,19 +909,27 @@ let runRestart (request: string) showWin autoApprove =
         FinalVerifierResults = Map.empty; FinalVerifierSummaries = Map.empty; CIStatus = None
         CurrentPhase = "Restart Planning"; CurrentAgentTask = "Architect"
         LastVerifierLog = None; PlanOverview = request; ErrorLog = None
+        FixupReason = None
+        ArbiterAttempt = 0; RestartReason = None
     }
     
+    // Clear old sprint files deterministically (summaries already captured above)
+    SprintFiles.clearSprints()
+    SprintFiles.ensureDir()
+    Logging.info "Cleared all sprint files for restart"
+    
     let restartPrompt = Prompts.architectRestart request sprintsSummary logContent gitDiff
-    let architectOutput = runAgent restartPrompt "Restart-Architect" showWin |> Async.RunSynchronously
+    let (architectOutput, _) = runAgent restartPrompt "Restart-Architect" showWin None |> Async.RunSynchronously
     
     Logging.info "Restart architect completed"
     
     // Continue with normal execution
-    let sprints = SprintFiles.readAllSprints()
-    if sprints.IsEmpty then
+    let rawSprints = SprintFiles.readAllSprints()
+    if rawSprints.IsEmpty then
         AnsiConsole.MarkupLine "[red]Restart architect did not create any sprints[/]"
         1
     else
+        let sprints = runCutter rawSprints showWin
         AnsiConsole.MarkupLine $"[green]Restart created {sprints.Length} new sprints[/]"
         let overview = BacklogFile.readOverview() |> Option.defaultValue request
         showPlan sprints overview

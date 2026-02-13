@@ -22,13 +22,15 @@ type BacklogItem = {
     Name: string           // Sprint name from filename
     Description: string    // Full description from file body
     DoD: string list       // Definition of Done from file body
+    TargetVerifiers: string list option  // When Some, only these verifiers run (used by fixup sprints)
+    EliminatedVerifiers: Set<string>     // Verifiers deemed irrelevant by the cutter (per-sprint)
 }
 
 // Phase is just Implement - verifiers handle all validation
 type Phase = Implement
 
 // Track status AND iteration count for each verifier
-type VerifierStatus = NotStarted | Passed of iterations: int | Failed of iterations: int
+type VerifierStatus = NotStarted | Passed of iterations: int | Failed of iterations: int | Skipped
 
 // Track full history of an iteration for retry context
 type IterationRecord = {
@@ -63,11 +65,14 @@ type State = {
     FinalVerifierResults: Map<string, VerifierStatus>  // Final verification after all sprints
     FinalVerifierSummaries: Map<string, string>  // Management summaries from final verifiers
     CIStatus: (string * bool option) option  // (PR URL, passed: None=pending, Some true=passed, Some false=failed)
-    CurrentPhase: string  // "Planning", "Executing", "Final Verification", "Complete"
+    CurrentPhase: string  // "Planning", "Executing", "Final Verification", "Fixup", "Complete"
     CurrentAgentTask: string  // What agent is currently doing
     LastVerifierLog: (int * string * bool * string) option  // (sprint order, verifier name, passed, summary)
     PlanOverview: string  // Brief overview of the plan
     ErrorLog: string option  // Last error if any
+    FixupReason: string option  // Persistent record of what triggered fixup (verifier names + summaries)
+    ArbiterAttempt: int  // Which retry attempt we're on (0 = first run, 1+ = after arbiter failure)
+    RestartReason: string option  // Why the previous attempt was abandoned (preserved across run restarts)
 }
 
 let emptyTiming = { 
@@ -96,4 +101,7 @@ let emptyState = {
     LastVerifierLog = None
     PlanOverview = ""
     ErrorLog = None
+    FixupReason = None
+    ArbiterAttempt = 0
+    RestartReason = None
 }

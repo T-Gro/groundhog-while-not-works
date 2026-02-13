@@ -37,6 +37,10 @@ module XmlHelpers =
     let hasSignal signal (text: string) =
         Regex.IsMatch(text, sprintf @"(?<![""'`])%s(?![""'`])" (Regex.Escape signal), RegexOptions.IgnoreCase)
 
+    /// Check for a signal trying both the original form and with underscores replaced by spaces.
+    let hasSignalAny (signal: string) (text: string) =
+        hasSignal signal text || hasSignal (signal.Replace("_", " ")) text
+
 module PromptBuilder =
     open XmlHelpers
     let instruction name text = xt name text
@@ -47,14 +51,19 @@ module PromptBuilder =
     let optionalEl name = function Some v -> [xt name v] | None -> []
 
 module Git =
-    let getHeadCommit () =
+    /// Run a process and capture stdout. Returns Some output (trimmed) on success (exit code 0), None on failure.
+    let runProcess (command: string) (args: string) =
         try
-            let psi = ProcessStartInfo("git", "rev-parse --short HEAD", RedirectStandardOutput=true, UseShellExecute=false, CreateNoWindow=true)
+            let psi = ProcessStartInfo(command, args, RedirectStandardOutput=true, UseShellExecute=false, CreateNoWindow=true)
             use p = Process.Start(psi)
             let output = p.StandardOutput.ReadToEnd().Trim()
             p.WaitForExit()
-            if p.ExitCode = 0 && output.Length > 0 then Some output else None
+            if p.ExitCode = 0 then Some output else None
         with _ -> None
+
+    let getHeadCommit () =
+        runProcess "git" "rev-parse --short HEAD"
+        |> Option.bind (fun s -> if s.Length > 0 then Some s else None)
 
 module YamlFrontmatter =
     let private deserializer = DeserializerBuilder().Build()

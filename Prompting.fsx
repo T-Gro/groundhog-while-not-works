@@ -83,12 +83,17 @@ module SprintFiles =
             try
                 let body = File.ReadAllText filePath |> YamlFrontmatter.extractBody
                 let (order, name) = parseFileName (Path.GetFileName filePath)
-                Some { FilePath = filePath; Order = order; Name = name; Description = parseDescription body; DoD = parseDoD body }
+                Some { FilePath = filePath; Order = order; Name = name; Description = parseDescription body; DoD = parseDoD body; TargetVerifiers = None; EliminatedVerifiers = Set.empty }
             with _ -> None
     
     let readAllSprints () = listSprints () |> List.choose readSprint
     let ensureDir () = Directory.CreateDirectory(Config.sprintsDir) |> ignore
     let clearSprints () = if Directory.Exists(Config.sprintsDir) then Directory.GetFiles(Config.sprintsDir, "*.md") |> Array.iter File.Delete
+    let clearSprintsExcept (keepPaths: Set<string>) =
+        if Directory.Exists(Config.sprintsDir) then
+            Directory.GetFiles(Config.sprintsDir, "*.md")
+            |> Array.filter (fun f -> not (keepPaths.Contains f))
+            |> Array.iter File.Delete
 
 module BacklogFile =
     let writeOverview overview =
@@ -486,17 +491,82 @@ module Prompts =
         XmlPrompt.buildArbiter originalRequest failedSprintContext completedSprints pendingSprints
         |> XmlPrompt.toPrompt
 
-/// Standard suffix added to all verifier prompts
+    let cutter (sprintName: string) (sprintDescription: string) (dod: string list) (verifierNames: string list) =
+        let dodText = dod |> List.mapi (fun i d -> $"  {i+1}. {d}") |> String.concat "\n"
+        let verifierList = verifierNames |> List.map (fun v -> $"  - {v}") |> String.concat "\n"
+        xc "R" [
+            xt "role" "VERIFIER CUTTER. Decide which verifiers are utterly irrelevant for a specific sprint."
+            xc "sprint" [
+                xt "name" sprintName
+                xt "description" sprintDescription
+                xt "definition_of_done" dodText
+            ]
+            xc "available_verifiers" [
+                xt "list" verifierList
+            ]
+            xc "task" [
+                xt "instruction" "Some verifiers may be completely irrelevant to this sprint. For example, a sprint that only modifies documentation has no need for a PERF verifier. A sprint that creates no tests has no need for TEST-CODE-QUALITY."
+                xt "rule" "Be CONSERVATIVE. When in doubt, KEEP the verifier. Only eliminate verifiers that are UTTERLY IRRELEVANT — not just unlikely to fail, but checking something this sprint cannot possibly affect."
+                xt "rule" "NEVER eliminate FUNCTIONAL or HONEST-ASSESSMENT — they always apply."
+            ]
+            xc "output_format" [
+                xt "instruction" "Output the names of eliminated verifiers inside an XML tag. If none should be eliminated, output an empty tag."
+                xt "example" "<EliminatedVerifiers>PERF, TEST-CODE-QUALITY</EliminatedVerifiers>"
+                xt "example_none" "<EliminatedVerifiers></EliminatedVerifiers>"
+            ]
+        ] |> XmlPrompt.toPrompt
+
+/// Central preamble prepended to every verifier prompt.
+/// Contains: orchestrator semantics, diff scope with exact git commands, prerequisite.
+let verifierPreamble = """
+=== YOU ARE A VERIFIER AGENT ===
+An outer orchestration agent controls your work.
+- VERIFY_PASSED = process moves to next phase, NO changes made.
+- VERIFY_FAILED = your feedback is acted on, changes are made.
+- If you pass but mention issues, they are LOST. Only failures trigger fixes.
+- Do NOT write VERIFY_PASSED anywhere if you intend to fail.
+
+=== DIFF SCOPE ===
+Review ONLY code added by this branch. Treat it as a PR targeting main.
+
+Run this to get the diff:
+  FORK=$(git merge-base --fork-point main HEAD 2>/dev/null || git merge-base main HEAD) && git diff $FORK HEAD
+Summary:
+  FORK=$(git merge-base --fork-point main HEAD 2>/dev/null || git merge-base main HEAD) && git diff $FORK HEAD --stat
+
+--fork-point finds the original branch point even after merging main into the branch.
+Fallback handles missing reflog (CI, fresh clones).
+NEVER use two-dot 'git diff main HEAD' (shows main changes as deletions).
+NEVER use 'git diff main...HEAD' (merge-base shifts after merging main, hides earlier work).
+Code identical on main is OUT OF SCOPE. Do not review it, do not fail it.
+
+=== PREREQUISITE ===
+Use the check errors skill — must have 0 issues.
+Run added/modified tests using fast run option — they must pass.
+"""
+
+/// Standard suffix added after all verifier content.
+/// Single source of truth for output format.
 let verifierSuffix = """
 
 === OUTPUT FORMAT ===
 At the very end of your response, provide:
-<ManagementSummary>A 1-2 sentence executive summary of what you found</ManagementSummary>
+
+<ManagementSummary>
+4-8 sentence executive summary: what was checked, key findings, specific files/areas of concern, overall assessment.
+Shown to engineers — must be actionable without reading full output.
+</ManagementSummary>
+
+Then on its own line, output EXACTLY one of:
+  VERIFY_PASSED
+  VERIFY_FAILED
+No other text on that line. The orchestrator parses this token.
+Reminder: VERIFY_PASSED = no changes. Any feedback you want acted on requires VERIFY_FAILED.
 """
 
 /// Parse ManagementSummary from verifier output
 let parseManagementSummary (output: string) : string option =
-    let m = Regex.Match(output, @"<ManagementSummary>([^<]+)</ManagementSummary>", RegexOptions.Singleline)
+    let m = Regex.Match(output, @"<ManagementSummary>([\s\S]+?)</ManagementSummary>", RegexOptions.Singleline)
     if m.Success then Some (m.Groups.[1].Value.Trim())
     else None
 
@@ -564,9 +634,10 @@ type VerifyOutcome =
 /// Interpret verifier output - parse result and summary
 let interpretVerifierOutput (output: string) : VerifyOutcome =
     let summary = parseManagementSummary output |> Option.defaultValue "(no summary)"
-    if XmlHelpers.hasSignal "VERIFY_PASSED" output || XmlHelpers.hasSignal "VERIFY PASSED" output then
-        VPassed summary
-    elif XmlHelpers.hasSignal "VERIFY_FAILED" output || XmlHelpers.hasSignal "VERIFY FAILED" output then
-        VFailed summary
-    else
-        VInconclusive summary
+    let hasPassed = XmlHelpers.hasSignalAny "VERIFY_PASSED" output
+    let hasFailed = XmlHelpers.hasSignalAny "VERIFY_FAILED" output
+    match hasPassed, hasFailed with
+    | true, false -> VPassed summary
+    | false, true -> VFailed summary
+    | true, true -> VInconclusive summary   // Both signals = ambiguous
+    | false, false -> VInconclusive summary // No signal = inconclusive
