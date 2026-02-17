@@ -313,7 +313,7 @@ module Prompts =
                 xc "files_sprints" [
                     xt "directory" sprintsDir
                     xt "naming" "NN_SprintName.md - Examples: 01_Setup_Infrastructure.md, 02_Add_Parser.md, 03_Write_Tests.md"
-                    xt "quantity" "Create as many sprint files as needed. Each is an independent unit of work."
+                    xt "quantity" "Create as many sprint files as needed. Each is an independent unit of work. Totally fine to have e.g. 8 sprints as long as they can be verified one by one."
                 ]
             ]
             
@@ -372,7 +372,7 @@ module Prompts =
                 xt "option" "CREATE new fixup sprint(s) to address CI failures specifically"
                 xt "option" "MODIFY existing sprint files if the original approach was flawed"
                 xt "option" "REPLACE a sprint entirely if needed"
-                xt "tip" "Often a single targeted fixup sprint (e.g., 99_CI_Fixup.md) is sufficient"
+                xt "tip" "Often a single targeted fixup sprint is sufficient"
             ]
             
             xc "locations" [
