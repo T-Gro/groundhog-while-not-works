@@ -104,8 +104,21 @@ module PortingProgress =
         | Reviewed       -> "Reviewed"
         | Complete       -> "Complete"
 
+    /// Simple ASCII bar chart of test-passing percentage over time.
+    let private renderAsciiChart (history: Snapshot list) : string =
+        if history.IsEmpty then "(no data yet)"
+        else
+            let width = 50
+            history
+            |> List.map (fun s ->
+                let pct = if s.TotalTests > 0 then float s.TestsPassing / float s.TotalTests else 0.0
+                let bars = int (pct * float width)
+                let ts = s.Timestamp.ToString("MM-dd HH:mm")
+                sprintf "%s |%s%s| %3.0f%%" ts (String.replicate bars "█") (String.replicate (width - bars) "░") (pct * 100.0))
+            |> String.concat "\n"
+
     /// Generate a markdown progress report.
-    let rec renderMarkdownReport (state: PortingState) : string =
+    let renderMarkdownReport (state: PortingState) : string =
         let snap = createSnapshot state
         let elapsed = DateTime.UtcNow - state.StartTime
         let pct = if snap.TotalModules > 0 then float snap.ModulesComplete / float snap.TotalModules * 100.0 else 0.0
@@ -153,19 +166,6 @@ module PortingProgress =
 {renderAsciiChart state.History}
 ```
 """
-
-    /// Simple ASCII bar chart of test-passing percentage over time.
-    and private renderAsciiChart (history: Snapshot list) : string =
-        if history.IsEmpty then "(no data yet)"
-        else
-            let width = 50
-            history
-            |> List.map (fun s ->
-                let pct = if s.TotalTests > 0 then float s.TestsPassing / float s.TotalTests else 0.0
-                let bars = int (pct * float width)
-                let ts = s.Timestamp.ToString("MM-dd HH:mm")
-                sprintf "%s |%s%s| %3.0f%%" ts (String.replicate bars "█") (String.replicate (width - bars) "░") (pct * 100.0))
-            |> String.concat "\n"
 
     /// Write the markdown report to disk.
     let writeReport (state: PortingState) =

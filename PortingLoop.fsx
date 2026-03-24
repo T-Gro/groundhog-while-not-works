@@ -245,8 +245,10 @@ module OuterLoop =
     let run (chunks: SprintChunk list) (state: PortingState) (goDir: string) (autoApprove: bool) =
         let mutable currentState = state
         let mutable consecutiveFailures = 0
+        let mutable stopped = false
 
         for chunk in chunks do
+          if not stopped then
             let moduleIdx = currentState.Modules |> List.tryFindIndex (fun m -> m.Name = chunk.Name)
 
             // Skip already-completed modules (for resume)
@@ -274,11 +276,12 @@ module OuterLoop =
                 let sharedCtx = SharedContext.buildSharedContext completedNames
 
                 // Construct the Ralph request with shared context
+                let safeName = chunk.Name.Replace(" ", "_").Replace("/", "_").Replace("\\", "_")
                 let request = $"""Port TypeScript module '{chunk.Name}' to Go.
 
 {sharedCtx}
 
-Sprint file: {PortingConfig.sprintsDir}/{sprintf "%02d" chunk.Order}_{chunk.Name.Replace(" ", "_")}.md
+Sprint file: {PortingConfig.sprintsDir}/{sprintf "%02d" chunk.Order}_{safeName}.md
 
 After porting, append any new type mappings to {PortingConfig.typeMappingFile}."""
 
@@ -293,7 +296,7 @@ After porting, append any new type mappings to {PortingConfig.typeMappingFile}."
                 let newStatus =
                     if exitCode <> 0 then InProgress 1
                     elif not buildOk then Ported  // Code exists but doesn't compile
-                    elif testsPassing < testsTotal then TestsPassing
+                    elif testsTotal > 0 && testsPassing < testsTotal then TestsPassing
                     else Complete
 
                 // Update module progress
@@ -331,7 +334,7 @@ After porting, append any new type mappings to {PortingConfig.typeMappingFile}."
                             if not (AnsiConsole.Confirm("Continue porting?", false)) then
                                 AnsiConsole.MarkupLine "[red]Porting paused by user.[/]"
                                 saveState currentState
-                                ()  // Exit loop early
+                                stopped <- true
                         consecutiveFailures <- 0  // Reset after human review
                 else
                     consecutiveFailures <- 0

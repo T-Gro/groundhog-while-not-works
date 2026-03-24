@@ -80,7 +80,8 @@ use the **PortingLoop** — an outer orchestrator that sits above Ralph's sprint
 ### Quick Start
 
 ```bash
-# 1. Analyze source and create porting plan
+# 1. Analyze source and create porting plan (project name is optional)
+dotnet fsi PortingLoop.fsx init ./path/to/ts-source github.com/org/go-project
 dotnet fsi PortingLoop.fsx init ./path/to/ts-source github.com/org/go-project "My Project"
 
 # 2. Review the generated sprints

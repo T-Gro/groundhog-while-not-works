@@ -52,7 +52,7 @@ module PortingSplit =
         if not (Directory.Exists rootDir) then []
         else
             Directory.EnumerateFiles(rootDir, "*.ts", SearchOption.AllDirectories)
-            |> Seq.filter (fun f -> not (f.Contains "node_modules") && not (f.Contains ".d.ts"))
+            |> Seq.filter (fun f -> not (f.Contains "node_modules") && not (f.EndsWith ".d.ts"))
             |> Seq.map (fun f ->
                 let rel = Path.GetRelativePath(rootDir, f)
                 let content = File.ReadAllText f
