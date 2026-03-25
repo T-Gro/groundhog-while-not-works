@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "server",
+  "dolt_database": "pyright_porting",
+  "project_id": "6285dbcb-a530-424b-aab0-f5d7a840d0b7"
+}
