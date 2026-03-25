@@ -176,8 +176,10 @@ module ConvergenceLoop =
             Beads.note bead msg
             if passed && d > 0 then
                 Beads.close bead msg; printfn $"  OK: {msg}"
-                // Push on success — unpushed commits become the sprint's permanent record
-                try cli { Exec "git"; Arguments [|"push"|] } |> Command.execute |> ignore with _ -> ()
+                // Push on success
+                let pushResult = try (cli { Exec "git"; Arguments [|"push"|] } |> Command.execute).ExitCode with _ -> 1
+                if pushResult <> 0 then printfn "  ⚠ git push failed — commits are local only"
+                else printfn "  Pushed."
                 // Knowledge capture with explicit diff scope
                 let capturePrompt = String.concat "\n" [
                     $"Sprint {next} succeeded."
