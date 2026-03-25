@@ -627,6 +627,78 @@ module ConvergenceLoop =
 
             Beads.remember $"Sprint {nextSprint} ({targetBucket}): {resultMsg}"
 
+    /// Continuous run — loop sprints until all tests pass or stopped.
+    /// Designed for week-long autonomous runs. Anti-rot mechanisms:
+    ///   - Each sprint is a fresh copilot session (no context accumulation)
+    ///   - Knowledge captured via skills/ADRs (persistent, not session-bound)
+    ///   - Test DB is the source of truth (not agent memory)
+    ///   - Plateau detection: if N sprints with no improvement, pause
+    ///   - Beads tracks everything for crash recovery
+    let run (maxRetries: int) (plateauThreshold: int) =
+        let config = require()
+        printfn $"═══ CONTINUOUS RUN: {config.ProjectName} ({config.SourceLang} → {config.TargetLang}) ═══"
+        printfn $"  Plateau threshold: {plateauThreshold} sprints without improvement → pause"
+        printfn $"  Retries per sprint: {maxRetries}"
+        printfn $"  Press Ctrl+C to stop (safe — state is in beads + DB)"
+        printfn ""
+
+        let mutable running = true
+        let mutable consecutiveNoImprovement = 0
+
+        // Ctrl+C handler — graceful shutdown
+        Console.CancelKeyPress.Add(fun args ->
+            args.Cancel <- true
+            running <- false
+            printfn "\n⏸ Stopping after current sprint completes...")
+
+        while running do
+            let dbPath = currentDbPath()
+            let prePassing =
+                if File.Exists dbPath then
+                    let conn = initSchema dbPath
+                    let (p, _) = passRate conn
+                    conn.Close()
+                    p
+                else 0
+
+            // Run one sprint
+            step maxRetries
+
+            // Check improvement
+            let postPassing =
+                if File.Exists dbPath then
+                    let conn = initSchema dbPath
+                    let (p, t) = passRate conn
+                    let pct = if t > 0 then float p / float t * 100.0 else 0.0
+                    conn.Close()
+                    printfn $"\n  Progress: {p}/{t} ({pct:F1}%%)"
+                    p
+                else 0
+
+            if postPassing <= prePassing then
+                consecutiveNoImprovement <- consecutiveNoImprovement + 1
+                printfn $"  ⚠ No improvement ({consecutiveNoImprovement}/{plateauThreshold})"
+                if consecutiveNoImprovement >= plateauThreshold then
+                    printfn $"\n  🛑 PLATEAU: {plateauThreshold} sprints without improvement."
+                    printfn $"  Human review needed. Check: bd list --status=open"
+                    Beads.remember $"Plateau detected after {plateauThreshold} sprints with no improvement. Human review needed."
+                    running <- false
+            else
+                consecutiveNoImprovement <- 0
+
+            // Check if all tests pass
+            if File.Exists dbPath then
+                let conn = initSchema dbPath
+                let ranked = bucketsRanked conn
+                conn.Close()
+                if ranked.IsEmpty then
+                    printfn "\n  🎉 ALL TESTS PASSING. Porting complete."
+                    Beads.remember "All tests passing. Porting campaign complete."
+                    running <- false
+
+            if running then
+                printfn $"\n{'─' |> string |> String.replicate 60}"
+
     /// Show current status.
     let showStatus () =
         match load() with
@@ -653,16 +725,25 @@ match fsi.CommandLineArgs |> Array.toList |> List.tail with
     ConvergenceLoop.init sourceDir targetDir planFile
 | "init" :: _ ->
     printfn "Usage: dotnet fsi ConvergenceLoop.fsx init <source-dir> <target-dir> [--plan <file.md>]"
+| "run" :: rest ->
+    let maxRetries = rest |> List.tryFind (fun s -> s.StartsWith("--retries=")) |> Option.map (fun s -> int (s.Split('=').[1])) |> Option.defaultValue 3
+    let plateau = rest |> List.tryFind (fun s -> s.StartsWith("--plateau=")) |> Option.map (fun s -> int (s.Split('=').[1])) |> Option.defaultValue 5
+    ConvergenceLoop.run maxRetries plateau
 | "step" :: rest ->
     let maxRetries = rest |> List.tryFind (fun s -> s.StartsWith("--retries=")) |> Option.map (fun s -> int (s.Split('=').[1])) |> Option.defaultValue 3
     ConvergenceLoop.step maxRetries
 | ["status"] -> ConvergenceLoop.showStatus ()
 | ["--help"] | ["-h"] | [] ->
-    printfn "ConvergenceLoop — Re-entrant porting orchestrator"
+    printfn "ConvergenceLoop — Autonomous porting orchestrator"
     printfn ""
-    printfn "  init <src> <tgt> [--plan file.md]   Initialize project"
-    printfn "  step [--retries=N]                   Run one convergence step"
-    printfn "  status                               Show current progress"
+    printfn "  init <src> <tgt> [--plan file.md]        Initialize project"
+    printfn "  run  [--retries=N] [--plateau=N]          Run continuously until done (default)"
+    printfn "  step [--retries=N]                        Run one sprint then exit"
+    printfn "  status                                    Show current progress"
     printfn ""
-    printfn "Info flow: code→git, decisions→adr/, progress→beads, tests→SQLite, skills→.github/skills/"
+    printfn "  run: loops sprints autonomously. Stops on: all tests pass, plateau, or Ctrl+C."
+    printfn "       --plateau=5 means stop after 5 sprints with no improvement."
+    printfn "       Safe to kill — state is in beads + SQLite. Restart with 'run' to continue."
+    printfn ""
+    printfn "  step: single sprint. Use for testing or manual control."
 | other -> printfn $"Unknown: {other |> String.concat " "}. Try --help"
