@@ -221,19 +221,24 @@ module ConvergenceLoop =
                 try (cli { Exec "git"; Arguments [|"rev-parse"; "HEAD"|] } |> Command.execute).Text |> Option.defaultValue "HEAD" |> fun s -> s.Trim()
                 with _ -> "HEAD"
 
+            Beads.note bead $"PHASE:impl baseCommit={baseCommit.[..7]}"
             let (_, sid) = Agent.run prompt $"Impl-S{next}" None
 
-            // Check implementor actually committed something
             let headAfterImpl =
                 try (cli { Exec "git"; Arguments [|"rev-parse"; "HEAD"|] } |> Command.execute).Text |> Option.defaultValue "" |> fun s -> s.Trim()
                 with _ -> ""
-            if headAfterImpl = baseCommit then printfn "  ⚠ Implementor made no commits"
+            if headAfterImpl = baseCommit then
+                Beads.note bead "PHASE:impl:NO_COMMITS"
+                printfn "  ⚠ Implementor made no commits"
+            else
+                Beads.note bead $"PHASE:impl:done commits={headAfterImpl.[..7]}"
+
             let mutable retries = 0
             let mutable passed = false
             let mutable lastFail = ""
 
             while retries < maxRetries && not passed do
-                Beads.note bead $"attempt:{retries+1}"
+                Beads.note bead $"PHASE:verify attempt={retries+1}"
                 let results = Verifiers.listAll() |> List.map (fun v -> async {
                     let (vp,vo,vsid) = Verifiers.runVerifier v baseCommit
                     let verdict = if vp then "PASS" else "FAIL"
@@ -244,7 +249,10 @@ module ConvergenceLoop =
                 else
                     let fb = failed |> List.map (fun (v,_,vo,_) -> $"=== {v} ===\n{trunc vo 2000}") |> String.concat "\n\n"
                     lastFail <- fb
+                    let failedNames = failed |> List.map (fun (v,_,_,_) -> v) |> String.concat ","
+                    Beads.note bead $"PHASE:fix attempt={retries+1} fixing={failedNames}"
                     Agent.resume sid fb $"Fix-S{next}" |> ignore
+                    Beads.note bead $"PHASE:recheck attempt={retries+1}"
                     let rechecks = failed |> List.map (fun (v,_,_,vsid) -> async { let (r,_) = Verifiers.resumeVerifier vsid v in return (v,r) }) |> Async.Parallel |> Async.RunSynchronously
                     if rechecks |> Array.forall snd then passed <- true
                     retries <- retries + 1
