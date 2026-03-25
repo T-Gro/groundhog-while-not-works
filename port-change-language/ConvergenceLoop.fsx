@@ -147,6 +147,15 @@ module ConvergenceLoop =
 
     let private buildBriefing config sprintNum dbBriefing allBuckets prevFailure =
         let prevBlock = match prevFailure with Some ctx -> $"\n<previous_failure>\n{trunc ctx 3000}\n</previous_failure>" | None -> ""
+        // Check for nudge.md — human can drop instructions for the next sprint
+        let nudgePath = Path.Combine(targetDir(), "nudge.md")
+        let nudgeBlock =
+            if File.Exists nudgePath then
+                let content = File.ReadAllText nudgePath
+                File.Delete nudgePath // consume it — one-shot
+                printfn $"  📌 Nudge picked up: {content.[..min 80 (content.Length-1)]}..."
+                $"\n<human_nudge>\n{content}\n</human_nudge>"
+            else ""
         String.concat "\n" [
             $"Sprint {sprintNum}. Source: {config.SourceDir}."
             "Incremental port — improve test pass rate. Not a one-shot."
@@ -156,6 +165,7 @@ module ConvergenceLoop =
             $"\n<failing_buckets>\n{allBuckets}\n</failing_buckets>"
             "\nPick what to work on. Easy wins first is totally fine — the more tests you make pass in one go, the better."
             "Build up the implementation piece by piece. Commit your changes."
+            nudgeBlock
             prevBlock
         ]
 
