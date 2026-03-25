@@ -258,25 +258,25 @@ module BriefingPack =
 module Agent =
     let private model = "claude-opus-4.6"
 
-    /// Run a copilot agent. Returns (output, sessionId).
-    /// Fresh session: resumeSessionId = None → new GUID.
-    /// Resume:        resumeSessionId = Some id → continues existing session.
+    /// Run a copilot agent FROM THE TARGET PROJECT DIRECTORY.
+    /// This ensures .github/copilot-instructions.md, skills, and agents are picked up.
     let run (prompt: string) (title: string) (resumeSessionId: string option) : string * string =
+        let config = require()
         let sessionId = resumeSessionId |> Option.defaultWith (fun () -> Guid.NewGuid().ToString())
         try
             let args = [|
                 "-p"; prompt
                 "--model"; model
                 "--resume"; sessionId
-                "--allow-all"        // tools + paths + urls
-                "--no-ask-user"      // autonomous, no human prompts
-                "--autopilot"        // continue without confirmation
+                "--allow-all"
+                "--no-ask-user"
+                "--autopilot"
                 "--no-color"
                 "--plain-diff"
                 "--stream"; "off"
             |]
             let result =
-                cli { Exec "copilot"; Arguments args }
+                cli { Exec "copilot"; Arguments args; WorkingDirectory config.TargetDir }
                 |> Command.execute
             let output = result.Text |> Option.defaultValue ""
             (output, sessionId)
