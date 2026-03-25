@@ -66,6 +66,7 @@ module Verifiers =
         $"  Diff: git diff {baseCommit}..HEAD"
         $"  Log: git log --oneline {baseCommit}..HEAD"
         "Do NOT review code that existed before this sprint. Do NOT comment on pre-existing issues."
+        "Read: .github/copilot-instructions.md, adr/INDEX.md, porting-plan.md"
         "Output VERIFY_PASSED or VERIFY_FAILED on its own line at the end."
         "If FAILED, write specific actionable fix instructions for the implementor." ]
 
