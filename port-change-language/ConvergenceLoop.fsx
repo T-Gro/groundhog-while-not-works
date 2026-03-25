@@ -170,39 +170,24 @@ module ConvergenceLoop =
         let ranked = bucketsRanked conn
         match ranked with
         | [] when pt = 0 ->
-            // Empty DB — bootstrap sprint: set up test harness, populate DB
+            // No test data — one-shot bootstrap, then stop for human verification
             conn.Close()
-            printfn "S{next} | Empty test DB — bootstrap sprint"
+            printfn $"S{next} | No test data — bootstrap sprint"
             let prompt = String.concat "\n" [
                 $"Sprint {next}. Source: {config.SourceDir}."
-                "The test database is EMPTY. This is the first sprint."
-                "Read porting-plan.md Phase 0 for what needs to happen."
-                "Set up the test harness, run tests, establish the baseline."
+                "No test results exist yet. Read porting-plan.md Phase 0."
+                "Set up the Go test harness. Test samples are in testdata/cases/."
                 "You MUST commit your changes. Do NOT push."
                 "Read: adr/INDEX.md, porting-plan.md" ]
             let bead = Beads.createSprint next "bootstrap" "Empty DB"
             Beads.claim bead
             let sc = initSchema db in initSprint sc next "bootstrap" 0 0; sc.Close()
-            let baseCommit =
-                try (cli { Exec "git"; Arguments [|"rev-parse"; "HEAD"|] } |> Command.execute).Text |> Option.defaultValue "HEAD" |> fun s -> s.Trim()
-                with _ -> "HEAD"
-            let (_, sid) = Agent.run prompt $"Impl-S{next}" None
-            let headAfter =
-                try (cli { Exec "git"; Arguments [|"rev-parse"; "HEAD"|] } |> Command.execute).Text |> Option.defaultValue "" |> fun s -> s.Trim()
-                with _ -> ""
-            if headAfter = baseCommit then printfn "  ⚠ No commits"
-            // Run verifiers
-            let results = Verifiers.listAll() |> List.map (fun v -> async {
-                let (vp,vo,vsid) = Verifiers.runVerifier v baseCommit
-                return (v,vp,vo,vsid) }) |> Async.Parallel |> Async.RunSynchronously |> Array.toList
-            let failed = results |> List.filter (fun (_,vp,_,_) -> not vp)
-            if not failed.IsEmpty then
-                let fb = failed |> List.map (fun (v,_,vo,_) -> $"=== {v} ===\n{trunc vo 2000}") |> String.concat "\n\n"
-                Agent.resume sid fb $"Fix-S{next}" |> ignore
+            let (_, _) = Agent.run prompt $"Impl-S{next}" None
             let pushResult = try (cli { Exec "git"; Arguments [|"push"|] } |> Command.execute).ExitCode with _ -> 1
             if pushResult = 0 then printfn "  Pushed." else printfn "  ⚠ push failed"
             Beads.closeSuccess bead "Bootstrap done"
-            (true, "BOOTSTRAP")
+            printfn "  Bootstrap done. Verify test harness works, then restart ralph-port run."
+            (true, "ALL_PASS") // stops the run loop
         | [] ->
             conn.Close(); printfn "All pass!"; (true, "ALL_PASS")
         | (bucket,layer,failing,bt) :: rest ->
