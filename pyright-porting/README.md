@@ -1,90 +1,55 @@
 # Convergence Porting Tool
 
-A **test-driven convergence loop** for porting large codebases between languages.
+Test-driven convergence loop for porting large codebases between languages.
+Language-agnostic — knows nothing until `init` configures `project.json`.
 
-## Philosophy
-
-> "What passes tests is real. Everything else is optimism."
-
-This tool is **language-agnostic**. It knows nothing about source or target languages
-until you run `init`, which analyzes your project and configures everything.
-
-All project-specific knowledge lives in:
-- `project.json` — discovered during `init` (source/target dirs, build/test commands, layers)
-- `hints/` — generated during `init` (architecture docs, type patterns for subagents)
-- `.beads/` — runtime state (sprint tracking, metrics, memories)
-
-## Architecture
+## How It Works
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│  CONVERGENCE MANAGER (ConvergenceLoop.fsx)                      │
-│  Re-entrant: read beads → do 1 step → update beads → exit      │
-│  Can be restarted at any time. All state lives in beads.        │
-├─────────────────────────────────────────────────────────────────┤
-│  SPRINT PLANNER (FailureAnalyzer.fsx + ContextBuilder.fsx)      │
-│  Analyzes failures → selects target → builds compact context    │
-├─────────────────────────────────────────────────────────────────┤
-│  EXECUTION ENGINE (Ralph or copilot agents)                     │
-│  Implementor → Verifier battery → retry/arbiter → repeat        │
-└─────────────────────────────────────────────────────────────────┘
+┌─ ORCHESTRATOR (ConvergenceLoop.fsx) ─── re-entrant, one step per invocation ─┐
+│                                                                               │
+│  1. Read test DB → pick failing bucket (with alternatives for fuzziness)      │
+│  2. Build dynamic brief → run IMPLEMENTOR (fresh copilot session)             │
+│  3. Build + test → HARD GATE on regression                                    │
+│  4. Run verifiers from verifiers/ folder (dynamic, read-only reviewers)       │
+│     └─ On fail: resume implementor → implementor fixes → resume verifier      │
+│  5. All pass → archive DB, update beads, capture learnings                    │
+└───────────────────────────────────────────────────────────────────────────────┘
 ```
 
-## State Management: Beads
+## Information Flow
 
-All orchestration state lives in **beads** (`bd`), a git-backed issue tracker.
-No custom JSON state files. Fully re-entrant. Crash-safe.
+| What | Where | Access |
+|------|-------|--------|
+| Code changes | git commits | Agents see diffs via `git diff HEAD~1` |
+| Project conventions | `.github/copilot-instructions.md` | Always loaded by copilot |
+| Scoped conventions | `.github/instructions/*.md` | Loaded when matching file globs |
+| Reusable techniques | `.github/skills/*/SKILL.md` | Loaded on demand by trigger |
+| Architecture decisions | `adr/INDEX.md` → `adr/NNNN-*.md` | Read by agents on start |
+| Test pass/fail | SQLite `testdata/current_results.db` | Queried by orchestrator |
+| Subtask progress | beads (`bd`) | Query from another terminal |
 
+## Agent Invocation
+
+All agents run via GitHub Copilot CLI with Opus 4.6:
+```
+copilot -p "prompt" --model claude-opus-4.6 --resume <sessionId>
+        --allow-all --no-ask-user --autopilot --no-color --stream off
+```
+
+Session IDs enable the resume chain: implementor ↔ verifier ↔ implementor.
+
+## Visualization
+
+The orchestrator prints progress to stdout. For beads task status, run in another terminal:
 ```bash
-bd ready                    # What work is unblocked?
-bd list --status=open       # All open work
-bd show <id>                # Sprint details
-bd status                   # Project health overview
+bd ready && bd list --status=open && bd status
 ```
-
-**To view progress**: Open another terminal tab and query beads.
-
-## Verifier Battery
-
-**Hard gates (executable, must pass):**
-- `V01-BUILDS` — target language build command succeeds
-- `V02-TESTS-PASS` — target language test command succeeds
-- `V03-NO-REGRESSION` — % passing ≥ previous sprint
-- `V04-ORACLE` — output comparison vs golden reference
-
-**Soft gates (LLM review, quality):**
-- `V05-TYPE-FIDELITY` — type system translation quality
-- `V06-CODE-QUALITY` — idiomatic target code, reuse, architecture
-- `V07-DEDUP` — no copy-paste between packages
-- `V08-TEST-QUALITY` — test completeness and correctness
-- `V09-HONEST-ASSESSMENT` — independent honest review
 
 ## Quick Start
 
 ```bash
-# Prerequisites: dotnet, bd (beads), dolt, source & target language toolchains
-
-# 1. Initialize — analyzes source, discovers layers, creates project.json
-dotnet fsi ConvergenceLoop.fsx init <source-dir> <target-dir>
-
-# 2. Run one convergence step (re-entrant — safe to interrupt & restart)
-dotnet fsi ConvergenceLoop.fsx step
-
-# 3. View progress
+dotnet fsi ConvergenceLoop.fsx init <source-dir> <target-dir> [--plan file.md]
+dotnet fsi ConvergenceLoop.fsx step [--retries=N]
 dotnet fsi ConvergenceLoop.fsx status
-```
-
-## Directory Structure
-
-```
-pyright-porting/
-├── ConvergenceLoop.fsx    # Re-entrant orchestrator (outer loop)
-├── ContextBuilder.fsx     # Compact context for subagents
-├── FailureAnalyzer.fsx    # Categorizes test failures
-├── GoldenOracle.fsx       # Generates golden reference from original tool
-├── project.json           # [generated] Project-specific config
-├── .beads/                # Beads database (all state)
-├── verifiers/             # V01-V09 verifier definitions
-├── templates/             # Sprint templates
-└── hints/                 # [generated] Architecture docs for subagent context
 ```

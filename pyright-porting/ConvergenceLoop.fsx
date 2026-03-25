@@ -228,16 +228,22 @@ module BriefingPack =
                 $"<alternative_buckets>\nSuggested: '{targetBucket}'. But you may pick a different one if you believe you can make more progress:\n{alts}\nExplain your choice.\n</alternative_buckets>"
 
         // The CONSTANT brief is implicit via .github/copilot-instructions.md (always loaded by copilot).
-        // This is the DYNAMIC brief built from previous sprint state.
+        // This DYNAMIC brief is built from previous sprint state.
         String.concat "\n\n" [
-            $"<sprint num=\"{sprintNum}\" bucket=\"{targetBucket}\">"
-            $"Source dir: {config.SourceDir} | Target dir: {config.TargetDir}"
-            "</sprint>"
+            "<context>"
+            $"We are porting a codebase from {config.SourceLang} to {config.TargetLang}, per partes."
+            $"Source: {config.SourceDir} (read-only reference). Target: {config.TargetDir} (you work here)."
+            "This is NOT a one-shot port. We improve incrementally — each sprint increases the % of passing tests."
+            "Your .github/copilot-instructions.md has project conventions. Read adr/INDEX.md for architecture decisions."
+            "Code changes flow via git commits. Each commit should build and pass tests."
+            "</context>"
+
+            $"<sprint num=\"{sprintNum}\" bucket=\"{targetBucket}\" />"
 
             $"<test_summary total=\"{totalTestCount}\">\n{testDbBriefing}\n</test_summary>"
 
             "<guards>"
-            $"Total test count must remain >= {totalTestCount}. Deleting tests to fake progress = instant fail."
+            $"Total test count must remain >= {totalTestCount}. Deleting tests = instant fail."
             "Passing rate must not decrease. Regressions are hard-gated."
             "</guards>"
 
@@ -249,15 +255,12 @@ module BriefingPack =
 
             Knowledge.writingGuidance ()
 
-            "<instructions>"
-            "You are an implementor. Your goal: increase the passing test rate."
-            $"Focus on bucket '{targetBucket}' (or pick from alternatives if you justify it)."
-            "After making changes, run the build and test commands to verify."
+            "<task>"
+            $"Increase the passing test rate. Focus on bucket '{targetBucket}' (or pick from alternatives if you justify it)."
             $"Build: {config.BuildCommand}"
             $"Test: {config.TestCommand}"
             "Commit your changes with a descriptive message."
-            "If you discover a non-trivial insight, write an ADR or skill file."
-            "</instructions>"
+            "</task>"
         ]
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -265,14 +268,27 @@ module BriefingPack =
 // ═════════════════════════════════════════════════════════════════════════════
 
 module Agent =
+    let private model = "claude-opus-4.6"
+
     /// Run a copilot agent. Returns (output, sessionId).
+    /// Fresh session: resumeSessionId = None → new GUID.
+    /// Resume:        resumeSessionId = Some id → continues existing session.
     let run (prompt: string) (title: string) (resumeSessionId: string option) : string * string =
         let sessionId = resumeSessionId |> Option.defaultWith (fun () -> Guid.NewGuid().ToString())
         try
-            let baseArgs = [| "--allow-all-tools"; "--allow-all-paths"; "--no-ask-user"; "--no-color"; "--plain-diff"; "-s"; "--stream"; "off"; "--resume"; sessionId |]
-            let escapedPrompt = prompt.Replace("{", "{{").Replace("}", "}}")
+            let args = [|
+                "-p"; prompt
+                "--model"; model
+                "--resume"; sessionId
+                "--allow-all"        // tools + paths + urls
+                "--no-ask-user"      // autonomous, no human prompts
+                "--autopilot"        // continue without confirmation
+                "--no-color"
+                "--plain-diff"
+                "--stream"; "off"
+            |]
             let result =
-                cli { Exec "copilot"; Arguments baseArgs; Input escapedPrompt }
+                cli { Exec "copilot"; Arguments args }
                 |> Command.execute
             let output = result.Text |> Option.defaultValue ""
             (output, sessionId)
@@ -280,7 +296,7 @@ module Agent =
             eprintfn $"Agent '{title}' failed: {ex.Message}"
             ("", sessionId)
 
-    /// Resume a session with follow-up (verifier feedback → implementor).
+    /// Resume a session with follow-up context.
     let resume (sessionId: string) (feedback: string) (title: string) : string =
         let (output, _) = run feedback title (Some sessionId)
         output
@@ -314,26 +330,39 @@ module Verifiers =
     let preamble = """
 === YOU ARE A VERIFIER AGENT ===
 You REVIEW code. You do NOT make code changes.
-Your job: assess quality and plan actions for the implementor.
+Your job: assess the LATEST commit and plan actions for the implementor.
 
-- VERIFY_PASSED = work is acceptable, move on.
-- VERIFY_FAILED = problems found. Your feedback becomes the implementor's next task.
-  Write SPECIFIC, ACTIONABLE instructions the implementor can follow.
-  "Fix the bug in X by doing Y" — not "there are some issues."
+CONTEXT: This is an iterative porting campaign. Each sprint improves test pass rate
+incrementally. The code is NOT the final product — it is a work in progress.
+Judge whether THIS sprint made things better, not whether the port is complete.
+
+- VERIFY_PASSED = this sprint's changes are acceptable. Move on.
+- VERIFY_FAILED = problems found. Write SPECIFIC, ACTIONABLE fix instructions.
+  The implementor will receive your feedback and fix the issues.
+  Then you will be resumed (--resume) to re-check. Be ready for that.
+
+To see what changed this sprint:
+  cd {targetDir} && git diff HEAD~1
 
 Output exactly one of VERIFY_PASSED or VERIFY_FAILED on its own line at the end.
 """
 
-    /// Run a verifier agent. Returns (passed, feedback).
-    let runVerifier (config: ProjectConfig) (verifierName: string) : bool * string =
+    /// Run a verifier agent. Returns (passed, feedback, sessionId).
+    /// The sessionId is kept so the verifier can be RESUMED after implementor fixes.
+    let runVerifier (config: ProjectConfig) (verifierName: string) : bool * string * string =
+        let filledPreamble = preamble.Replace("{targetDir}", config.TargetDir)
         let prompt = String.concat "\n\n" [
-            preamble
+            filledPreamble
             getPrompt verifierName
-            $"\nTarget directory: {config.TargetDir}"
-            $"\nRun this to see the diff:"
-            $"  cd {config.TargetDir} && git diff HEAD~1"
         ]
-        let (output, _) = Agent.run prompt $"Verify-{verifierName}" None
+        let (output, sessionId) = Agent.run prompt $"Verify-{verifierName}" None
+        let passed = output.Contains("VERIFY_PASSED") && not (output.Contains("VERIFY_FAILED"))
+        (passed, output, sessionId)
+
+    /// Resume a verifier to re-check after implementor fixed issues.
+    let resumeVerifier (sessionId: string) (verifierName: string) : bool * string =
+        let feedback = "The implementor has addressed your feedback and committed fixes. Re-review the latest state. Output VERIFY_PASSED or VERIFY_FAILED."
+        let output = Agent.resume sessionId feedback $"Re-verify-{verifierName}"
         let passed = output.Contains("VERIFY_PASSED") && not (output.Contains("VERIFY_FAILED"))
         (passed, output)
 
@@ -541,21 +570,29 @@ module ConvergenceLoop =
                         Agent.resume sessionId feedback $"Fix-regression-S{nextSprint}" |> ignore
                         retryCount <- retryCount + 1
                     else
-                        // 4. Run ALL soft verifiers from verifiers/ folder (dynamic — add/remove .md files freely)
+                        // 4. Run ALL soft verifiers from verifiers/ folder
+                        // Flow: verifier fails → resume impl with feedback → impl fixes → resume SAME verifier
                         let softVerifiers = Verifiers.listSoftVerifiers ()
                         let mutable verifiersPassed = true
 
                         for vName in softVerifiers do
                             if verifiersPassed && retryCount < maxRetries then
                                 printfn $"  Running {vName}..."
-                                let (passed, feedback) = Verifiers.runVerifier config vName
+                                let (passed, feedback, verifierSessionId) = Verifiers.runVerifier config vName
                                 if passed then
                                     printfn $"  ✅ {vName}"
                                 else
                                     printfn $"  ❌ {vName} — resuming implementor with feedback"
                                     let truncFeedback = if feedback.Length > 4000 then feedback.[..3999] else feedback
+                                    // Implementor fixes based on verifier feedback
                                     Agent.resume sessionId truncFeedback $"Fix-{vName}-S{nextSprint}" |> ignore
-                                    verifiersPassed <- false
+                                    // Resume the SAME verifier to re-check
+                                    let (recheck, _) = Verifiers.resumeVerifier verifierSessionId vName
+                                    if recheck then
+                                        printfn $"  ✅ {vName} (after fix)"
+                                    else
+                                        printfn $"  ❌ {vName} still failing after fix"
+                                        verifiersPassed <- false
                                     retryCount <- retryCount + 1
 
                         if verifiersPassed then
