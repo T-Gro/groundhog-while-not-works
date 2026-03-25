@@ -59,7 +59,15 @@ module Verifiers =
         let p = Path.Combine(dir, name + ".md")
         if File.Exists p then File.ReadAllText p else ""
 
-    let private preamble baseCommit = $"You are a VERIFIER. Review code, do NOT change it. This is iterative — judge the delta, not perfection.\nYour scope: unpushed commits since {baseCommit}. Run: git diff {baseCommit}..HEAD\nOutput VERIFY_PASSED or VERIFY_FAILED on its own line at the end. If FAILED, write specific actionable fix instructions."
+    let private preamble baseCommit = String.concat "\n" [
+        "You are a VERIFIER. Review code, do NOT change it."
+        "This is iterative work — judge THIS SPRINT's delta only, not the whole project."
+        $"EXACT SCOPE: only changes between {baseCommit} and HEAD. Nothing else."
+        $"  Diff: git diff {baseCommit}..HEAD"
+        $"  Log: git log --oneline {baseCommit}..HEAD"
+        "Do NOT review code that existed before this sprint. Do NOT comment on pre-existing issues."
+        "Output VERIFY_PASSED or VERIFY_FAILED on its own line at the end."
+        "If FAILED, write specific actionable fix instructions for the implementor." ]
 
     let private parseVerdict (output: string) sid name =
         let p = output.Contains "VERIFY_PASSED"
@@ -171,7 +179,11 @@ module ConvergenceLoop =
                 // Push on success — unpushed commits become the sprint's permanent record
                 try cli { Exec "git"; Arguments [|"push"|] } |> Command.execute |> ignore with _ -> ()
                 // Knowledge capture with explicit diff scope
-                let capturePrompt = $"Sprint {next} succeeded. Diff scope: git diff {baseCommit}..HEAD\nCapture non-trivial learnings if any. Say 'No learnings.' if none."
+                let capturePrompt = String.concat "\n" [
+                    $"Sprint {next} succeeded."
+                    $"EXACT SCOPE: git diff {baseCommit}..HEAD"
+                    $"Log: git log --oneline {baseCommit}..HEAD"
+                    "Review only these commits. Capture non-trivial learnings if any. Say 'No learnings.' if none." ]
                 Agent.run capturePrompt $"Knowledge-S{next}" None |> ignore
                 (true, msg)
             else
