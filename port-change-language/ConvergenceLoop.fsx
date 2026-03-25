@@ -145,19 +145,18 @@ module ConvergenceLoop =
         Beads.ensureEpic config.ProjectName |> ignore
         config
 
-    let private buildBriefing config sprintNum bucket dbBriefing failures totalTests alts prevFailure =
-        let failLines = failures |> List.truncate 25 |> List.map (fun (f,e) -> $"  {f}: {e}") |> String.concat "\n"
-        let altLines = if alts = [] then "" else alts |> List.map (fun b -> $"  - {b}") |> String.concat "\n" |> sprintf "\nAlternative buckets (pick if stuck):\n%s"
+    let private buildBriefing config sprintNum dbBriefing allBuckets prevFailure =
         let prevBlock = match prevFailure with Some ctx -> $"\n<previous_failure>\n{trunc ctx 3000}\n</previous_failure>" | None -> ""
         String.concat "\n" [
-            $"Sprint {sprintNum}. Target bucket: {bucket}. Source: {config.SourceDir}."
-            "Incremental port — improve test pass rate piece by piece. Not a one-shot."
-            "You MUST commit your changes (git add + git commit). Do NOT push — the orchestrator pushes on success."
+            $"Sprint {sprintNum}. Source: {config.SourceDir}."
+            "Incremental port — improve test pass rate. Not a one-shot."
+            "You MUST commit your changes. Do NOT push."
             "Read: adr/INDEX.md, porting-plan.md"
-            $"\n<tests total=\"{totalTests}\">\n{dbBriefing}\n</tests>"
-            $"\n<failing>\n{failLines}\n</failing>"
-            altLines; prevBlock
-            $"\nFix failures in '{bucket}'. Build, test, commit."
+            $"\n<test_status>\n{dbBriefing}\n</test_status>"
+            $"\n<failing_buckets>\n{allBuckets}\n</failing_buckets>"
+            "\nPick what to work on. Easy wins first is totally fine — the more tests you make pass in one go, the better."
+            "Build up the implementation piece by piece. Commit your changes."
+            prevBlock
         ]
 
     let step maxRetries prevFailure : bool * string =
@@ -190,17 +189,20 @@ module ConvergenceLoop =
             (true, "ALL_PASS") // stops the run loop
         | [] ->
             conn.Close(); printfn "All pass!"; (true, "ALL_PASS")
-        | (bucket,layer,failing,bt) :: rest ->
-            let alts = rest |> List.truncate 4 |> List.map (fun (b,l,f,_) -> $"{b} ({l},{f})")
-            let fails = failingInBucket conn bucket 30
+        | _ ->
+            // Build a full bucket list for the agent to choose from
+            let allBuckets =
+                ranked |> List.map (fun (b, l, f, t) -> $"  {b} ({l}): {f}/{t} failing")
+                |> String.concat "\n"
             let brief = briefing conn
             conn.Close()
-            printfn $"S{next} | {pp}/{pt} | {bucket} ({failing} failing)"
+            printfn $"S{next} | {pp}/{pt} | {ranked.Length} failing buckets"
 
-            let prompt = buildBriefing config next bucket brief fails pt alts prevFailure
-            let bead = Beads.createSprint next bucket $"Pre:{pp}/{pt}, {failing} failing"
+            let prompt = buildBriefing config next brief allBuckets prevFailure
+            let topBucket = ranked |> List.head |> fun (b,_,_,_) -> b
+            let bead = Beads.createSprint next topBucket $"Pre:{pp}/{pt}"
             Beads.claim bead
-            let sc = initSchema db in initSprint sc next bucket pp pt; sc.Close()
+            let sc = initSchema db in initSprint sc next topBucket pp pt; sc.Close()
 
             // Record base commit BEFORE implementor runs — this defines the sprint's diff scope
             let baseCommit =
