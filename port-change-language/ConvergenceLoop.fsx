@@ -203,12 +203,23 @@ module ConvergenceLoop =
         printfn $"=== {config.ProjectName}: {config.SourceLang} -> {config.TargetLang} ==="
         let mutable go = true
         let mutable prev: string option = None
+        let mutable consecutiveErrors = 0
         Console.CancelKeyPress.Add(fun a -> a.Cancel <- true; go <- false; printfn "\nStopping...")
         while go do
-            let (ok, s) = step maxRetries prev
-            if s = "ALL_PASS" then go <- false
-            elif ok then prev <- None
-            else prev <- Some s
+            try
+                let (ok, s) = step maxRetries prev
+                consecutiveErrors <- 0  // reset on any successful step completion
+                if s = "ALL_PASS" then go <- false
+                elif ok then prev <- None
+                else prev <- Some s
+            with ex ->
+                consecutiveErrors <- consecutiveErrors + 1
+                eprintfn $"Sprint error ({consecutiveErrors}): {ex.Message}"
+                Beads.remember $"Sprint error: {ex.Message}"
+                if consecutiveErrors >= 5 then
+                    eprintfn "5 consecutive errors — sleeping 10 min before retry"
+                    System.Threading.Thread.Sleep(10 * 60 * 1000)
+                    consecutiveErrors <- 0  // reset after sleep, try again
 
     let status () =
         match load() with
