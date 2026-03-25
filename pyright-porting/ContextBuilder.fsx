@@ -83,6 +83,12 @@ module ContextBuilder =
                 $"... and {failures.Length - maxCount} more"
         ]
 
+    /// Read the porting plan (if one was seeded during init).
+    let getPlan () : string =
+        let content = readHint "porting-plan.md"
+        if String.IsNullOrWhiteSpace content then ""
+        else $"## Porting Plan\n{content}"
+
     /// Build the complete prompt context for a convergence sprint.
     let buildSprintContext
         (config: ProjectConfig)
@@ -96,13 +102,24 @@ module ContextBuilder =
 
         let contracts = getAdjacentContracts config layerId
         let patterns = getTranslationPatterns ()
+        let plan = getPlan ()
         let source = extractSourceFiles config.SourceDir sourceFiles 30_000
         let failureText = formatFailures failures 20
+
+        // Include plan summary only if it fits budget — truncate to first 3K tokens
+        let planSection =
+            if String.IsNullOrWhiteSpace plan then ""
+            else
+                let maxPlanChars = 12_000  // ~3K tokens
+                if plan.Length <= maxPlanChars then plan
+                else plan.Substring(0, maxPlanChars) + "\n\n_(plan truncated for context budget)_"
 
         String.concat "\n\n" [
             $"# Convergence Sprint: Port {featureName} ({layerId})"
             $"**Source language**: {config.SourceLang}  |  **Target language**: {config.TargetLang}"
             $"**Previous passing**: {previousPassingPct:F1}%%  |  **Target delta**: +{targetDeltaPct:F1}%%"
+            ""
+            if not (String.IsNullOrWhiteSpace planSection) then planSection
             ""
             "## Architecture Context"
             contracts

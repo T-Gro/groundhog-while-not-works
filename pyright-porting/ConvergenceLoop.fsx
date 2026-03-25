@@ -102,9 +102,15 @@ module Toolchain =
 
 module ConvergenceLoop =
 
-    /// Discover project properties by scanning source and target directories.
-    /// Uses a copilot agent to analyze the codebase and populate project.json + hints.
-    let init (sourceDir: string) (targetDir: string) =
+    let private planPath () = Path.Combine(__SOURCE_DIRECTORY__, "hints", "porting-plan.md")
+
+    /// Read the porting plan if one exists.
+    let readPlan () : string option =
+        let p = planPath ()
+        if File.Exists p then Some (File.ReadAllText p) else None
+
+    /// Initialize the project. Optionally seed with a pre-written plan.
+    let init (sourceDir: string) (targetDir: string) (planFile: string option) =
         printfn $"Initializing porting project..."
         printfn $"  Source: {sourceDir}"
         printfn $"  Target: {targetDir}"
@@ -136,6 +142,19 @@ module ConvergenceLoop =
             if not (File.Exists path) then
                 File.WriteAllText(path, content)
                 printfn $"  Created hints/{name} (placeholder — fill in during setup)"
+
+        // Copy plan file if provided
+        match planFile with
+        | Some pf when File.Exists pf ->
+            let dest = planPath ()
+            File.Copy(pf, dest, true)
+            printfn $"  Seeded porting plan from {pf}"
+            Beads.remember $"Porting plan loaded from {Path.GetFileName pf}. Read hints/porting-plan.md for project context."
+        | Some pf ->
+            eprintfn $"  Warning: Plan file not found: {pf}"
+        | None ->
+            printfn $"  No plan provided. You can add one later at hints/porting-plan.md"
+            printfn $"  Or re-run with: init <src> <tgt> --plan <file.md>"
 
         // Create beads epics for project structure
         let epicId = Beads.create
@@ -309,10 +328,14 @@ module ConvergenceLoop =
 
 // CLI entry point
 match fsi.CommandLineArgs |> Array.toList |> List.tail with
-| "init" :: sourceDir :: targetDir :: _ ->
-    ConvergenceLoop.init sourceDir targetDir
+| "init" :: sourceDir :: targetDir :: rest ->
+    let planFile = 
+        match rest |> List.tryFindIndex (fun a -> a = "--plan") with
+        | Some i when i + 1 < rest.Length -> Some rest.[i + 1]
+        | _ -> None
+    ConvergenceLoop.init sourceDir targetDir planFile
 | "init" :: _ ->
-    printfn "Usage: dotnet fsi ConvergenceLoop.fsx init <source-dir> <target-dir>"
+    printfn "Usage: dotnet fsi ConvergenceLoop.fsx init <source-dir> <target-dir> [--plan <file.md>]"
 | "step" :: rest ->
     let auto = rest |> List.contains "--auto"
     ConvergenceLoop.step auto
@@ -324,7 +347,7 @@ match fsi.CommandLineArgs |> Array.toList |> List.tail with
     printfn "ConvergenceLoop — Re-entrant, language-agnostic porting orchestrator"
     printfn ""
     printfn "Usage:"
-    printfn "  dotnet fsi ConvergenceLoop.fsx init <source-dir> <target-dir>"
+    printfn "  dotnet fsi ConvergenceLoop.fsx init <source-dir> <target-dir> [--plan <file.md>]"
     printfn "  dotnet fsi ConvergenceLoop.fsx step [--auto]"
     printfn "  dotnet fsi ConvergenceLoop.fsx status"
     printfn "  dotnet fsi ConvergenceLoop.fsx analyze"
