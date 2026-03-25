@@ -19,13 +19,19 @@ open Microsoft.Data.Sqlite
 
 module TestResultsDb =
 
-    let private dbDir () = Path.Combine(__SOURCE_DIRECTORY__, "testdata")
+    /// Runtime data lives in .ralph-port/<project-key>/ inside the harness dir.
+    /// Keyed by target folder name so parallel ports don't collide.
+    /// This folder is gitignored — ephemeral runtime state, not source.
+    let private runtimeDir (projectKey: string) =
+        let dir = Path.Combine(__SOURCE_DIRECTORY__, ".ralph-port", projectKey)
+        Directory.CreateDirectory dir |> ignore
+        dir
 
-    /// Path to the current (latest) sprint DB.
-    let currentDbPath () = Path.Combine(dbDir(), "current_results.db")
+    /// Derive project key from target directory path (just the folder name).
+    let projectKey (targetDir: string) = Path.GetFileName(targetDir.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar))
 
-    /// Archive path for a specific sprint.
-    let sprintDbPath (sprintNum: int) = Path.Combine(dbDir(), $"sprint_{sprintNum:D4}.db")
+    let currentDbPath (key: string) = Path.Combine(runtimeDir key, "current_results.db")
+    let sprintDbPath (key: string) (sprintNum: int) = Path.Combine(runtimeDir key, $"sprint_{sprintNum:D4}.db")
 
     /// Initialize the schema in a new or existing DB.
     let initSchema (dbPath: string) =
@@ -214,10 +220,10 @@ module TestResultsDb =
             yield! bucketLines
         ]
 
-    /// Archive current DB as sprint N and start fresh.
-    let archiveAndReset (sprintNum: int) =
-        let current = currentDbPath()
+    /// Archive current DB as sprint N.
+    let archiveAndReset (key: string) (sprintNum: int) =
+        let current = currentDbPath key
         if File.Exists current then
-            let archive = sprintDbPath sprintNum
+            let archive = sprintDbPath key sprintNum
             File.Copy(current, archive, true)
         // Don't delete current — it becomes the baseline for next sprint

@@ -450,13 +450,14 @@ module ConvergenceLoop =
 
     let private ensureInit () =
         let config = require()
-        let dbPath = currentDbPath()
+        let key = projectKey config.TargetDir
+        let dbPath = currentDbPath key
         if not (File.Exists dbPath) then
             let conn = initSchema dbPath
             initSprint conn 0 "" 0 0
             conn.Close()
         Knowledge.ensureDirs config
-        config
+        (config, key)
 
     let private truncOut (s: string) (max: int) =
         if s.Length <= max then s
@@ -466,8 +467,8 @@ module ConvergenceLoop =
     /// Every agent output stored as beads note. Nothing dropped.
     /// Failed sprint summary carries forward to next sprint.
     let step (maxRetries: int) (previousFailure: string option) : bool * string =
-        let config = ensureInit ()
-        let dbPath = currentDbPath()
+        let (config, key) = ensureInit ()
+        let dbPath = currentDbPath key
         let conn = initSchema dbPath
         let sprintNum = currentSprintNum conn
         let nextSprint = sprintNum + 1
@@ -551,7 +552,7 @@ module ConvergenceLoop =
 
             let fc = initSchema dbPath
             let (fp,ft) = passRate fc in let delta = fp-prevPassing
-            finalizeSprint fc fp ft; fc.Close(); archiveAndReset nextSprint
+            finalizeSprint fc fp ft; fc.Close(); archiveAndReset key nextSprint
 
             let msg = $"{fp}/{ft} ({if ft>0 then float fp/float ft*100.0 else 0.0:F1}%%) d={delta:+#;-#;0}"
             Beads.note beadId msg
@@ -566,7 +567,7 @@ module ConvergenceLoop =
 
     /// Continuous autonomous run. Self-healing: failure feeds forward.
     let run (maxRetries: int) =
-        let config = ensureInit ()
+        let (config, _) = ensureInit ()
         printfn $"=== {config.ProjectName}: {config.SourceLang} -> {config.TargetLang} ==="
         printfn $"  Ctrl+C safe. Failures feed forward."
 
@@ -584,9 +585,10 @@ module ConvergenceLoop =
     let showStatus () =
         match load() with
         | Some config ->
+            let key = projectKey config.TargetDir
             printfn $"{config.ProjectName}: {config.SourceLang} -> {config.TargetLang}"
-            if File.Exists (currentDbPath()) then
-                let c = initSchema (currentDbPath()) in printfn $"{briefing c}"; c.Close()
+            if File.Exists (currentDbPath key) then
+                let c = initSchema (currentDbPath key) in printfn $"{briefing c}"; c.Close()
             printfn $"{Beads.status()}"
             let r = Beads.ready() in if r.Length > 0 then printfn $"Ready:\n{r}"
         | None -> printfn "No project.json."
