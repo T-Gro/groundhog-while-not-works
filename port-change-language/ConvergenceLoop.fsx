@@ -126,7 +126,42 @@ module ConvergenceLoop =
         let (pp, pt) = passRate conn
         let ranked = bucketsRanked conn
         match ranked with
-        | [] -> conn.Close(); printfn "All pass!"; (true, "ALL_PASS")
+        | [] when pt = 0 ->
+            // Empty DB — bootstrap sprint: set up test harness, populate DB
+            conn.Close()
+            printfn "S{next} | Empty test DB — bootstrap sprint"
+            let prompt = String.concat "\n" [
+                $"Sprint {next}. Source: {config.SourceDir}."
+                "The test database is EMPTY. This is the first sprint."
+                "Read porting-plan.md Phase 0 for what needs to happen."
+                "Set up the test harness, run tests, establish the baseline."
+                "You MUST commit your changes. Do NOT push."
+                "Read: adr/INDEX.md, porting-plan.md" ]
+            let bead = Beads.create $"S{next}: bootstrap" "Set up test harness"
+            Beads.claim bead
+            let sc = initSchema db in initSprint sc next "bootstrap" 0 0; sc.Close()
+            let baseCommit =
+                try (cli { Exec "git"; Arguments [|"rev-parse"; "HEAD"|] } |> Command.execute).Text |> Option.defaultValue "HEAD" |> fun s -> s.Trim()
+                with _ -> "HEAD"
+            let (_, sid) = Agent.run prompt $"Impl-S{next}" None
+            let headAfter =
+                try (cli { Exec "git"; Arguments [|"rev-parse"; "HEAD"|] } |> Command.execute).Text |> Option.defaultValue "" |> fun s -> s.Trim()
+                with _ -> ""
+            if headAfter = baseCommit then printfn "  ⚠ No commits"
+            // Run verifiers
+            let results = Verifiers.listAll() |> List.map (fun v -> async {
+                let (vp,vo,vsid) = Verifiers.runVerifier v baseCommit
+                return (v,vp,vo,vsid) }) |> Async.Parallel |> Async.RunSynchronously |> Array.toList
+            let failed = results |> List.filter (fun (_,vp,_,_) -> not vp)
+            if not failed.IsEmpty then
+                let fb = failed |> List.map (fun (v,_,vo,_) -> $"=== {v} ===\n{trunc vo 2000}") |> String.concat "\n\n"
+                Agent.resume sid fb $"Fix-S{next}" |> ignore
+            let pushResult = try (cli { Exec "git"; Arguments [|"push"|] } |> Command.execute).ExitCode with _ -> 1
+            if pushResult = 0 then printfn "  Pushed." else printfn "  ⚠ push failed"
+            Beads.close bead "Bootstrap done"
+            (true, "BOOTSTRAP")
+        | [] ->
+            conn.Close(); printfn "All pass!"; (true, "ALL_PASS")
         | (bucket,layer,failing,bt) :: rest ->
             let alts = rest |> List.truncate 4 |> List.map (fun (b,l,f,_) -> $"{b} ({l},{f})")
             let fails = failingInBucket conn bucket 30
