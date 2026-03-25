@@ -267,10 +267,25 @@ module ConvergenceLoop =
     let status () =
         match load() with
         | Some c ->
+            let k = key()
             printfn $"{c.ProjectName}: {c.SourceLang} -> {c.TargetLang}"
-            let db = currentDbPath (key())
+            let db = currentDbPath k
             if File.Exists db then let cn = initSchema db in printfn $"{briefing cn}"; cn.Close()
+            let trend = trendData k
+            if trend.Length > 0 then
+                printfn ""
+                printfn $"{renderChart trend 30}"
         | None -> printfn "No project.json."
+
+    /// Watch mode — refreshes status every N seconds.
+    let watch interval =
+        let mutable go = true
+        Console.CancelKeyPress.Add(fun a -> a.Cancel <- true; go <- false)
+        while go do
+            Console.Clear()
+            status ()
+            printfn $"\n(refreshing every {interval}s — Ctrl+C to stop)"
+            System.Threading.Thread.Sleep(interval * 1000)
 
 let retries rest = rest |> List.tryFind (fun (s:string) -> s.StartsWith "--retries=") |> Option.map (fun s -> int(s.Split('=').[1])) |> Option.defaultValue 3
 
@@ -278,6 +293,12 @@ match fsi.CommandLineArgs |> Array.toList |> List.tail with
 | "run" :: r -> ConvergenceLoop.run (retries r)
 | "step" :: r -> ConvergenceLoop.step (retries r) None |> ignore
 | ["status"] -> ConvergenceLoop.status ()
+| "watch" :: r ->
+    let interval = r |> List.tryHead |> Option.map int |> Option.defaultValue 30
+    ConvergenceLoop.watch interval
 | _ ->
-    printfn "ralph-port  run [--retries=N] | step [--retries=N] | status"
-    printfn "Run from target project dir (needs project.json)."
+    printfn "ralph-port"
+    printfn "  run   [--retries=N]  Autonomous loop. Ctrl+C safe."
+    printfn "  step  [--retries=N]  One sprint."
+    printfn "  status               Current state + progress chart."
+    printfn "  watch [seconds]      Live dashboard (default: 30s refresh)."

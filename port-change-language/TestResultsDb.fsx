@@ -226,4 +226,33 @@ module TestResultsDb =
         if File.Exists current then
             let archive = sprintDbPath key sprintNum
             File.Copy(current, archive, true)
+
+    /// Read pass rates from all archived sprint DBs. Returns (sprintNum, passing, total) list.
+    let trendData (key: string) : (int * int * int) list =
+        let dir = runtimeDir key
+        if not (Directory.Exists dir) then []
+        else
+            Directory.GetFiles(dir, "sprint_*.db")
+            |> Array.sort
+            |> Array.choose (fun f ->
+                try
+                    let name = Path.GetFileNameWithoutExtension f
+                    let num = int (name.Replace("sprint_", ""))
+                    let conn = initSchema f
+                    let (p, t) = passRate conn
+                    conn.Close()
+                    Some (num, p, t)
+                with _ -> None)
+            |> Array.toList
+
+    /// Render an ASCII progress chart from trend data.
+    let renderChart (data: (int * int * int) list) (width: int) : string =
+        if data.IsEmpty then "(no sprint data yet)"
+        else
+            let lines = data |> List.map (fun (s, p, t) ->
+                let pct = if t > 0 then float p / float t * 100.0 else 0.0
+                let bars = int (pct / 100.0 * float width)
+                let bar = String.replicate bars "█" + String.replicate (width - bars) "░"
+                sprintf "S%3d %s %5.1f%% (%d/%d)" s bar pct p t)
+            String.concat "\n" lines
         // Don't delete current — it becomes the baseline for next sprint
