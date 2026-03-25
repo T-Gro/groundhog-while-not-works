@@ -347,8 +347,21 @@ To see what changed this sprint:
 Output exactly one of VERIFY_PASSED or VERIFY_FAILED on its own line at the end.
 """
 
+    /// Parse verifier output. If ambiguous (both or neither signal), disambiguate via session resume.
+    let private parseVerdict (output: string) (sessionId: string) (name: string) : bool * string =
+        let hasPassed = output.Contains("VERIFY_PASSED")
+        let hasFailed = output.Contains("VERIFY_FAILED")
+        if hasPassed && not hasFailed then (true, output)
+        elif hasFailed && not hasPassed then (false, output)
+        else
+            // Ambiguous — resume session and force a clear answer
+            let clarification = Agent.resume sessionId
+                                    "Your response was ambiguous — it contained both VERIFY_PASSED and VERIFY_FAILED, or neither. Based on your full analysis, output EXACTLY one of these on its own line, nothing else:\nVERIFY_PASSED\nVERIFY_FAILED"
+                                    $"Disambiguate-{name}"
+            let p = clarification.Contains("VERIFY_PASSED") && not (clarification.Contains("VERIFY_FAILED"))
+            (p, output + "\n[disambiguated→" + (if p then "PASS" else "FAIL") + "]")
+
     /// Run a verifier agent. Returns (passed, feedback, sessionId).
-    /// The sessionId is kept so the verifier can be RESUMED after implementor fixes.
     let runVerifier (config: ProjectConfig) (verifierName: string) : bool * string * string =
         let filledPreamble = preamble.Replace("{targetDir}", config.TargetDir)
         let prompt = String.concat "\n\n" [
@@ -356,15 +369,15 @@ Output exactly one of VERIFY_PASSED or VERIFY_FAILED on its own line at the end.
             getPrompt verifierName
         ]
         let (output, sessionId) = Agent.run prompt $"Verify-{verifierName}" None
-        let passed = output.Contains("VERIFY_PASSED") && not (output.Contains("VERIFY_FAILED"))
-        (passed, output, sessionId)
+        let (passed, fullOutput) = parseVerdict output sessionId verifierName
+        (passed, fullOutput, sessionId)
 
     /// Resume a verifier to re-check after implementor fixed issues.
     let resumeVerifier (sessionId: string) (verifierName: string) : bool * string =
         let feedback = "The implementor has addressed your feedback and committed fixes. Re-review the latest state. Output VERIFY_PASSED or VERIFY_FAILED."
         let output = Agent.resume sessionId feedback $"Re-verify-{verifierName}"
-        let passed = output.Contains("VERIFY_PASSED") && not (output.Contains("VERIFY_FAILED"))
-        (passed, output)
+        let (passed, fullOutput) = parseVerdict output sessionId verifierName
+        (passed, fullOutput)
 
 // ═════════════════════════════════════════════════════════════════════════════
 // Post-Sprint Knowledge Refinement
