@@ -1,0 +1,75 @@
+Starting server with Config HP="127.0.0.1:64387"|T="28800000"|R="false"|L="info"
+time="2026-03-25T10:32:55+01:00" level=info msg="Creating root@localhost superuser"
+time="2026-03-25T10:32:55+01:00" level=info msg="Server ready. Accepting connections."
+time="2026-03-25T10:32:55+01:00" level=warning msg="secure_file_priv is set to \"\", which is insecure."
+time="2026-03-25T10:32:55+01:00" level=warning msg="Any user with GRANT FILE privileges will be able to read any file which the sql-server process can read."
+time="2026-03-25T10:32:55+01:00" level=warning msg="Please consider restarting the server with secure_file_priv set to a safe (or non-existent) directory."
+time="2026-03-25T10:32:55+01:00" level=info msg=NewConnection DisableClientMultiStatements=false connectionID=1
+time="2026-03-25T10:32:55+01:00" level=info msg=NewConnection DisableClientMultiStatements=false connectionID=2
+time="2026-03-25T10:32:55+01:00" level=error msg="Cannot send HandshakeV10 packet: write tcp 127.0.0.1:64387->127.0.0.1:64391: wsasend: An established connection was aborted by the software in your host machine.\nWrite(packet) failed\nconn 1"
+time="2026-03-25T10:32:55+01:00" level=error msg="Cannot send HandshakeV10 packet: write tcp 127.0.0.1:64387->127.0.0.1:64392: wsasend: An established connection was aborted by the software in your host machine.\nWrite(packet) failed\nconn 2"
+time="2026-03-25T10:32:55+01:00" level=info msg=ConnectionClosed connectionID=1
+time="2026-03-25T10:32:55+01:00" level=info msg=ConnectionClosed connectionID=2
+time="2026-03-25T10:32:55+01:00" level=info msg=NewConnection DisableClientMultiStatements=false connectionID=3
+time="2026-03-25T10:32:55+01:00" level=info msg=NewConnection DisableClientMultiStatements=false connectionID=4
+time="2026-03-25T10:32:55+01:00" level=info msg=ConnectionClosed connectionID=3
+time="2026-03-25T10:32:55+01:00" level=warning msg="error running query" connectTime="2026-03-25 10:32:55.4100309 +0100 CET m=+0.206471201" connectionDb=pyright_porting connectionID=4 error="table not found: config" queryTime="2026-03-25 10:32:55.410934 +0100 CET m=+0.207374301"
+time="2026-03-25T10:32:55+01:00" level=warning msg="error running query" connectTime="2026-03-25 10:32:55.4100309 +0100 CET m=+0.206471201" connectionDb=pyright_porting connectionID=4 error="table not found: config" queryTime="2026-03-25 10:32:55.4127215 +0100 CET m=+0.209161801"
+time="2026-03-25T10:32:55+01:00" level=info msg=NewConnection DisableClientMultiStatements=false connectionID=5
+time="2026-03-25T10:32:55+01:00" level=warning msg="error running query" connectTime="2026-03-25 10:32:55.4136591 +0100 CET m=+0.210099401" connectionDb=pyright_porting connectionID=5 error="Duplicate key name 'idx_issues_issue_type'" queryTime="2026-03-25 10:32:55.4575461 +0100 CET m=+0.253986401"
+time="2026-03-25T10:32:55+01:00" level=warning msg="error running query" connectTime="2026-03-25 10:32:55.4136591 +0100 CET m=+0.210099401" connectionDb=pyright_porting connectionID=5 error="foreign key `fk_dep_depends_on` was not found on the table `dependencies`" queryTime="2026-03-25 10:32:55.4584335 +0100 CET m=+0.254873801"
+time="2026-03-25T10:32:55+01:00" level=info msg=NewConnection DisableClientMultiStatements=false connectionID=6
+time="2026-03-25T10:32:55+01:00" level=info msg=ConnectionClosed connectionID=6
+time="2026-03-25T10:32:56+01:00" level=info msg=NewConnection DisableClientMultiStatements=false connectionID=7
+time="2026-03-25T10:32:56+01:00" level=info msg=ConnectionClosed connectionID=7
+time="2026-03-25T10:33:25+01:00" level=info msg=ConnectionClosed connectionID=5
+time="2026-03-25T10:33:25+01:00" level=info msg=ConnectionClosed connectionID=4
+time="2026-03-25T10:33:26+01:00" level=info msg=NewConnection DisableClientMultiStatements=false connectionID=8
+time="2026-03-25T10:33:26+01:00" level=error msg="Cannot send HandshakeV10 packet: write tcp 127.0.0.1:64387->127.0.0.1:64487: wsasend: An established connection was aborted by the software in your host machine.\nWrite(packet) failed\nconn 8"
+time="2026-03-25T10:33:26+01:00" level=info msg=ConnectionClosed connectionID=8
+time="2026-03-25T10:33:26+01:00" level=info msg=NewConnection DisableClientMultiStatements=false connectionID=9
+time="2026-03-25T10:33:26+01:00" level=info msg=NewConnection DisableClientMultiStatements=false connectionID=10
+time="2026-03-25T10:33:26+01:00" level=info msg=ConnectionClosed connectionID=9
+time="2026-03-25T10:33:26+01:00" level=info msg=ConnectionClosed connectionID=10
+time="2026-03-25T10:33:26+01:00" level=info msg=NewConnection DisableClientMultiStatements=false connectionID=11
+time="2026-03-25T10:33:26+01:00" level=error msg="Cannot send HandshakeV10 packet: write tcp 127.0.0.1:64387->127.0.0.1:64490: wsasend: An established connection was aborted by the software in your host machine.\nWrite(packet) failed\nconn 11"
+time="2026-03-25T10:33:26+01:00" level=info msg=ConnectionClosed connectionID=11
+time="2026-03-25T10:33:26+01:00" level=info msg=NewConnection DisableClientMultiStatements=false connectionID=12
+time="2026-03-25T10:33:26+01:00" level=info msg=NewConnection DisableClientMultiStatements=false connectionID=13
+time="2026-03-25T10:33:26+01:00" level=info msg=ConnectionClosed connectionID=12
+time="2026-03-25T10:33:26+01:00" level=info msg=ConnectionClosed connectionID=13
+time="2026-03-25T10:33:26+01:00" level=info msg=NewConnection DisableClientMultiStatements=false connectionID=14
+time="2026-03-25T10:33:26+01:00" level=error msg="Cannot send HandshakeV10 packet: write tcp 127.0.0.1:64387->127.0.0.1:64493: wsasend: An established connection was aborted by the software in your host machine.\nWrite(packet) failed\nconn 14"
+time="2026-03-25T10:33:26+01:00" level=info msg=ConnectionClosed connectionID=14
+time="2026-03-25T10:33:26+01:00" level=info msg=NewConnection DisableClientMultiStatements=false connectionID=15
+time="2026-03-25T10:33:26+01:00" level=info msg=NewConnection DisableClientMultiStatements=false connectionID=16
+time="2026-03-25T10:33:26+01:00" level=info msg=ConnectionClosed connectionID=15
+time="2026-03-25T10:33:26+01:00" level=info msg=ConnectionClosed connectionID=16
+time="2026-03-25T10:33:26+01:00" level=info msg=NewConnection DisableClientMultiStatements=false connectionID=17
+time="2026-03-25T10:33:26+01:00" level=info msg=ConnectionClosed connectionID=17
+time="2026-03-25T10:33:26+01:00" level=info msg=NewConnection DisableClientMultiStatements=false connectionID=18
+time="2026-03-25T10:33:26+01:00" level=info msg=ConnectionClosed connectionID=18
+time="2026-03-25T10:34:27+01:00" level=info msg=NewConnection DisableClientMultiStatements=false connectionID=19
+time="2026-03-25T10:34:27+01:00" level=error msg="Cannot send HandshakeV10 packet: write tcp 127.0.0.1:64387->127.0.0.1:62235: wsasend: An established connection was aborted by the software in your host machine.\nWrite(packet) failed\nconn 19"
+time="2026-03-25T10:34:27+01:00" level=info msg=ConnectionClosed connectionID=19
+time="2026-03-25T10:34:27+01:00" level=info msg=NewConnection DisableClientMultiStatements=false connectionID=20
+time="2026-03-25T10:34:27+01:00" level=info msg=NewConnection DisableClientMultiStatements=false connectionID=21
+time="2026-03-25T10:34:27+01:00" level=info msg=ConnectionClosed connectionID=20
+time="2026-03-25T10:34:27+01:00" level=warning msg="error running query" connectTime="2026-03-25 10:34:27.5148838 +0100 CET m=+92.311314901" connectionDb=pyright_porting connectionID=21 error="nothing to commit" queryTime="2026-03-25 10:34:27.5221938 +0100 CET m=+92.318624901"
+time="2026-03-25T10:34:28+01:00" level=info msg=NewConnection DisableClientMultiStatements=false connectionID=22
+time="2026-03-25T10:34:28+01:00" level=info msg=ConnectionClosed connectionID=22
+time="2026-03-25T10:34:28+01:00" level=info msg=NewConnection DisableClientMultiStatements=false connectionID=23
+time="2026-03-25T10:34:28+01:00" level=info msg=ConnectionClosed connectionID=23
+time="2026-03-25T10:34:28+01:00" level=info msg=ConnectionClosed connectionID=21
+time="2026-03-25T10:42:17+01:00" level=info msg=NewConnection DisableClientMultiStatements=false connectionID=24
+time="2026-03-25T10:42:17+01:00" level=error msg="Cannot send HandshakeV10 packet: write tcp 127.0.0.1:64387->127.0.0.1:57139: wsasend: An established connection was aborted by the software in your host machine.\nWrite(packet) failed\nconn 24"
+time="2026-03-25T10:42:17+01:00" level=info msg=ConnectionClosed connectionID=24
+time="2026-03-25T10:42:17+01:00" level=info msg=NewConnection DisableClientMultiStatements=false connectionID=25
+time="2026-03-25T10:42:17+01:00" level=info msg=NewConnection DisableClientMultiStatements=false connectionID=26
+time="2026-03-25T10:42:17+01:00" level=info msg=ConnectionClosed connectionID=25
+time="2026-03-25T10:42:17+01:00" level=warning msg="error running query" connectTime="2026-03-25 10:42:17.3334752 +0100 CET m=+562.129859301" connectionDb=pyright_porting connectionID=26 error="nothing to commit" queryTime="2026-03-25 10:42:17.3416759 +0100 CET m=+562.138060001"
+time="2026-03-25T10:42:18+01:00" level=info msg=NewConnection DisableClientMultiStatements=false connectionID=27
+time="2026-03-25T10:42:18+01:00" level=info msg=ConnectionClosed connectionID=27
+time="2026-03-25T10:42:18+01:00" level=info msg=NewConnection DisableClientMultiStatements=false connectionID=28
+time="2026-03-25T10:42:18+01:00" level=info msg=ConnectionClosed connectionID=28
+time="2026-03-25T10:42:18+01:00" level=info msg=ConnectionClosed connectionID=26

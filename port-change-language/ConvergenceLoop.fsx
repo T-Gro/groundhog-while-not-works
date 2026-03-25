@@ -76,20 +76,8 @@ module Beads =
 // Toolchain — run build/test commands from project.json
 // ═════════════════════════════════════════════════════════════════════════════
 
-module Toolchain =
-    let runCmd (workDir: string) (command: string) : bool * string =
-        try
-            let parts = command.Split([|' '|], 2)
-            let result =
-                cli { Exec parts.[0]; Arguments (if parts.Length > 1 then parts.[1].Split(' ') else [||]); WorkingDirectory workDir }
-                |> Command.execute
-            let out = (result.Text |> Option.defaultValue "") + "\n" + (result.Error |> Option.defaultValue "")
-            (result.ExitCode = 0, out.Trim())
-        with ex -> (false, ex.Message)
-
-    let build (c: ProjectConfig) = runCmd c.TargetDir c.BuildCommand
-    let lint  (c: ProjectConfig) = runCmd c.TargetDir c.LintCommand
-    let test  (c: ProjectConfig) = runCmd c.TargetDir c.TestCommand
+// Toolchain module removed — build/test/regression checking is done by
+// LLM verifiers reading project instructions, not hardcoded commands.
 
 // ═════════════════════════════════════════════════════════════════════════════
 // ADR / Skills / Learnings — shared knowledge channels
@@ -502,81 +490,51 @@ module ConvergenceLoop =
             let mutable passed = false
             let mutable lastFail = ""
 
+            // Run ALL verifiers in PARALLEL (they are read-only)
+            // This includes build/test/regression — handled by LLM verifier, not hardcoded.
             while retries < maxRetries && not passed do
-                let (buildOk, buildOut) = Toolchain.build config
-                if not buildOk then
-                    let fb = $"BUILD FAILED:\n{truncOut buildOut 3000}"
-                    lastFail <- fb; Beads.note beadId "Build fail"
-                    Agent.resume sid fb $"Fix-S{nextSprint}" |> ignore
-                    retries <- retries + 1
+                let verifiers = Verifiers.listAll ()
+                let verifierResults =
+                    verifiers
+                    |> List.map (fun v -> async {
+                        printfn $"  {v}..."
+                        let (vp, vo, vsid) = Verifiers.runVerifier config v
+                        let verdict = if vp then "PASS" else "FAIL"
+                        Beads.note beadId $"{v}: {verdict}"
+                        return (v, vp, vo, vsid)
+                    })
+                    |> Async.Parallel
+                    |> Async.RunSynchronously
+                    |> Array.toList
+
+                let failures = verifierResults |> List.filter (fun (_, vp, _, _) -> not vp)
+                if failures.IsEmpty then
+                    for (v, _, _, _) in verifierResults do printfn $"  OK {v}"
+                    passed <- true
                 else
-                    let (_, testOut) = Toolchain.test config
-                    let nc = initSchema dbPath in let (np,nt) = passRate nc in nc.Close()
-                    printfn $"  Build OK | {np}/{nt}"
-
-                    if nt < prevTotal then
-                        let fb = $"REGRESSION: count {prevTotal}->{nt}. Tests deleted."
-                        lastFail <- fb; Beads.note beadId fb
-                        Agent.resume sid fb $"Fix-S{nextSprint}" |> ignore; retries <- retries+1
-                    elif np < prevPassing then
-                        let fb = $"REGRESSION: passing {prevPassing}->{np}.\n{truncOut testOut 2000}"
-                        lastFail <- fb; Beads.note beadId $"Regressed {prevPassing}->{np}"
-                        Agent.resume sid fb $"Fix-S{nextSprint}" |> ignore; retries <- retries+1
-                    elif np = prevPassing then
-                        let fb = $"NO IMPROVEMENT: {np}/{nt}. Try different approach.\n{truncOut testOut 2000}"
-                        lastFail <- fb; Beads.note beadId "No improvement"
-                        Agent.resume sid fb $"Retry-S{nextSprint}" |> ignore; retries <- retries+1
-                    else
-                        printfn $"  +{np-prevPassing} ({prevPassing}->{np})"
-                        let verifiers = Verifiers.listAll ()
-
-                        // Run ALL verifiers in PARALLEL (they are read-only, no file writes)
-                        let verifierResults =
-                            verifiers
-                            |> List.map (fun v -> async {
-                                printfn $"  {v}..."
-                                let (vp, vo, vsid) = Verifiers.runVerifier config v
-                                let verdict = if vp then "PASS" else "FAIL"
-                                Beads.note beadId $"{v}: {verdict}"
-                                return (v, vp, vo, vsid)
-                            })
-                            |> Async.Parallel
-                            |> Async.RunSynchronously
-                            |> Array.toList
-
-                        let failures = verifierResults |> List.filter (fun (_, vp, _, _) -> not vp)
-                        if failures.IsEmpty then
-                            for (v, _, _, _) in verifierResults do printfn $"  OK {v}"
-                            passed <- true
-                        else
-                            // Collect ALL failure feedback, prefixed by verifier name
-                            let combinedFeedback =
-                                failures
-                                |> List.map (fun (v, _, vo, _) ->
-                                    printfn $"  FAIL {v}"
-                                    $"=== {v} ===\n{truncOut vo 2000}")
-                                |> String.concat "\n\n"
-                            lastFail <- combinedFeedback
-                            // Send combined feedback to implementor in one resume
-                            Agent.resume sid combinedFeedback $"Fix-verifiers-S{nextSprint}" |> ignore
-                            // Re-check ALL failed verifiers (in parallel again)
-                            let recheckResults =
-                                failures
-                                |> List.map (fun (v, _, _, vsid) -> async {
-                                    let (re, _) = Verifiers.resumeVerifier vsid v
-                                    return (v, re)
-                                })
-                                |> Async.Parallel
-                                |> Async.RunSynchronously
-                            let stillFailing = recheckResults |> Array.filter (fun (_, re) -> not re)
-                            for (v, re) in recheckResults do
-                                let s = if re then "OK" else "FAIL"
-                                printfn $"  {s} {v} (recheck)"
-                            if stillFailing.Length > 0 then
-                                lastFail <- stillFailing |> Array.map fst |> String.concat ", " |> sprintf "Still failing: %s"
-                            else
-                                passed <- true
-                            retries <- retries + 1
+                    let combinedFeedback =
+                        failures
+                        |> List.map (fun (v, _, vo, _) ->
+                            printfn $"  FAIL {v}"
+                            $"=== {v} ===\n{truncOut vo 2000}")
+                        |> String.concat "\n\n"
+                    lastFail <- combinedFeedback
+                    Agent.resume sid combinedFeedback $"Fix-S{nextSprint}" |> ignore
+                    // Re-check failed verifiers in parallel
+                    let recheckResults =
+                        failures
+                        |> List.map (fun (v, _, _, vsid) -> async {
+                            let (re, _) = Verifiers.resumeVerifier vsid v
+                            return (v, re)
+                        })
+                        |> Async.Parallel
+                        |> Async.RunSynchronously
+                    let stillFailing = recheckResults |> Array.filter (fun (_, re) -> not re)
+                    for (v, re) in recheckResults do
+                        let s = if re then "OK" else "FAIL"
+                        printfn $"  {s} {v} (recheck)"
+                    if stillFailing.Length = 0 then passed <- true
+                    retries <- retries + 1
 
             let fc = initSchema dbPath
             let (fp,ft) = passRate fc in let delta = fp-prevPassing
