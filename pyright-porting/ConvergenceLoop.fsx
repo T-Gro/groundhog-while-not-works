@@ -434,316 +434,163 @@ module KnowledgeRefiner =
 // ═════════════════════════════════════════════════════════════════════════════
 
 module ConvergenceLoop =
-    let private planPath () = Path.Combine(__SOURCE_DIRECTORY__, "hints", "porting-plan.md")
 
-    /// Initialize a new porting project.
-    let init (sourceDir: string) (targetDir: string) (planFile: string option) =
-        printfn $"Initializing porting project: {sourceDir} → {targetDir}"
-
-        if not (Directory.Exists sourceDir) then eprintfn $"Source not found: {sourceDir}"; exit 1
-        if not (Directory.Exists targetDir) then Directory.CreateDirectory targetDir |> ignore
-
-        let config = createDefault sourceDir targetDir
-        save config
-
-        // Create hint placeholders
-        let hintsDir = Path.Combine(__SOURCE_DIRECTORY__, "hints")
-        Directory.CreateDirectory hintsDir |> ignore
-        for (name, content) in [
-            "architecture.md", "# Source Architecture\n\n> Describe source codebase structure for subagents."
-            "layer-boundaries.md", "# Layer Boundary Contracts\n\n> Interface contracts between layers."
-            "type-patterns.md", "# Translation Patterns\n\n> How source patterns map to target idioms." ] do
-            let p = Path.Combine(hintsDir, name)
-            if not (File.Exists p) then File.WriteAllText(p, content)
-
-        // Copy plan if provided
-        match planFile with
-        | Some pf when File.Exists pf ->
-            File.Copy(pf, planPath(), true)
-            printfn $"  Seeded plan from {pf}"
-        | Some pf -> eprintfn $"  Plan file not found: {pf}"
-        | None -> printfn "  No plan. Add one at hints/porting-plan.md or re-run with --plan"
-
-        // Create knowledge dirs in target
-        Knowledge.ensureDirs config
-
-        // Init test results DB
-        let conn = initSchema (currentDbPath())
-        initSprint conn 0 "" 0 0
-        conn.Close()
-
-        // Create beads structure
-        let epicId = Beads.create $"Port {Path.GetFileName sourceDir}" "Test-driven convergence porting." "epic" 0
-        Beads.create "Configure project.json" "Fill in build/test commands, languages, layers, sample dirs." "task" 0 |> ignore
-        Beads.create "Generate hints" "Analyze source, create architecture.md, layer-boundaries.md, type-patterns.md." "task" 0 |> ignore
-        Beads.create "Generate golden oracle" "Run original tool on all samples, save expected outputs." "task" 0 |> ignore
-
-        printfn $"\n  Created project.json, test DB, beads epic ({epicId})"
-        printfn "  Next: fill in project.json, generate hints, then run 'step'"
-
-    /// Execute one convergence step.
-    ///
-    /// Flow:
-    ///   1. Read test DB → find top failing buckets (with fuzziness — agent can pick)
-    ///   2. Build dynamic brief → run implementor (fresh session)
-    ///   3. Re-run tests → update DB → check for regression (HARD GATE)
-    ///   4. Run ALL verifiers from verifiers/ folder (dynamic) → if fail, resume implementor
-    ///   5. Sprint passes → archive DB, update beads, refine instructions, exit
-    let step (maxRetries: int) =
+    let private ensureInit () =
         let config = require()
-        printfn $"Project: {config.ProjectName} ({config.SourceLang} → {config.TargetLang})"
-
-        // 1. Read current test state
         let dbPath = currentDbPath()
         if not (File.Exists dbPath) then
-            eprintfn "No test results DB. Run oracle population first."
-            exit 1
+            let conn = initSchema dbPath
+            initSprint conn 0 "" 0 0
+            conn.Close()
+        Knowledge.ensureDirs config
+        config
 
+    let private truncOut (s: string) (max: int) =
+        if s.Length <= max then s
+        else let h = max/2 in s.[..h] + $"\n...({s.Length-max} omitted)...\n" + s.[(s.Length-h)..]
+
+    /// One sprint. Returns (improved, failureSummary).
+    /// Every agent output stored as beads note. Nothing dropped.
+    /// Failed sprint summary carries forward to next sprint.
+    let step (maxRetries: int) (previousFailure: string option) : bool * string =
+        let config = ensureInit ()
+        let dbPath = currentDbPath()
         let conn = initSchema dbPath
         let sprintNum = currentSprintNum conn
         let nextSprint = sprintNum + 1
         let (prevPassing, prevTotal) = passRate conn
-        let prevPct = if prevTotal > 0 then float prevPassing / float prevTotal * 100.0 else 0.0
+        printfn $"Sprint {nextSprint} | {prevPassing}/{prevTotal} ({if prevTotal>0 then float prevPassing/float prevTotal*100.0 else 0.0:F1}%%)"
 
-        printfn $"Sprint {nextSprint} | Current: {prevPassing}/{prevTotal} passing ({prevPct:F1}%%)"
-
-        // Find top buckets — provide alternatives for fuzziness (anti-stuckness)
         let ranked = bucketsRanked conn
         match ranked with
         | [] ->
-            printfn "✓ No failing buckets. All tests pass!"
             conn.Close()
-        | (targetBucket, layer, failing, bucketTotal) :: rest ->
-            let alternativeBuckets = rest |> List.truncate 4 |> List.map (fun (b, l, f, _) -> $"{b} ({l}, {f} failing)")
-            printfn $"Suggested target: '{targetBucket}' ({layer}) — {failing}/{bucketTotal} failing"
-            if alternativeBuckets.Length > 0 then
-                printfn $"  Alternatives: {alternativeBuckets |> String.concat ", "}"
-
-            let failures = failingInBucket conn targetBucket 30
-            let testBriefing = briefing conn
+            printfn "All tests pass!"
+            (true, "ALL_PASS")
+        | (bucket, layer, failing, bTotal) :: rest ->
+            let alts = rest |> List.truncate 4 |> List.map (fun (b,l,f,_) -> $"{b} ({l},{f})")
+            let failures = failingInBucket conn bucket 30
+            let brief = briefing conn
             conn.Close()
+            printfn $"  Target: {bucket} ({layer}) {failing}/{bTotal} failing"
 
-            // 2. Build dynamic brief & run implementor
-            // Constant brief = .github/copilot-instructions.md (implicit, always loaded by copilot)
-            // Dynamic brief = test DB summary + failures + plan + alternatives
-            let briefingText = BriefingPack.build config nextSprint targetBucket testBriefing failures prevTotal alternativeBuckets
-            let sprintBeadId = Beads.create $"Sprint {nextSprint}: {targetBucket}" $"Fix {failing} failures in '{targetBucket}'." "task" 1
-            Beads.claim sprintBeadId
-            Beads.note sprintBeadId $"Pre: {prevPassing}/{prevTotal} ({prevPct:F1}%%)"
+            let mutable prompt = BriefingPack.build config nextSprint bucket brief failures prevTotal alts
+            match previousFailure with
+            | Some ctx ->
+                prompt <- prompt + "\n\n<previous_failure>\nPrevious sprint FAILED. Do NOT repeat:\n" + (truncOut ctx 3000) + "\n</previous_failure>"
+            | None -> ()
 
-            // Record sprint in DB
-            let sprintConn = initSchema dbPath
-            initSprint sprintConn nextSprint targetBucket prevPassing prevTotal
-            sprintConn.Close()
+            let beadId = Beads.create $"Sprint {nextSprint}: {bucket}" $"{failing} failures" "task" 1
+            Beads.claim beadId
+            Beads.note beadId $"Pre: {prevPassing}/{prevTotal}"
+            let sc = initSchema dbPath in initSprint sc nextSprint bucket prevPassing prevTotal; sc.Close()
 
-            printfn $"Running implementor (briefing: {briefingText.Length / 4} est. tokens)..."
-            let (implOutput, sessionId) = Agent.run briefingText $"Impl-S{nextSprint}" None
-            printfn $"Implementor done ({implOutput.Length} chars output)"
+            printfn $"  Implementor ({prompt.Length/4} tokens)..."
+            let (implOut, sid) = Agent.run prompt $"Impl-S{nextSprint}" None
+            Beads.note beadId $"Impl: {truncOut implOut 500}"
 
-            // 3-6. Verify loop (with retries via session resume)
-            let mutable retryCount = 0
-            let mutable allPassed = false
+            let mutable retries = 0
+            let mutable passed = false
+            let mutable lastFail = ""
 
-            while retryCount < maxRetries && not allPassed do
-                // 3. Re-run tests, update DB
-                printfn $"\nRecalculating stats (attempt {retryCount + 1})..."
+            while retries < maxRetries && not passed do
                 let (buildOk, buildOut) = Toolchain.build config
                 if not buildOk then
-                    printfn $"❌ Build failed. Resuming implementor with errors..."
-                    let feedback = $"BUILD FAILED. Fix these errors:\n{buildOut |> fun s -> if s.Length > 3000 then s.[..2999] else s}"
-                    Agent.resume sessionId feedback $"Fix-build-S{nextSprint}" |> ignore
-                    retryCount <- retryCount + 1
+                    let fb = $"BUILD FAILED:\n{truncOut buildOut 3000}"
+                    lastFail <- fb; Beads.note beadId "Build fail"
+                    Agent.resume sid fb $"Fix-S{nextSprint}" |> ignore
+                    retries <- retries + 1
                 else
-                    let (testOk, testOut) = Toolchain.test config
-                    // TODO: parse test output, update test DB
-                    printfn $"  Build: ✅ | Tests: {if testOk then "✅" else "❌"}"
+                    let (_, testOut) = Toolchain.test config
+                    let nc = initSchema dbPath in let (np,nt) = passRate nc in nc.Close()
+                    printfn $"  Build OK | {np}/{nt}"
 
-                    // Regression check
-                    let newConn = initSchema dbPath
-                    let (newPassing, newTotal) = passRate newConn
-                    newConn.Close()
-
-                    if newTotal < prevTotal then
-                        printfn $"❌ REGRESSION: test count dropped {prevTotal}→{newTotal}. Reverting."
-                        let feedback = $"REGRESSION DETECTED: Total tests dropped from {prevTotal} to {newTotal}. You deleted tests. Revert and fix properly."
-                        Agent.resume sessionId feedback $"Fix-regression-S{nextSprint}" |> ignore
-                        retryCount <- retryCount + 1
-                    elif newPassing < prevPassing then
-                        printfn $"❌ REGRESSION: passing dropped {prevPassing}→{newPassing}."
-                        let feedback = $"REGRESSION: Passing tests dropped from {prevPassing} to {newPassing}. Fix without breaking what worked."
-                        Agent.resume sessionId feedback $"Fix-regression-S{nextSprint}" |> ignore
-                        retryCount <- retryCount + 1
+                    if nt < prevTotal then
+                        let fb = $"REGRESSION: count {prevTotal}->{nt}. Tests deleted."
+                        lastFail <- fb; Beads.note beadId fb
+                        Agent.resume sid fb $"Fix-S{nextSprint}" |> ignore; retries <- retries+1
+                    elif np < prevPassing then
+                        let fb = $"REGRESSION: passing {prevPassing}->{np}.\n{truncOut testOut 2000}"
+                        lastFail <- fb; Beads.note beadId $"Regressed {prevPassing}->{np}"
+                        Agent.resume sid fb $"Fix-S{nextSprint}" |> ignore; retries <- retries+1
+                    elif np = prevPassing then
+                        let fb = $"NO IMPROVEMENT: {np}/{nt}. Try different approach.\n{truncOut testOut 2000}"
+                        lastFail <- fb; Beads.note beadId "No improvement"
+                        Agent.resume sid fb $"Retry-S{nextSprint}" |> ignore; retries <- retries+1
                     else
-                        // 4. Run ALL soft verifiers from verifiers/ folder
-                        // Flow: verifier fails → resume impl with feedback → impl fixes → resume SAME verifier
-                        let softVerifiers = Verifiers.listSoftVerifiers ()
-                        let mutable verifiersPassed = true
-
-                        for vName in softVerifiers do
-                            if verifiersPassed && retryCount < maxRetries then
-                                printfn $"  Running {vName}..."
-                                let (passed, feedback, verifierSessionId) = Verifiers.runVerifier config vName
-                                if passed then
-                                    printfn $"  ✅ {vName}"
+                        printfn $"  +{np-prevPassing} ({prevPassing}->{np})"
+                        let verifiers = Verifiers.listSoftVerifiers ()
+                        let mutable vOk = true
+                        for v in verifiers do
+                            if vOk && retries < maxRetries then
+                                printfn $"  {v}..."
+                                let (vp, vo, vsid) = Verifiers.runVerifier config v
+                                Beads.note beadId $"{v}: {if vp then "PASS" else "FAIL"}"
+                                if vp then printfn $"  OK {v}"
                                 else
-                                    printfn $"  ❌ {vName} — resuming implementor with feedback"
-                                    let truncFeedback = if feedback.Length > 4000 then feedback.[..3999] else feedback
-                                    // Implementor fixes based on verifier feedback
-                                    Agent.resume sessionId truncFeedback $"Fix-{vName}-S{nextSprint}" |> ignore
-                                    // Resume the SAME verifier to re-check
-                                    let (recheck, _) = Verifiers.resumeVerifier verifierSessionId vName
-                                    if recheck then
-                                        printfn $"  ✅ {vName} (after fix)"
-                                    else
-                                        printfn $"  ❌ {vName} still failing after fix"
-                                        verifiersPassed <- false
-                                    retryCount <- retryCount + 1
+                                    lastFail <- truncOut vo 4000
+                                    Agent.resume sid lastFail $"Fix-{v}-S{nextSprint}" |> ignore
+                                    let (re,_) = Verifiers.resumeVerifier vsid v
+                                    if re then printfn $"  OK {v} (fixed)"
+                                    else printfn $"  FAIL {v}"; vOk <- false
+                                    retries <- retries+1
+                        if vOk then passed <- true
 
-                        if verifiersPassed then
-                            allPassed <- true
+            let fc = initSchema dbPath
+            let (fp,ft) = passRate fc in let delta = fp-prevPassing
+            finalizeSprint fc fp ft; fc.Close(); archiveAndReset nextSprint
 
-            // Finalize
-            let finalConn = initSchema dbPath
-            let (finalPassing, finalTotal) = passRate finalConn
-            let finalPct = if finalTotal > 0 then float finalPassing / float finalTotal * 100.0 else 0.0
-            let delta = finalPassing - prevPassing
-            finalizeSprint finalConn finalPassing finalTotal
-            finalConn.Close()
-
-            archiveAndReset nextSprint
-
-            let resultMsg = $"Post: {finalPassing}/{finalTotal} ({finalPct:F1}%%), Δ={delta:+#;-#;0}, retries={retryCount}"
-            Beads.note sprintBeadId resultMsg
-            if allPassed then
-                Beads.close sprintBeadId $"Done. {resultMsg}"
-                printfn $"✅ Sprint {nextSprint} complete. {resultMsg}"
-
-                // 5. Post-sprint: capture learnings (only on success)
-                printfn "  Running knowledge refinement..."
+            let msg = $"{fp}/{ft} ({if ft>0 then float fp/float ft*100.0 else 0.0:F1}%%) d={delta:+#;-#;0}"
+            Beads.note beadId msg
+            if passed && delta > 0 then
+                Beads.close beadId msg; printfn $"  Done: {msg}"
                 KnowledgeRefiner.refine config nextSprint
+                (true, msg)
             else
-                Beads.note sprintBeadId "Max retries reached"
-                printfn $"⚠ Sprint {nextSprint} finished with retries exhausted. {resultMsg}"
+                Beads.note beadId $"Failed: {truncOut lastFail 500}"
+                printfn $"  Failed: {msg}"
+                (false, lastFail)
 
-            Beads.remember $"Sprint {nextSprint} ({targetBucket}): {resultMsg}"
-
-    /// Continuous run — loop sprints until all tests pass or stopped.
-    /// Designed for week-long autonomous runs. Anti-rot mechanisms:
-    ///   - Each sprint is a fresh copilot session (no context accumulation)
-    ///   - Knowledge captured via skills/ADRs (persistent, not session-bound)
-    ///   - Test DB is the source of truth (not agent memory)
-    ///   - Plateau detection: if N sprints with no improvement, pause
-    ///   - Beads tracks everything for crash recovery
-    let run (maxRetries: int) (plateauThreshold: int) =
-        let config = require()
-        printfn $"═══ CONTINUOUS RUN: {config.ProjectName} ({config.SourceLang} → {config.TargetLang}) ═══"
-        printfn $"  Plateau threshold: {plateauThreshold} sprints without improvement → pause"
-        printfn $"  Retries per sprint: {maxRetries}"
-        printfn $"  Press Ctrl+C to stop (safe — state is in beads + DB)"
-        printfn ""
+    /// Continuous autonomous run. Self-healing: failure feeds forward.
+    let run (maxRetries: int) =
+        let config = ensureInit ()
+        printfn $"=== {config.ProjectName}: {config.SourceLang} -> {config.TargetLang} ==="
+        printfn $"  Ctrl+C safe. Failures feed forward."
 
         let mutable running = true
-        let mutable consecutiveNoImprovement = 0
-
-        // Ctrl+C handler — graceful shutdown
-        Console.CancelKeyPress.Add(fun args ->
-            args.Cancel <- true
-            running <- false
-            printfn "\n⏸ Stopping after current sprint completes...")
+        let mutable prevFail: string option = None
+        Console.CancelKeyPress.Add(fun a -> a.Cancel <- true; running <- false; printfn "\nStopping...")
 
         while running do
-            let dbPath = currentDbPath()
-            let prePassing =
-                if File.Exists dbPath then
-                    let conn = initSchema dbPath
-                    let (p, _) = passRate conn
-                    conn.Close()
-                    p
-                else 0
+            let (ok, summary) = step maxRetries prevFail
+            if summary = "ALL_PASS" then printfn "\nDone."; running <- false
+            elif ok then prevFail <- None
+            else prevFail <- Some summary
+            if running then printfn "──────────────────────────────────────────"
 
-            // Run one sprint
-            step maxRetries
-
-            // Check improvement
-            let postPassing =
-                if File.Exists dbPath then
-                    let conn = initSchema dbPath
-                    let (p, t) = passRate conn
-                    let pct = if t > 0 then float p / float t * 100.0 else 0.0
-                    conn.Close()
-                    printfn $"\n  Progress: {p}/{t} ({pct:F1}%%)"
-                    p
-                else 0
-
-            if postPassing <= prePassing then
-                consecutiveNoImprovement <- consecutiveNoImprovement + 1
-                printfn $"  ⚠ No improvement ({consecutiveNoImprovement}/{plateauThreshold})"
-                if consecutiveNoImprovement >= plateauThreshold then
-                    printfn $"\n  🛑 PLATEAU: {plateauThreshold} sprints without improvement."
-                    printfn $"  Human review needed. Check: bd list --status=open"
-                    Beads.remember $"Plateau detected after {plateauThreshold} sprints with no improvement. Human review needed."
-                    running <- false
-            else
-                consecutiveNoImprovement <- 0
-
-            // Check if all tests pass
-            if File.Exists dbPath then
-                let conn = initSchema dbPath
-                let ranked = bucketsRanked conn
-                conn.Close()
-                if ranked.IsEmpty then
-                    printfn "\n  🎉 ALL TESTS PASSING. Porting complete."
-                    Beads.remember "All tests passing. Porting campaign complete."
-                    running <- false
-
-            if running then
-                printfn $"\n{'─' |> string |> String.replicate 60}"
-
-    /// Show current status.
     let showStatus () =
         match load() with
         | Some config ->
-            printfn $"╔══════════════════════════════════════════════════════╗"
-            printfn $"║  {config.ProjectName}: {config.SourceLang} → {config.TargetLang}"
-            let dbPath = currentDbPath()
-            if File.Exists dbPath then
-                let conn = initSchema dbPath
-                let brief = briefing conn
-                conn.Close()
-                printfn $"║  {brief}"
-            printfn $"╠══════════════════════════════════════════════════════╣"
+            printfn $"{config.ProjectName}: {config.SourceLang} -> {config.TargetLang}"
+            if File.Exists (currentDbPath()) then
+                let c = initSchema (currentDbPath()) in printfn $"{briefing c}"; c.Close()
             printfn $"{Beads.status()}"
-            let rdy = Beads.ready()
-            if not (String.IsNullOrWhiteSpace rdy) then printfn $"Ready:\n{rdy}"
-            printfn $"╚══════════════════════════════════════════════════════╝"
-        | None -> printfn "No project.json. Run init first."
+            let r = Beads.ready() in if r.Length > 0 then printfn $"Ready:\n{r}"
+        | None -> printfn "No project.json."
 
-// CLI entry point
+let parseRetries rest = rest |> List.tryFind (fun (s:string) -> s.StartsWith "--retries=") |> Option.map (fun s -> int(s.Split('=').[1])) |> Option.defaultValue 3
+
 match fsi.CommandLineArgs |> Array.toList |> List.tail with
-| "init" :: sourceDir :: targetDir :: rest ->
-    let planFile = match rest |> List.tryFindIndex ((=) "--plan") with Some i when i+1 < rest.Length -> Some rest.[i+1] | _ -> None
-    ConvergenceLoop.init sourceDir targetDir planFile
-| "init" :: _ ->
-    printfn "Usage: dotnet fsi ConvergenceLoop.fsx init <source-dir> <target-dir> [--plan <file.md>]"
-| "run" :: rest ->
-    let maxRetries = rest |> List.tryFind (fun s -> s.StartsWith("--retries=")) |> Option.map (fun s -> int (s.Split('=').[1])) |> Option.defaultValue 3
-    let plateau = rest |> List.tryFind (fun s -> s.StartsWith("--plateau=")) |> Option.map (fun s -> int (s.Split('=').[1])) |> Option.defaultValue 5
-    ConvergenceLoop.run maxRetries plateau
-| "step" :: rest ->
-    let maxRetries = rest |> List.tryFind (fun s -> s.StartsWith("--retries=")) |> Option.map (fun s -> int (s.Split('=').[1])) |> Option.defaultValue 3
-    ConvergenceLoop.step maxRetries
+| "run" :: rest -> ConvergenceLoop.run (parseRetries rest)
+| "step" :: rest -> ConvergenceLoop.step (parseRetries rest) None |> ignore
 | ["status"] -> ConvergenceLoop.showStatus ()
 | ["--help"] | ["-h"] | [] ->
-    printfn "ConvergenceLoop — Autonomous porting orchestrator"
+    printfn "ralph-port — Autonomous porting orchestrator"
     printfn ""
-    printfn "  init <src> <tgt> [--plan file.md]        Initialize project"
-    printfn "  run  [--retries=N] [--plateau=N]          Run continuously until done (default)"
-    printfn "  step [--retries=N]                        Run one sprint then exit"
-    printfn "  status                                    Show current progress"
+    printfn "  run  [--retries=N]   Run continuously. Self-healing. Ctrl+C safe."
+    printfn "  step [--retries=N]   One sprint then exit."
+    printfn "  status               Current progress."
     printfn ""
-    printfn "  run: loops sprints autonomously. Stops on: all tests pass, plateau, or Ctrl+C."
-    printfn "       --plateau=5 means stop after 5 sprints with no improvement."
-    printfn "       Safe to kill — state is in beads + SQLite. Restart with 'run' to continue."
-    printfn ""
-    printfn "  step: single sprint. Use for testing or manual control."
+    printfn "Run from target project dir (needs project.json)."
+    printfn "Failures feed forward to next sprint. No output dropped."
 | other -> printfn $"Unknown: {other |> String.concat " "}. Try --help"
