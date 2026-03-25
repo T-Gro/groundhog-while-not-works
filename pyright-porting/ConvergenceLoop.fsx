@@ -308,8 +308,7 @@ module Agent =
 module Verifiers =
     let private verifiersDir = Path.Combine(__SOURCE_DIRECTORY__, "verifiers")
 
-    /// Dynamically list all verifiers from the verifiers/ folder.
-    /// Users can add/remove/rephrase .md files freely — the loop picks them all up.
+    /// All .md files in verifiers/ are LLM reviewers. Add/remove freely.
     let listAll () : string list =
         if Directory.Exists verifiersDir then
             Directory.GetFiles(verifiersDir, "*.md")
@@ -317,11 +316,6 @@ module Verifiers =
             |> Array.sort
             |> Array.toList
         else []
-
-    /// List only the "soft" verifiers (V05+) — the ones that run as LLM reviews.
-    /// V01-V04 are handled as executable checks in the main loop.
-    let listSoftVerifiers () : string list =
-        listAll () |> List.filter (fun n -> not (n.StartsWith "V01") && not (n.StartsWith "V02") && not (n.StartsWith "V03") && not (n.StartsWith "V04"))
 
     let getPrompt (name: string) : string =
         let path = Path.Combine(verifiersDir, name + ".md")
@@ -534,7 +528,7 @@ module ConvergenceLoop =
                         Agent.resume sid fb $"Retry-S{nextSprint}" |> ignore; retries <- retries+1
                     else
                         printfn $"  +{np-prevPassing} ({prevPassing}->{np})"
-                        let verifiers = Verifiers.listSoftVerifiers ()
+                        let verifiers = Verifiers.listAll ()
 
                         // Run ALL verifiers in PARALLEL (they are read-only, no file writes)
                         let verifierResults =
