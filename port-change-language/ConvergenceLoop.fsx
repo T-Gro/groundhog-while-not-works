@@ -28,7 +28,8 @@ module Beads =
             let doltDir = @"Q:\.tools\dolt\dolt-windows-amd64\bin"
             if not (path.Contains(doltDir)) then
                 Environment.SetEnvironmentVariable("PATH", $"{doltDir};{path}")
-            let result = cli { Exec (bd()); Arguments (args |> Array.ofList); WorkingDirectory __SOURCE_DIRECTORY__ } |> Command.execute
+            Environment.SetEnvironmentVariable("BEADS_DIR", Path.Combine(__SOURCE_DIRECTORY__, ".beads"))
+            let result = cli { Exec (bd()); Arguments (args |> Array.ofList) } |> Command.execute
             result.Text |> Option.defaultValue ""
         with ex ->
             if not warned then eprintfn $"⚠ beads unavailable: {ex.Message}"; warned <- true
