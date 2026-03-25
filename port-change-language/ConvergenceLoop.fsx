@@ -219,8 +219,11 @@ module ConvergenceLoop =
                         $"Goal: assess overall quality of the FULL codebase in {targetDir()}."
                         "You are NOT reviewing a diff. You are reviewing the entire implementation."
                         $"Source reference: {config.SourceDir}"
-                        "Provide: concrete improvement suggestions, architectural concerns,"
-                        "module-level refactoring opportunities, code quality issues."
+                        "Focus on:"
+                        "- Simplify code, logical flow, and data flow"
+                        "- Detect missing abstractions or reuse potential"
+                        "- Module-level architectural concerns"
+                        "- Cross-cutting refactoring opportunities"
                         "Output a prioritized list of actionable improvements." ]
                     let (reviewOutput, _) = Agent.run reviewPrompt "review-expert" None
                     let reviewFeedback = trunc reviewOutput 4000
