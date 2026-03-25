@@ -59,7 +59,7 @@ module Verifiers =
         let p = Path.Combine(dir, name + ".md")
         if File.Exists p then File.ReadAllText p else ""
 
-    let private preamble = "You are a VERIFIER. Review code, do NOT change it. This is iterative — judge the delta, not perfection. Output VERIFY_PASSED or VERIFY_FAILED on its own line at the end. If FAILED, write specific actionable fix instructions."
+    let private preamble baseCommit = $"You are a VERIFIER. Review code, do NOT change it. This is iterative — judge the delta, not perfection.\nYour scope: unpushed commits since {baseCommit}. Run: git diff {baseCommit}..HEAD\nOutput VERIFY_PASSED or VERIFY_FAILED on its own line at the end. If FAILED, write specific actionable fix instructions."
 
     let private parseVerdict (output: string) sid name =
         let p = output.Contains "VERIFY_PASSED"
@@ -72,8 +72,8 @@ module Verifiers =
 
     let private title (name: string) = if name.Contains "EXPERT-REVIEW" then "review-expert" else $"Verify-{name}"
 
-    let runVerifier (name: string) : bool * string * string =
-        let prompt = if name.Contains "EXPERT-REVIEW" then getPrompt name else preamble + "\n\n" + getPrompt name
+    let runVerifier (name: string) (baseCommit: string) : bool * string * string =
+        let prompt = if name.Contains "EXPERT-REVIEW" then getPrompt name else (preamble baseCommit) + "\n\n" + getPrompt name
         let (out, sid) = Agent.run prompt (title name) None
         let (passed, fullOut) = parseVerdict out sid name
         (passed, fullOut, sid)
@@ -105,7 +105,9 @@ module ConvergenceLoop =
         let prevBlock = match prevFailure with Some ctx -> $"\n<previous_failure>\n{trunc ctx 3000}\n</previous_failure>" | None -> ""
         String.concat "\n" [
             $"Sprint {sprintNum}. Target bucket: {bucket}. Source: {config.SourceDir}."
-            "Incremental port — improve test pass rate. Read .github/copilot-instructions.md and adr/INDEX.md."
+            "Incremental port — improve test pass rate piece by piece. Not a one-shot."
+            "Your focus: unpushed commits. Build, test, commit. Push happens only on full success."
+            "Read .github/copilot-instructions.md and adr/INDEX.md."
             $"\n<tests total=\"{totalTests}\">\n{dbBriefing}\n</tests>"
             $"\n<failing>\n{failLines}\n</failing>"
             altLines; prevBlock
@@ -134,6 +136,11 @@ module ConvergenceLoop =
             Beads.claim bead; Beads.note bead $"Pre:{pp}/{pt}"
             let sc = initSchema db in initSprint sc next bucket pp pt; sc.Close()
 
+            // Record base commit BEFORE implementor runs — this defines the sprint's diff scope
+            let baseCommit =
+                try (cli { Exec "git"; Arguments [|"rev-parse"; "HEAD"|] } |> Command.execute).Text |> Option.defaultValue "HEAD" |> fun s -> s.Trim()
+                with _ -> "HEAD"
+
             let (_, sid) = Agent.run prompt $"Impl-S{next}" None
             let mutable retries = 0
             let mutable passed = false
@@ -141,7 +148,7 @@ module ConvergenceLoop =
 
             while retries < maxRetries && not passed do
                 let results = Verifiers.listAll() |> List.map (fun v -> async {
-                    let (vp,vo,vsid) = Verifiers.runVerifier v
+                    let (vp,vo,vsid) = Verifiers.runVerifier v baseCommit
                     let verdict = if vp then "OK" else "FAIL"
                     Beads.note bead $"{v}:{verdict}"
                     return (v,vp,vo,vsid) }) |> Async.Parallel |> Async.RunSynchronously |> Array.toList
@@ -161,8 +168,10 @@ module ConvergenceLoop =
             Beads.note bead msg
             if passed && d > 0 then
                 Beads.close bead msg; printfn $"  OK: {msg}"
-                // Knowledge capture: invoke an agent with sprint commits as context
-                let capturePrompt = $"Sprint {next} just succeeded. Review what changed and capture any non-trivial learnings.\nRun: git log --oneline HEAD~10..HEAD\nPriority: amend existing skill > new skill > amend instruction > ADR > do nothing.\nMost sprints need nothing. Say 'No learnings.' if so."
+                // Push on success — unpushed commits become the sprint's permanent record
+                try cli { Exec "git"; Arguments [|"push"|] } |> Command.execute |> ignore with _ -> ()
+                // Knowledge capture with explicit diff scope
+                let capturePrompt = $"Sprint {next} succeeded. Diff scope: git diff {baseCommit}..HEAD\nCapture non-trivial learnings if any. Say 'No learnings.' if none."
                 Agent.run capturePrompt $"Knowledge-S{next}" None |> ignore
                 (true, msg)
             else
