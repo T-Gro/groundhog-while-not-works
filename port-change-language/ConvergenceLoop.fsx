@@ -343,21 +343,32 @@ Output exactly one of VERIFY_PASSED or VERIFY_FAILED on its own line at the end.
             let p = clarification.Contains("VERIFY_PASSED") && not (clarification.Contains("VERIFY_FAILED"))
             (p, output + "\n[disambiguated→" + (if p then "PASS" else "FAIL") + "]")
 
+    /// Map verifier name to agent title. 04-EXPERT-REVIEW uses a named agent.
+    let private agentTitle (verifierName: string) =
+        if verifierName.Contains("EXPERT-REVIEW") then "review-expert"
+        else $"Verify-{verifierName}"
+
     /// Run a verifier agent. Returns (passed, feedback, sessionId).
+    /// For EXPERT-REVIEW: invokes review-expert agent with just the .md body (agent has its own context).
+    /// For others: wraps the .md body with the standard verifier preamble.
     let runVerifier (config: ProjectConfig) (verifierName: string) : bool * string * string =
-        let filledPreamble = preamble.Replace("{targetDir}", config.TargetDir)
-        let prompt = String.concat "\n\n" [
-            filledPreamble
-            getPrompt verifierName
-        ]
-        let (output, sessionId) = Agent.run prompt $"Verify-{verifierName}" None
+        let title = agentTitle verifierName
+        let prompt =
+            if verifierName.Contains("EXPERT-REVIEW") then
+                // Expert review = invoke the named agent directly. Its .md agent definition provides context.
+                getPrompt verifierName
+            else
+                let filledPreamble = preamble.Replace("{targetDir}", config.TargetDir)
+                String.concat "\n\n" [ filledPreamble; getPrompt verifierName ]
+        let (output, sessionId) = Agent.run prompt title None
         let (passed, fullOutput) = parseVerdict output sessionId verifierName
         (passed, fullOutput, sessionId)
 
     /// Resume a verifier to re-check after implementor fixed issues.
     let resumeVerifier (sessionId: string) (verifierName: string) : bool * string =
         let feedback = "The implementor has addressed your feedback and committed fixes. Re-review the latest state. Output VERIFY_PASSED or VERIFY_FAILED."
-        let output = Agent.resume sessionId feedback $"Re-verify-{verifierName}"
+        let title = agentTitle verifierName
+        let output = Agent.resume sessionId feedback $"Re-{title}"
         let (passed, fullOutput) = parseVerdict output sessionId verifierName
         (passed, fullOutput)
 
