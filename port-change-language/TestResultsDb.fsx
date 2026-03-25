@@ -36,9 +36,9 @@ module TestResultsDb =
     /// Initialize the schema in a new or existing DB.
     let initSchema (dbPath: string) =
         Directory.CreateDirectory(Path.GetDirectoryName dbPath) |> ignore
-        use conn = new SqliteConnection($"Data Source={dbPath}")
+        let conn = new SqliteConnection($"Data Source={dbPath}")
         conn.Open()
-        use cmd = conn.CreateCommand()
+        let cmd = conn.CreateCommand()
         cmd.CommandText <- """
             -- Sprint identity: exactly one row, always present.
             CREATE TABLE IF NOT EXISTS sprint (
