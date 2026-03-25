@@ -215,7 +215,7 @@ module TestResultsDb =
         let ranked = bucketsRanked conn |> List.truncate 10
         let bucketLines = ranked |> List.map (fun (id, layer, failing, tot) -> $"  {layer} {id}: {failing}/{tot} failing")
         String.concat "\n" [
-            $"Sprint: {sprintNum} | Pass rate: {passing}/{total} ({pct:F1}%)"
+            $"Sprint: {sprintNum} | Pass rate: {passing}/{total} ({pct:F1}%%)"
             "Top failure buckets:"
             yield! bucketLines
         ]

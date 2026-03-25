@@ -473,7 +473,8 @@ module ConvergenceLoop =
         let sprintNum = currentSprintNum conn
         let nextSprint = sprintNum + 1
         let (prevPassing, prevTotal) = passRate conn
-        printfn $"Sprint {nextSprint} | {prevPassing}/{prevTotal} ({if prevTotal>0 then float prevPassing/float prevTotal*100.0 else 0.0:F1}%%)"
+        let prevPct = if prevTotal > 0 then float prevPassing / float prevTotal * 100.0 else 0.0
+        printfn $"Sprint {nextSprint} | {prevPassing}/{prevTotal} ({prevPct:F1}%%)"
 
         let ranked = bucketsRanked conn
         match ranked with
@@ -534,27 +535,61 @@ module ConvergenceLoop =
                     else
                         printfn $"  +{np-prevPassing} ({prevPassing}->{np})"
                         let verifiers = Verifiers.listSoftVerifiers ()
-                        let mutable vOk = true
-                        for v in verifiers do
-                            if vOk && retries < maxRetries then
+
+                        // Run ALL verifiers in PARALLEL (they are read-only, no file writes)
+                        let verifierResults =
+                            verifiers
+                            |> List.map (fun v -> async {
                                 printfn $"  {v}..."
                                 let (vp, vo, vsid) = Verifiers.runVerifier config v
-                                Beads.note beadId $"{v}: {if vp then "PASS" else "FAIL"}"
-                                if vp then printfn $"  OK {v}"
-                                else
-                                    lastFail <- truncOut vo 4000
-                                    Agent.resume sid lastFail $"Fix-{v}-S{nextSprint}" |> ignore
-                                    let (re,_) = Verifiers.resumeVerifier vsid v
-                                    if re then printfn $"  OK {v} (fixed)"
-                                    else printfn $"  FAIL {v}"; vOk <- false
-                                    retries <- retries+1
-                        if vOk then passed <- true
+                                let verdict = if vp then "PASS" else "FAIL"
+                                Beads.note beadId $"{v}: {verdict}"
+                                return (v, vp, vo, vsid)
+                            })
+                            |> Async.Parallel
+                            |> Async.RunSynchronously
+                            |> Array.toList
+
+                        let failures = verifierResults |> List.filter (fun (_, vp, _, _) -> not vp)
+                        if failures.IsEmpty then
+                            for (v, _, _, _) in verifierResults do printfn $"  OK {v}"
+                            passed <- true
+                        else
+                            // Collect ALL failure feedback, prefixed by verifier name
+                            let combinedFeedback =
+                                failures
+                                |> List.map (fun (v, _, vo, _) ->
+                                    printfn $"  FAIL {v}"
+                                    $"=== {v} ===\n{truncOut vo 2000}")
+                                |> String.concat "\n\n"
+                            lastFail <- combinedFeedback
+                            // Send combined feedback to implementor in one resume
+                            Agent.resume sid combinedFeedback $"Fix-verifiers-S{nextSprint}" |> ignore
+                            // Re-check ALL failed verifiers (in parallel again)
+                            let recheckResults =
+                                failures
+                                |> List.map (fun (v, _, _, vsid) -> async {
+                                    let (re, _) = Verifiers.resumeVerifier vsid v
+                                    return (v, re)
+                                })
+                                |> Async.Parallel
+                                |> Async.RunSynchronously
+                            let stillFailing = recheckResults |> Array.filter (fun (_, re) -> not re)
+                            for (v, re) in recheckResults do
+                                let s = if re then "OK" else "FAIL"
+                                printfn $"  {s} {v} (recheck)"
+                            if stillFailing.Length > 0 then
+                                lastFail <- stillFailing |> Array.map fst |> String.concat ", " |> sprintf "Still failing: %s"
+                            else
+                                passed <- true
+                            retries <- retries + 1
 
             let fc = initSchema dbPath
             let (fp,ft) = passRate fc in let delta = fp-prevPassing
             finalizeSprint fc fp ft; fc.Close(); archiveAndReset key nextSprint
 
-            let msg = $"{fp}/{ft} ({if ft>0 then float fp/float ft*100.0 else 0.0:F1}%%) d={delta:+#;-#;0}"
+            let pct = if ft > 0 then float fp / float ft * 100.0 else 0.0
+            let msg = $"{fp}/{ft} ({pct:F1}%%) d={delta}"
             Beads.note beadId msg
             if passed && delta > 0 then
                 Beads.close beadId msg; printfn $"  Done: {msg}"
@@ -608,4 +643,6 @@ match fsi.CommandLineArgs |> Array.toList |> List.tail with
     printfn ""
     printfn "Run from target project dir (needs project.json)."
     printfn "Failures feed forward to next sprint. No output dropped."
-| other -> printfn $"Unknown: {other |> String.concat " "}. Try --help"
+| other ->
+    let cmd = other |> String.concat " "
+    printfn $"Unknown: {cmd}. Try --help"
