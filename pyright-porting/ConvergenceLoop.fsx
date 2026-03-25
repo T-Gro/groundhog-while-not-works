@@ -196,14 +196,13 @@ module BriefingPack =
         (testDbBriefing: string)
         (failingSamples: (string * string) list)
         (totalTestCount: int)
+        (alternativeBuckets: string list)
         : string =
 
         let plan = readHint "porting-plan.md"
-        let layers = readHint "layer-boundaries.md"
-        let patterns = readHint "type-patterns.md"
         let learnings = Knowledge.buildLearningsContext config
 
-        // Truncate plan to ~3K tokens if too large
+        // Plan: truncate to ~3K tokens
         let planSection =
             if String.IsNullOrWhiteSpace plan then ""
             else
@@ -221,9 +220,17 @@ module BriefingPack =
                 "</failing_tests>"
             ]
 
+        // Alternative buckets the agent CAN choose if it thinks it can make more progress elsewhere
+        let altSection =
+            if alternativeBuckets.IsEmpty then ""
+            else
+                let alts = alternativeBuckets |> List.map (fun b -> $"  - {b}") |> String.concat "\n"
+                $"<alternative_buckets>\nSuggested: '{targetBucket}'. But you may pick a different one if you believe you can make more progress:\n{alts}\nExplain your choice.\n</alternative_buckets>"
+
+        // The CONSTANT brief is implicit via .github/copilot-instructions.md (always loaded by copilot).
+        // This is the DYNAMIC brief built from previous sprint state.
         String.concat "\n\n" [
             $"<sprint num=\"{sprintNum}\" bucket=\"{targetBucket}\">"
-            $"Source: {config.SourceLang} | Target: {config.TargetLang}"
             $"Source dir: {config.SourceDir} | Target dir: {config.TargetDir}"
             "</sprint>"
 
@@ -236,16 +243,15 @@ module BriefingPack =
 
             planSection
             failuresSection
+            altSection
 
-            if not (String.IsNullOrWhiteSpace layers) then $"<layer_contracts>\n{layers}\n</layer_contracts>"
-            if not (String.IsNullOrWhiteSpace patterns) then $"<translation_patterns>\n{patterns}\n</translation_patterns>"
             if not (String.IsNullOrWhiteSpace learnings) then learnings
 
             Knowledge.writingGuidance ()
 
             "<instructions>"
             "You are an implementor. Your goal: increase the passing test rate."
-            $"Focus on bucket '{targetBucket}'. Fix as many failing tests as you can."
+            $"Focus on bucket '{targetBucket}' (or pick from alternatives if you justify it)."
             "After making changes, run the build and test commands to verify."
             $"Build: {config.BuildCommand}"
             $"Test: {config.TestCommand}"
@@ -286,6 +292,8 @@ module Agent =
 module Verifiers =
     let private verifiersDir = Path.Combine(__SOURCE_DIRECTORY__, "verifiers")
 
+    /// Dynamically list all verifiers from the verifiers/ folder.
+    /// Users can add/remove/rephrase .md files freely — the loop picks them all up.
     let listAll () : string list =
         if Directory.Exists verifiersDir then
             Directory.GetFiles(verifiersDir, "*.md")
@@ -293,6 +301,11 @@ module Verifiers =
             |> Array.sort
             |> Array.toList
         else []
+
+    /// List only the "soft" verifiers (V05+) — the ones that run as LLM reviews.
+    /// V01-V04 are handled as executable checks in the main loop.
+    let listSoftVerifiers () : string list =
+        listAll () |> List.filter (fun n -> not (n.StartsWith "V01") && not (n.StartsWith "V02") && not (n.StartsWith "V03") && not (n.StartsWith "V04"))
 
     let getPrompt (name: string) : string =
         let path = Path.Combine(verifiersDir, name + ".md")
@@ -323,6 +336,43 @@ Output exactly one of VERIFY_PASSED or VERIFY_FAILED on its own line at the end.
         let (output, _) = Agent.run prompt $"Verify-{verifierName}" None
         let passed = output.Contains("VERIFY_PASSED") && not (output.Contains("VERIFY_FAILED"))
         (passed, output)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Post-Sprint Instruction Refinement
+// ═════════════════════════════════════════════════════════════════════════════
+
+module InstructionRefiner =
+    /// After a successful sprint, invoke an agent to review and potentially
+    /// update .github/copilot-instructions.md with significant learnings.
+    /// This prevents rot and keeps instructions current.
+    let refine (config: ProjectConfig) (sprintNum: int) =
+        let instructionsPath = Path.Combine(config.TargetDir, ".github", "copilot-instructions.md")
+        if not (File.Exists instructionsPath) then ()
+        else
+            let currentInstructions = File.ReadAllText instructionsPath
+            let prompt = String.concat "\n" [
+                "You are an instruction refinement agent. After sprint " + string sprintNum + ","
+                "review and optionally update the project's copilot-instructions.md."
+                ""
+                "Current instructions:"
+                "```"
+                currentInstructions
+                "```"
+                ""
+                "Your task:"
+                "1. Review the git log for this sprint: `cd " + config.TargetDir + " && git log --oneline -5`"
+                "2. Check for any ADRs or skills created: `ls " + config.TargetDir + "/adr/ " + config.TargetDir + "/.github/skills/`"
+                "3. If there are SIGNIFICANT, non-obvious insights that ALL future sessions need,"
+                "   update copilot-instructions.md. Keep it SHORT — under 80 lines."
+                "4. Remove anything stale or redundant."
+                "5. Do NOT add trivial information Claude already knows."
+                "6. Do NOT bloat the file. Every line must justify its token cost."
+                ""
+                "If no changes needed, just say 'No updates.' and exit."
+            ]
+            let (output, _) = Agent.run prompt $"Refine-instructions-S{sprintNum}" None
+            if output.Length > 0 && not (output.Contains "No updates") then
+                printfn $"  📝 Instructions refined after sprint {sprintNum}"
 
 // ═════════════════════════════════════════════════════════════════════════════
 // The Main Loop
@@ -380,11 +430,11 @@ module ConvergenceLoop =
     /// Execute one convergence step.
     ///
     /// Flow:
-    ///   1. Read test DB → find highest-impact failing bucket
-    ///   2. Build briefing pack → run implementor (fresh session)
+    ///   1. Read test DB → find top failing buckets (with fuzziness — agent can pick)
+    ///   2. Build dynamic brief → run implementor (fresh session)
     ///   3. Re-run tests → update DB → check for regression (HARD GATE)
-    ///   4. Run verifiers (read-only) → if fail, resume implementor with feedback → goto 3
-    ///   5. Sprint passes → archive DB, update beads, exit
+    ///   4. Run ALL verifiers from verifiers/ folder (dynamic) → if fail, resume implementor
+    ///   5. Sprint passes → archive DB, update beads, refine instructions, exit
     let step (maxRetries: int) =
         let config = require()
         printfn $"Project: {config.ProjectName} ({config.SourceLang} → {config.TargetLang})"
@@ -403,21 +453,26 @@ module ConvergenceLoop =
 
         printfn $"Sprint {nextSprint} | Current: {prevPassing}/{prevTotal} passing ({prevPct:F1}%%)"
 
-        // Find highest-impact bucket
+        // Find top buckets — provide alternatives for fuzziness (anti-stuckness)
         let ranked = bucketsRanked conn
-        match ranked |> List.tryHead with
-        | None ->
+        match ranked with
+        | [] ->
             printfn "✓ No failing buckets. All tests pass!"
             conn.Close()
-        | Some (targetBucket, layer, failing, bucketTotal) ->
-            printfn $"Target: '{targetBucket}' ({layer}) — {failing}/{bucketTotal} failing"
+        | (targetBucket, layer, failing, bucketTotal) :: rest ->
+            let alternativeBuckets = rest |> List.truncate 4 |> List.map (fun (b, l, f, _) -> $"{b} ({l}, {f} failing)")
+            printfn $"Suggested target: '{targetBucket}' ({layer}) — {failing}/{bucketTotal} failing"
+            if alternativeBuckets.Length > 0 then
+                printfn $"  Alternatives: {alternativeBuckets |> String.concat ", "}"
 
             let failures = failingInBucket conn targetBucket 30
             let testBriefing = briefing conn
             conn.Close()
 
-            // 2. Build briefing & run implementor
-            let briefingText = BriefingPack.build config nextSprint targetBucket testBriefing failures prevTotal
+            // 2. Build dynamic brief & run implementor
+            // Constant brief = .github/copilot-instructions.md (implicit, always loaded by copilot)
+            // Dynamic brief = test DB summary + failures + plan + alternatives
+            let briefingText = BriefingPack.build config nextSprint targetBucket testBriefing failures prevTotal alternativeBuckets
             let sprintBeadId = Beads.create $"Sprint {nextSprint}: {targetBucket}" $"Fix {failing} failures in '{targetBucket}'." "task" 1
             Beads.claim sprintBeadId
             Beads.note sprintBeadId $"Pre: {prevPassing}/{prevTotal} ({prevPct:F1}%%)"
@@ -460,8 +515,8 @@ module ConvergenceLoop =
                         Agent.resume sessionId feedback $"Fix-regression-S{nextSprint}" |> ignore
                         retryCount <- retryCount + 1
                     else
-                        // 4-5-6. Run verifiers (read-only, plan actions)
-                        let softVerifiers = ["V06-CODE-QUALITY"; "V07-DEDUP"; "V09-HONEST-ASSESSMENT"]
+                        // 4. Run ALL soft verifiers from verifiers/ folder (dynamic — add/remove .md files freely)
+                        let softVerifiers = Verifiers.listSoftVerifiers ()
                         let mutable verifiersPassed = true
 
                         for vName in softVerifiers do
@@ -472,7 +527,6 @@ module ConvergenceLoop =
                                     printfn $"  ✅ {vName}"
                                 else
                                     printfn $"  ❌ {vName} — resuming implementor with feedback"
-                                    // Resume implementor with verifier's action plan
                                     let truncFeedback = if feedback.Length > 4000 then feedback.[..3999] else feedback
                                     Agent.resume sessionId truncFeedback $"Fix-{vName}-S{nextSprint}" |> ignore
                                     verifiersPassed <- false
@@ -496,6 +550,10 @@ module ConvergenceLoop =
             if allPassed then
                 Beads.close sprintBeadId $"Done. {resultMsg}"
                 printfn $"✅ Sprint {nextSprint} complete. {resultMsg}"
+
+                // 5. Post-sprint: refine instructions (only on success)
+                printfn "  Running instruction refinement..."
+                InstructionRefiner.refine config nextSprint
             else
                 Beads.note sprintBeadId "Max retries reached"
                 printfn $"⚠ Sprint {nextSprint} finished with retries exhausted. {resultMsg}"
