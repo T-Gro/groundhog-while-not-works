@@ -19,16 +19,57 @@ module Beads =
         let known = @"Q:\.tools\beads\bd.exe"
         if File.Exists known then known else "bd"
 
+    let mutable private warned = false
+    let mutable private epicId = ""
+
     let run (args: string list) : string =
         try
+            let path = Environment.GetEnvironmentVariable("PATH")
+            let doltDir = @"Q:\.tools\dolt\dolt-windows-amd64\bin"
+            if not (path.Contains(doltDir)) then
+                Environment.SetEnvironmentVariable("PATH", $"{doltDir};{path}")
             let result = cli { Exec (bd()); Arguments (args |> Array.ofList); WorkingDirectory __SOURCE_DIRECTORY__ } |> Command.execute
             result.Text |> Option.defaultValue ""
-        with ex -> eprintfn $"bd: {ex.Message}"; ""
+        with ex ->
+            if not warned then eprintfn $"⚠ beads unavailable: {ex.Message}"; warned <- true
+            ""
 
-    let create title desc = run ["create"; $"--title={title}"; $"--description={desc}"; "--type=task"; "--priority=1"] |> fun s -> s.Trim()
+    /// Ensure campaign epic exists. Returns its ID.
+    let ensureEpic (projectName: string) =
+        if epicId = "" then
+            // Search for existing epic
+            let existing = run ["query"; "type=epic AND status!=closed"; "--json"]
+            if existing.Contains projectName then
+                // Extract ID from JSON — rough but works
+                let m = System.Text.RegularExpressions.Regex.Match(existing, "\"id\":\\s*\"([^\"]+)\"")
+                if m.Success then epicId <- m.Groups.[1].Value
+            if epicId = "" then
+                epicId <- (run ["create"; $"--title={projectName}"; "--type=epic"; "--description=Porting campaign"]).Trim()
+        epicId
+
+    /// Create a sprint task under the campaign epic.
+    let createSprint (sprintNum: int) (bucket: string) (preMetrics: string) =
+        let parent = epicId
+        let args = [
+            "create"
+            $"--title=S{sprintNum}: {bucket}"
+            $"--description={preMetrics}"
+            "--type=task"
+            $"--labels=sprint:{sprintNum},bucket:{bucket}"
+            if parent <> "" then $"--parent={parent}"
+        ]
+        (run args).Trim()
+
     let claim id = run ["update"; id; "--claim"] |> ignore
-    let close id reason = run ["close"; id; $"--reason={reason}"] |> ignore
     let note id text = run ["note"; id; text] |> ignore
+
+    /// Record a verifier result as a labeled note.
+    let verifierResult id (verifier: string) (passed: bool) (attempt: int) =
+        let verdict = if passed then "PASS" else "FAIL"
+        note id $"VERIFIER:{verifier}:{verdict}:attempt{attempt}"
+
+    let closeSuccess id reason = run ["close"; id; $"--reason={reason}"] |> ignore
+    let closeFailed id reason = run ["close"; id; $"--reason=FAILED: {reason}"; "--add-label"; "failed"] |> ignore
     let remember text = run ["remember"; text] |> ignore
 
 module Agent =
@@ -100,6 +141,7 @@ module ConvergenceLoop =
         let config = require()
         let db = currentDbPath (key())
         if not (File.Exists db) then let c = initSchema db in initSprint c 0 "" 0 0; c.Close()
+        Beads.ensureEpic config.ProjectName |> ignore
         config
 
     let private buildBriefing config sprintNum bucket dbBriefing failures totalTests alts prevFailure =
@@ -137,7 +179,7 @@ module ConvergenceLoop =
                 "Set up the test harness, run tests, establish the baseline."
                 "You MUST commit your changes. Do NOT push."
                 "Read: adr/INDEX.md, porting-plan.md" ]
-            let bead = Beads.create $"S{next}: bootstrap" "Set up test harness"
+            let bead = Beads.createSprint next "bootstrap" "Empty DB"
             Beads.claim bead
             let sc = initSchema db in initSprint sc next "bootstrap" 0 0; sc.Close()
             let baseCommit =
@@ -158,7 +200,7 @@ module ConvergenceLoop =
                 Agent.resume sid fb $"Fix-S{next}" |> ignore
             let pushResult = try (cli { Exec "git"; Arguments [|"push"|] } |> Command.execute).ExitCode with _ -> 1
             if pushResult = 0 then printfn "  Pushed." else printfn "  ⚠ push failed"
-            Beads.close bead "Bootstrap done"
+            Beads.closeSuccess bead "Bootstrap done"
             (true, "BOOTSTRAP")
         | [] ->
             conn.Close(); printfn "All pass!"; (true, "ALL_PASS")
@@ -170,8 +212,8 @@ module ConvergenceLoop =
             printfn $"S{next} | {pp}/{pt} | {bucket} ({failing} failing)"
 
             let prompt = buildBriefing config next bucket brief fails pt alts prevFailure
-            let bead = Beads.create $"S{next}: {bucket}" $"{failing} failures"
-            Beads.claim bead; Beads.note bead $"Pre:{pp}/{pt}"
+            let bead = Beads.createSprint next bucket $"Pre:{pp}/{pt}, {failing} failing"
+            Beads.claim bead
             let sc = initSchema db in initSprint sc next bucket pp pt; sc.Close()
 
             // Record base commit BEFORE implementor runs — this defines the sprint's diff scope
@@ -191,10 +233,11 @@ module ConvergenceLoop =
             let mutable lastFail = ""
 
             while retries < maxRetries && not passed do
+                Beads.note bead $"attempt:{retries+1}"
                 let results = Verifiers.listAll() |> List.map (fun v -> async {
                     let (vp,vo,vsid) = Verifiers.runVerifier v baseCommit
-                    let verdict = if vp then "OK" else "FAIL"
-                    Beads.note bead $"{v}:{verdict}"
+                    let verdict = if vp then "PASS" else "FAIL"
+                    Beads.verifierResult bead v (verdict = "PASS") (retries+1)
                     return (v,vp,vo,vsid) }) |> Async.Parallel |> Async.RunSynchronously |> Array.toList
                 let failed = results |> List.filter (fun (_,vp,_,_) -> not vp)
                 if failed.IsEmpty then passed <- true
@@ -211,7 +254,7 @@ module ConvergenceLoop =
             let msg = $"{fp}/{ft} d={d}"
             Beads.note bead msg
             if passed && d > 0 then
-                Beads.close bead msg; printfn $"  OK: {msg}"
+                Beads.closeSuccess bead msg; printfn $"  OK: {msg}"
                 // Knowledge capture — runs BEFORE push so its changes get included
                 let capturePrompt = String.concat "\n" [
                     $"Sprint {next} succeeded."
@@ -226,7 +269,7 @@ module ConvergenceLoop =
                 else printfn "  Pushed."
                 (true, msg)
             else
-                Beads.note bead $"Fail:{trunc lastFail 500}"; printfn $"  Fail: {msg}"; (false, lastFail)
+                Beads.closeFailed bead msg; printfn $"  Fail: {msg}"; (false, lastFail)
 
     let run maxRetries =
         let config = ensureInit ()
