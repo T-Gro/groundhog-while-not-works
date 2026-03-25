@@ -204,14 +204,54 @@ module ConvergenceLoop =
         let mutable go = true
         let mutable prev: string option = None
         let mutable consecutiveErrors = 0
+        let mutable sprintsSinceReview = 0
+        let reviewInterval = 7
         Console.CancelKeyPress.Add(fun a -> a.Cancel <- true; go <- false; printfn "\nStopping...")
         while go do
             try
-                let (ok, s) = step maxRetries prev
-                consecutiveErrors <- 0  // reset on any successful step completion
-                if s = "ALL_PASS" then go <- false
-                elif ok then prev <- None
-                else prev <- Some s
+                // Every N sprints: full codebase review → refactoring sprint
+                sprintsSinceReview <- sprintsSinceReview + 1
+                if sprintsSinceReview >= reviewInterval then
+                    sprintsSinceReview <- 0
+                    printfn "── Periodic codebase review ──"
+                    let reviewPrompt = String.concat "\n" [
+                        "Invoke the review-expert agent as a subtask."
+                        $"Goal: assess overall quality of the FULL codebase in {targetDir()}."
+                        "You are NOT reviewing a diff. You are reviewing the entire implementation."
+                        $"Source reference: {config.SourceDir}"
+                        "Provide: concrete improvement suggestions, architectural concerns,"
+                        "module-level refactoring opportunities, code quality issues."
+                        "Output a prioritized list of actionable improvements." ]
+                    let (reviewOutput, _) = Agent.run reviewPrompt "review-expert" None
+                    let reviewFeedback = trunc reviewOutput 4000
+                    Beads.remember $"Codebase review: {trunc reviewOutput 500}"
+                    // Feed review as a refactoring sprint — must not regress tests
+                    let refactorPrompt = String.concat "\n" [
+                        "REFACTORING SPRINT. No new features. Test count and pass rate must not decrease."
+                        "An expert review found these improvement opportunities:"
+                        reviewFeedback
+                        "Pick the highest-impact improvements. Refactor, commit." ]
+                    printfn "── Refactoring sprint ──"
+                    let (_, refactorSid) = Agent.run refactorPrompt "Refactor" None
+                    // Run verifiers on the refactoring too
+                    let baseCommit =
+                        try (cli { Exec "git"; Arguments [|"rev-parse"; "HEAD"|] } |> Command.execute).Text |> Option.defaultValue "HEAD" |> fun s -> s.Trim()
+                        with _ -> "HEAD"
+                    let results = Verifiers.listAll() |> List.map (fun v -> async {
+                        let (vp,vo,vsid) = Verifiers.runVerifier v baseCommit
+                        return (v,vp,vo,vsid) }) |> Async.Parallel |> Async.RunSynchronously |> Array.toList
+                    let failed = results |> List.filter (fun (_,vp,_,_) -> not vp)
+                    if not failed.IsEmpty then
+                        let fb = failed |> List.map (fun (v,_,vo,_) -> $"=== {v} ===\n{trunc vo 2000}") |> String.concat "\n\n"
+                        Agent.resume refactorSid fb "Fix-Refactor" |> ignore
+                    try cli { Exec "git"; Arguments [|"push"|] } |> Command.execute |> ignore with _ -> ()
+                    printfn "── Refactoring done ──"
+                else
+                    let (ok, s) = step maxRetries prev
+                    consecutiveErrors <- 0
+                    if s = "ALL_PASS" then go <- false
+                    elif ok then prev <- None
+                    else prev <- Some s
             with ex ->
                 consecutiveErrors <- consecutiveErrors + 1
                 eprintfn $"Sprint error ({consecutiveErrors}): {ex.Message}"
@@ -219,7 +259,7 @@ module ConvergenceLoop =
                 if consecutiveErrors >= 5 then
                     eprintfn "5 consecutive errors — sleeping 10 min before retry"
                     System.Threading.Thread.Sleep(10 * 60 * 1000)
-                    consecutiveErrors <- 0  // reset after sleep, try again
+                    consecutiveErrors <- 0
 
     let status () =
         match load() with
