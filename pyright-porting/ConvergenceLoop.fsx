@@ -338,41 +338,67 @@ Output exactly one of VERIFY_PASSED or VERIFY_FAILED on its own line at the end.
         (passed, output)
 
 // ═════════════════════════════════════════════════════════════════════════════
-// Post-Sprint Instruction Refinement
+// Post-Sprint Knowledge Refinement
 // ═════════════════════════════════════════════════════════════════════════════
 
-module InstructionRefiner =
-    /// After a successful sprint, invoke an agent to review and potentially
-    /// update .github/copilot-instructions.md with significant learnings.
-    /// This prevents rot and keeps instructions current.
+module KnowledgeRefiner =
+    /// After a successful sprint, invoke an agent to optionally capture learnings.
+    /// Priority order (prefer improving existing over creating new):
+    ///   1. Rephrase/amend an EXISTING skill — always compact it
+    ///   2. Add a NEW skill (rare — only if no existing skill fits)
+    ///   3. Add/amend a folder-scoped .instructions.md file (compact)
+    ///   4. If it's a BIG architecture decision → write an ADR
+    /// If nothing significant was learned, do nothing.
     let refine (config: ProjectConfig) (sprintNum: int) =
-        let instructionsPath = Path.Combine(config.TargetDir, ".github", "copilot-instructions.md")
-        if not (File.Exists instructionsPath) then ()
-        else
-            let currentInstructions = File.ReadAllText instructionsPath
-            let prompt = String.concat "\n" [
-                "You are an instruction refinement agent. After sprint " + string sprintNum + ","
-                "review and optionally update the project's copilot-instructions.md."
-                ""
-                "Current instructions:"
-                "```"
-                currentInstructions
-                "```"
-                ""
-                "Your task:"
-                "1. Review the git log for this sprint: `cd " + config.TargetDir + " && git log --oneline -5`"
-                "2. Check for any ADRs or skills created: `ls " + config.TargetDir + "/adr/ " + config.TargetDir + "/.github/skills/`"
-                "3. If there are SIGNIFICANT, non-obvious insights that ALL future sessions need,"
-                "   update copilot-instructions.md. Keep it SHORT — under 80 lines."
-                "4. Remove anything stale or redundant."
-                "5. Do NOT add trivial information Claude already knows."
-                "6. Do NOT bloat the file. Every line must justify its token cost."
-                ""
-                "If no changes needed, just say 'No updates.' and exit."
-            ]
-            let (output, _) = Agent.run prompt $"Refine-instructions-S{sprintNum}" None
-            if output.Length > 0 && not (output.Contains "No updates") then
-                printfn $"  📝 Instructions refined after sprint {sprintNum}"
+        let prompt = String.concat "\n" [
+            $"You are a knowledge refinement agent. Sprint {sprintNum} just completed successfully."
+            $"Working directory: {config.TargetDir}"
+            ""
+            "Review what was done this sprint and decide if any learnings should be captured."
+            "Most sprints produce NO learnings worth capturing. Only act on genuinely non-trivial insights."
+            ""
+            "== YOUR OPTIONS (in priority order — prefer option 1 over 2, 2 over 3, etc.) =="
+            ""
+            "OPTION 1 (PREFERRED): Amend an EXISTING skill in .github/skills/"
+            "  - Read existing skills: `ls .github/skills/`"
+            "  - If this sprint's insight fits an existing skill, update it"
+            "  - Always COMPACT when touching — remove fluff, tighten wording"
+            "  - Follow https://platform.claude.com/docs/en/agents-and-tools/agent-skills/best-practices"
+            ""
+            "OPTION 2 (RARE): Create a NEW skill in .github/skills/<name>/SKILL.md"
+            "  - Only if no existing skill covers this area"
+            "  - Must have a clear trigger phrase (when does this skill activate?)"
+            "  - YAML frontmatter: name (lowercase-hyphenated), description (third person, specific)"
+            "  - Body: concise, under 200 lines. Progressive disclosure — link to reference files"
+            "  - Follow https://platform.claude.com/docs/en/agents-and-tools/agent-skills/best-practices"
+            ""
+            "OPTION 3: Amend/create a folder-scoped .instructions.md in .github/instructions/"
+            "  - Read existing: `ls .github/instructions/`"
+            "  - These have `applyTo` globs — they load only for matching files"
+            "  - Keep compact. Dedup against copilot-instructions.md and other instruction files"
+            "  - Follow the Anthropic style guide for conciseness"
+            ""
+            "OPTION 4 (BIG decisions only): Write an ADR in adr/"
+            $"  - Read the index: `cat {config.TargetDir}/adr/INDEX.md`"
+            "  - Only for non-trivial ARCHITECTURE decisions that are impactful and worth recording"
+            "  - Format: adr/NNNN-title.md with Status, Context, Decision, Consequences"
+            "  - Update adr/INDEX.md with a one-line summary"
+            ""
+            "OPTION 5: Do nothing. Say 'No learnings.' and exit."
+            "  This is the RIGHT choice for most sprints."
+            ""
+            "== RULES =="
+            "- NEVER bloat. Every token must justify its cost."
+            "- When amending, always leave the file SHORTER or same length, never longer (unless adding genuinely new content)"
+            "- Do NOT capture obvious things (how to write a for loop, what types map to what)"
+            "- DO capture: discovered gotchas, non-obvious behavioral differences, performance traps,"
+            "  architectural constraints, circular dependency resolutions, import ordering requirements"
+            ""
+            "Start by reviewing: `git log --oneline -5` and `git diff HEAD~1 --stat`"
+        ]
+        let (output, _) = Agent.run prompt $"Knowledge-refine-S{sprintNum}" None
+        if output.Length > 0 && not (output.Contains "No learnings") then
+            printfn $"  📝 Knowledge captured after sprint {sprintNum}"
 
 // ═════════════════════════════════════════════════════════════════════════════
 // The Main Loop
@@ -551,9 +577,9 @@ module ConvergenceLoop =
                 Beads.close sprintBeadId $"Done. {resultMsg}"
                 printfn $"✅ Sprint {nextSprint} complete. {resultMsg}"
 
-                // 5. Post-sprint: refine instructions (only on success)
-                printfn "  Running instruction refinement..."
-                InstructionRefiner.refine config nextSprint
+                // 5. Post-sprint: capture learnings (only on success)
+                printfn "  Running knowledge refinement..."
+                KnowledgeRefiner.refine config nextSprint
             else
                 Beads.note sprintBeadId "Max retries reached"
                 printfn $"⚠ Sprint {nextSprint} finished with retries exhausted. {resultMsg}"
