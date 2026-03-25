@@ -34,15 +34,22 @@ module TestResultsDb =
         conn.Open()
         use cmd = conn.CreateCommand()
         cmd.CommandText <- """
-            CREATE TABLE IF NOT EXISTS meta (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
+            -- Sprint identity: exactly one row, always present.
+            CREATE TABLE IF NOT EXISTS sprint (
+                sprint_num INTEGER NOT NULL,
+                started_at TEXT NOT NULL DEFAULT (datetime('now')),
+                finished_at TEXT,
+                target_bucket TEXT,
+                pre_passing INTEGER,
+                pre_total INTEGER,
+                post_passing INTEGER,
+                post_total INTEGER
             );
 
             CREATE TABLE IF NOT EXISTS buckets (
-                id TEXT PRIMARY KEY,          -- e.g. "generics", "classes", "parser"
+                id TEXT PRIMARY KEY,
                 description TEXT,
-                layer TEXT,                   -- e.g. "L0", "L1", "L3"
+                layer TEXT,
                 total_tests INTEGER DEFAULT 0,
                 passing INTEGER DEFAULT 0,
                 failing INTEGER DEFAULT 0,
@@ -50,44 +57,54 @@ module TestResultsDb =
             );
 
             CREATE TABLE IF NOT EXISTS tests (
-                id TEXT PRIMARY KEY,           -- sample file name or test ID
+                id TEXT PRIMARY KEY,
                 bucket_id TEXT NOT NULL,
-                status TEXT NOT NULL,          -- 'pass', 'fail', 'crash', 'timeout', 'skip'
-                error_message TEXT,            -- NULL if passing
-                error_category TEXT,           -- 'missing_output', 'extra_output', 'wrong_content', 'parse_error', 'crash'
+                sprint_num INTEGER NOT NULL,  -- which sprint recorded this result
+                status TEXT NOT NULL CHECK(status IN ('pass','fail','crash','timeout','skip')),
+                error_message TEXT,
+                error_category TEXT,
                 duration_ms INTEGER,
                 FOREIGN KEY (bucket_id) REFERENCES buckets(id)
             );
 
             CREATE TABLE IF NOT EXISTS regressions (
                 test_id TEXT NOT NULL,
-                previous_status TEXT NOT NULL, -- was 'pass'
-                current_status TEXT NOT NULL,  -- now 'fail' or 'crash'
-                sprint_num INTEGER,
+                previous_status TEXT NOT NULL,
+                current_status TEXT NOT NULL,
+                sprint_num INTEGER NOT NULL,
                 PRIMARY KEY (test_id, sprint_num)
             );
 
             CREATE INDEX IF NOT EXISTS idx_tests_bucket ON tests(bucket_id);
             CREATE INDEX IF NOT EXISTS idx_tests_status ON tests(status);
+            CREATE INDEX IF NOT EXISTS idx_tests_sprint ON tests(sprint_num);
         """
         cmd.ExecuteNonQuery() |> ignore
         conn
 
-    /// Set a metadata value.
-    let setMeta (conn: SqliteConnection) (key: string) (value: string) =
+    /// Initialize the sprint row (call once at start of a new sprint).
+    let initSprint (conn: SqliteConnection) (sprintNum: int) (targetBucket: string) (prePassing: int) (preTotal: int) =
         use cmd = conn.CreateCommand()
-        cmd.CommandText <- "INSERT OR REPLACE INTO meta (key, value) VALUES ($k, $v)"
-        cmd.Parameters.AddWithValue("$k", key) |> ignore
-        cmd.Parameters.AddWithValue("$v", value) |> ignore
+        cmd.CommandText <- "DELETE FROM sprint; INSERT INTO sprint (sprint_num, target_bucket, pre_passing, pre_total) VALUES ($n, $b, $pp, $pt)"
+        cmd.Parameters.AddWithValue("$n", sprintNum) |> ignore
+        cmd.Parameters.AddWithValue("$b", targetBucket) |> ignore
+        cmd.Parameters.AddWithValue("$pp", prePassing) |> ignore
+        cmd.Parameters.AddWithValue("$pt", preTotal) |> ignore
         cmd.ExecuteNonQuery() |> ignore
 
-    /// Get a metadata value.
-    let getMeta (conn: SqliteConnection) (key: string) : string option =
+    /// Finalize the sprint row with post-sprint metrics.
+    let finalizeSprint (conn: SqliteConnection) (postPassing: int) (postTotal: int) =
         use cmd = conn.CreateCommand()
-        cmd.CommandText <- "SELECT value FROM meta WHERE key = $k"
-        cmd.Parameters.AddWithValue("$k", key) |> ignore
-        use reader = cmd.ExecuteReader()
-        if reader.Read() then Some (reader.GetString(0)) else None
+        cmd.CommandText <- "UPDATE sprint SET finished_at = datetime('now'), post_passing = $pp, post_total = $pt"
+        cmd.Parameters.AddWithValue("$pp", postPassing) |> ignore
+        cmd.Parameters.AddWithValue("$pt", postTotal) |> ignore
+        cmd.ExecuteNonQuery() |> ignore
+
+    /// Read the current sprint number.
+    let currentSprintNum (conn: SqliteConnection) : int =
+        use cmd = conn.CreateCommand()
+        cmd.CommandText <- "SELECT sprint_num FROM sprint LIMIT 1"
+        try cmd.ExecuteScalar() :?> int64 |> int with _ -> 0
 
     /// Upsert a bucket.
     let upsertBucket (conn: SqliteConnection) (id: string) (desc: string) (layer: string) =
@@ -101,15 +118,16 @@ module TestResultsDb =
         cmd.Parameters.AddWithValue("$layer", layer) |> ignore
         cmd.ExecuteNonQuery() |> ignore
 
-    /// Record a test result.
-    let recordTest (conn: SqliteConnection) (id: string) (bucketId: string) (status: string) (errorMsg: string option) (errorCat: string option) =
+    /// Record a test result (tagged with sprint number).
+    let recordTest (conn: SqliteConnection) (sprintNum: int) (id: string) (bucketId: string) (status: string) (errorMsg: string option) (errorCat: string option) =
         use cmd = conn.CreateCommand()
         cmd.CommandText <- """
-            INSERT OR REPLACE INTO tests (id, bucket_id, status, error_message, error_category)
-            VALUES ($id, $bucket, $status, $err, $cat)
+            INSERT OR REPLACE INTO tests (id, bucket_id, sprint_num, status, error_message, error_category)
+            VALUES ($id, $bucket, $sn, $status, $err, $cat)
         """
         cmd.Parameters.AddWithValue("$id", id) |> ignore
         cmd.Parameters.AddWithValue("$bucket", bucketId) |> ignore
+        cmd.Parameters.AddWithValue("$sn", sprintNum) |> ignore
         cmd.Parameters.AddWithValue("$status", status) |> ignore
         cmd.Parameters.AddWithValue("$err", errorMsg |> Option.map box |> Option.defaultValue (box DBNull.Value)) |> ignore
         cmd.Parameters.AddWithValue("$cat", errorCat |> Option.map box |> Option.defaultValue (box DBNull.Value)) |> ignore
@@ -185,12 +203,13 @@ module TestResultsDb =
 
     /// Generate a compact briefing string for implementor context.
     let briefing (conn: SqliteConnection) : string =
+        let sprintNum = currentSprintNum conn
         let (passing, total) = passRate conn
         let pct = if total > 0 then float passing / float total * 100.0 else 0.0
         let ranked = bucketsRanked conn |> List.truncate 10
         let bucketLines = ranked |> List.map (fun (id, layer, failing, tot) -> $"  {layer} {id}: {failing}/{tot} failing")
         String.concat "\n" [
-            $"Pass rate: {passing}/{total} ({pct:F1}%)"
+            $"Sprint: {sprintNum} | Pass rate: {passing}/{total} ({pct:F1}%)"
             "Top failure buckets:"
             yield! bucketLines
         ]

@@ -469,8 +469,7 @@ module ConvergenceLoop =
 
         // Init test results DB
         let conn = initSchema (currentDbPath())
-        setMeta conn "sprint" "0"
-        setMeta conn "project" config.ProjectName
+        initSprint conn 0 "" 0 0
         conn.Close()
 
         // Create beads structure
@@ -501,7 +500,7 @@ module ConvergenceLoop =
             exit 1
 
         let conn = initSchema dbPath
-        let sprintNum = getMeta conn "sprint" |> Option.map int |> Option.defaultValue 0
+        let sprintNum = currentSprintNum conn
         let nextSprint = sprintNum + 1
         let (prevPassing, prevTotal) = passRate conn
         let prevPct = if prevTotal > 0 then float prevPassing / float prevTotal * 100.0 else 0.0
@@ -531,6 +530,11 @@ module ConvergenceLoop =
             let sprintBeadId = Beads.create $"Sprint {nextSprint}: {targetBucket}" $"Fix {failing} failures in '{targetBucket}'." "task" 1
             Beads.claim sprintBeadId
             Beads.note sprintBeadId $"Pre: {prevPassing}/{prevTotal} ({prevPct:F1}%%)"
+
+            // Record sprint in DB
+            let sprintConn = initSchema dbPath
+            initSprint sprintConn nextSprint targetBucket prevPassing prevTotal
+            sprintConn.Close()
 
             printfn $"Running implementor (briefing: {briefingText.Length / 4} est. tokens)..."
             let (implOutput, sessionId) = Agent.run briefingText $"Impl-S{nextSprint}" None
@@ -603,7 +607,7 @@ module ConvergenceLoop =
             let (finalPassing, finalTotal) = passRate finalConn
             let finalPct = if finalTotal > 0 then float finalPassing / float finalTotal * 100.0 else 0.0
             let delta = finalPassing - prevPassing
-            setMeta finalConn "sprint" (string nextSprint)
+            finalizeSprint finalConn finalPassing finalTotal
             finalConn.Close()
 
             archiveAndReset nextSprint
@@ -632,10 +636,8 @@ module ConvergenceLoop =
             let dbPath = currentDbPath()
             if File.Exists dbPath then
                 let conn = initSchema dbPath
-                let sprint = getMeta conn "sprint" |> Option.defaultValue "0"
                 let brief = briefing conn
                 conn.Close()
-                printfn $"║  Sprint: {sprint}"
                 printfn $"║  {brief}"
             printfn $"╠══════════════════════════════════════════════════════╣"
             printfn $"{Beads.status()}"
