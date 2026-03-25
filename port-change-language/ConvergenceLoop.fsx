@@ -84,9 +84,9 @@ module Beads =
 // ═════════════════════════════════════════════════════════════════════════════
 
 module Knowledge =
-    let private adrDir (config: ProjectConfig) = Path.Combine(config.TargetDir, "adr")
-    let private skillsDir (config: ProjectConfig) = Path.Combine(config.TargetDir, ".github", "skills")
-    let private instructionsFile (config: ProjectConfig) = Path.Combine(config.TargetDir, ".github", "copilot-instructions.md")
+    let private adrDir (config: ProjectConfig) = Path.Combine(targetDir(), "adr")
+    let private skillsDir (config: ProjectConfig) = Path.Combine(targetDir(), ".github", "skills")
+    let private instructionsFile (config: ProjectConfig) = Path.Combine(targetDir(), ".github", "copilot-instructions.md")
 
     /// Ensure knowledge directories exist.
     let ensureDirs (config: ProjectConfig) =
@@ -220,7 +220,7 @@ module BriefingPack =
         String.concat "\n\n" [
             "<context>"
             $"We are porting a codebase from {config.SourceLang} to {config.TargetLang}, per partes."
-            $"Source: {config.SourceDir} (read-only reference). Target: {config.TargetDir} (you work here)."
+            $"Source: {config.SourceDir} (read-only reference). Target: {targetDir()} (you work here)."
             "This is NOT a one-shot port. We improve incrementally — each sprint increases the % of passing tests."
             "Your .github/copilot-instructions.md has project conventions. Read adr/INDEX.md for architecture decisions."
             "Code changes flow via git commits. Each commit should build and pass tests."
@@ -245,8 +245,7 @@ module BriefingPack =
 
             "<task>"
             $"Increase the passing test rate. Focus on bucket '{targetBucket}' (or pick from alternatives if you justify it)."
-            $"Build: {config.BuildCommand}"
-            $"Test: {config.TestCommand}"
+            "Build and test using the commands from .github/copilot-instructions.md."
             "Commit your changes with a descriptive message."
             "</task>"
         ]
@@ -276,7 +275,7 @@ module Agent =
                 "--stream"; "off"
             |]
             let result =
-                cli { Exec "copilot"; Arguments args; WorkingDirectory config.TargetDir }
+                cli { Exec "copilot"; Arguments args }
                 |> Command.execute
             let output = result.Text |> Option.defaultValue ""
             (output, sessionId)
@@ -358,7 +357,7 @@ Output exactly one of VERIFY_PASSED or VERIFY_FAILED on its own line at the end.
                 // Expert review = invoke the named agent directly. Its .md agent definition provides context.
                 getPrompt verifierName
             else
-                let filledPreamble = preamble.Replace("{targetDir}", config.TargetDir)
+                let filledPreamble = preamble.Replace("{targetDir}", targetDir())
                 String.concat "\n\n" [ filledPreamble; getPrompt verifierName ]
         let (output, sessionId) = Agent.run prompt title None
         let (passed, fullOutput) = parseVerdict output sessionId verifierName
@@ -387,7 +386,7 @@ module KnowledgeRefiner =
     let refine (config: ProjectConfig) (sprintNum: int) =
         let prompt = String.concat "\n" [
             $"You are a knowledge refinement agent. Sprint {sprintNum} just completed successfully."
-            $"Working directory: {config.TargetDir}"
+            $"Working directory: {targetDir()}"
             ""
             "Review what was done this sprint and decide if any learnings should be captured."
             "Most sprints produce NO learnings worth capturing. Only act on genuinely non-trivial insights."
@@ -414,7 +413,7 @@ module KnowledgeRefiner =
             "  - Follow the Anthropic style guide for conciseness"
             ""
             "OPTION 4 (BIG decisions only): Write an ADR in adr/"
-            $"  - Read the index: `cat {config.TargetDir}/adr/INDEX.md`"
+            $"  - Read the index: `cat {targetDir()}/adr/INDEX.md`"
             "  - Only for non-trivial ARCHITECTURE decisions that are impactful and worth recording"
             "  - Format: adr/NNNN-title.md with Status, Context, Decision, Consequences"
             "  - Update adr/INDEX.md with a one-line summary"
@@ -443,7 +442,7 @@ module ConvergenceLoop =
 
     let private ensureInit () =
         let config = require()
-        let key = projectKey config.TargetDir
+        let key = projectKey (targetDir())
         let dbPath = currentDbPath key
         if not (File.Exists dbPath) then
             let conn = initSchema dbPath
@@ -583,7 +582,7 @@ module ConvergenceLoop =
     let showStatus () =
         match load() with
         | Some config ->
-            let key = projectKey config.TargetDir
+            let key = projectKey (targetDir())
             printfn $"{config.ProjectName}: {config.SourceLang} -> {config.TargetLang}"
             if File.Exists (currentDbPath key) then
                 let c = initSchema (currentDbPath key) in printfn $"{briefing c}"; c.Close()

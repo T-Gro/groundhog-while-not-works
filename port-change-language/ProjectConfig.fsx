@@ -26,26 +26,22 @@ module ProjectConfig =
     type ProjectConfig = {
         ProjectName: string
         SourceDir: string
-        TargetDir: string
-        SourceLang: string          // discovered during init
-        TargetLang: string          // discovered during init
-        SourceFileGlob: string      // glob for source files to port
-        TestSampleGlob: string      // glob for test input/sample files
-        TestSampleDir: string       // where test samples live in source
-        GoldenDir: string           // where golden reference files go
-        BuildCommand: string        // target-language build command
-        LintCommand: string         // target-language lint/vet command
-        TestCommand: string         // target-language test command
-        OracleRunCommand: string    // command to run original tool on a sample
-        OracleCompareCommand: string // command to compare output vs golden
+        SourceLang: string
+        TargetLang: string
+        SourceFileGlob: string
+        TestSampleGlob: string
+        TestSampleDir: string
+        GoldenDir: string
         Layers: LayerConfig list
         MaxTokensPerSprint: int
         MaxIterationsPerSprint: int
-        BackpressureThreshold: int
     }
 
-    let private configPath () =
-        Path.Combine(__SOURCE_DIRECTORY__, "project.json")
+    /// Target dir = wherever the user launched from (cwd).
+    let targetDir () = Environment.CurrentDirectory
+
+    /// project.json lives in the target repo root (cwd).
+    let private configPath () = Path.Combine(targetDir(), "project.json")
 
     let private jsonOptions =
         let opts = JsonSerializerOptions(WriteIndented = true)
@@ -69,26 +65,18 @@ module ProjectConfig =
         match load() with
         | Some c -> c
         | None ->
-            eprintfn "No project.json found. Run 'init' first."
+            eprintfn $"No project.json found in {targetDir()}. Create one first."
             exit 1
 
-    /// Create a default config — the init command will override these with discovered values.
-    let createDefault (sourceDir: string) (targetDir: string) : ProjectConfig =
-        { ProjectName = Path.GetFileName(sourceDir)
+    let createDefault (sourceDir: string) : ProjectConfig =
+        { ProjectName = Path.GetFileName(targetDir())
           SourceDir = sourceDir
-          TargetDir = targetDir
           SourceLang = "unknown"
           TargetLang = "unknown"
           SourceFileGlob = "*.*"
           TestSampleGlob = "*.*"
           TestSampleDir = ""
-          GoldenDir = Path.Combine(targetDir, "testdata", "golden")
-          BuildCommand = "echo 'no build command configured'"
-          LintCommand = "echo 'no lint command configured'"
-          TestCommand = "echo 'no test command configured'"
-          OracleRunCommand = "echo 'no oracle command configured'"
-          OracleCompareCommand = "echo 'no compare command configured'"
+          GoldenDir = Path.Combine(targetDir(), "testdata", "golden")
           Layers = []
           MaxTokensPerSprint = 60_000
-          MaxIterationsPerSprint = 15
-          BackpressureThreshold = 3 }
+          MaxIterationsPerSprint = 15 }
