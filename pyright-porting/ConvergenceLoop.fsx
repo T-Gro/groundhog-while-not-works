@@ -2,25 +2,33 @@
 
 /// ConvergenceLoop — Re-entrant, language-agnostic porting orchestrator.
 ///
-/// All state lives in beads (bd). This script is designed to be interrupted
-/// and restarted at any time. Each invocation does exactly ONE step.
+/// INFORMATION FLOW:
+///   Code changes       → git commits
+///   Decisions/learnings → adr/ folder (.md files with index) + .github/copilot-instructions.md
+///   Subtask progress   → beads (bd)
+///   Test pass/fail     → per-sprint SQLite DBs (TestResultsDb)
+///   Agent skills       → .github/skills/ (agents auto-discover these)
 ///
-/// Project-specific knowledge comes from:
-///   - project.json (created during init — build/test commands, layers, paths)
-///   - hints/ (generated during init — architecture docs, patterns)
-///   - beads memories (accumulated during execution — learned patterns, gotchas)
+/// MAIN LOOP (each invocation = one step):
+///   1. Receive context: test DB briefing, previous sprint summary, overall plan
+///   2. Implementor: try improve (fresh session with briefing, or --resume from verifier)
+///   3. Recalculate stats: re-run tests, update DB, HARD GATE on regression
+///   4. Code quality review: verifier agent (read-only, plans actions for implementor)
+///   5. Code dedup/engineering: verifier agent (read-only, plans actions)
+///   6. Semantic search / rot prevention: verifier agent (read-only, plans actions)
+///   If any verifier fails → resume implementor session with feedback, go to step 2
 ///
-/// The harness knows NOTHING about source/target languages until init runs.
+/// VERIFIER CONTRACT:
+///   Verifiers do NOT make code changes. They produce a verdict + action plan.
+///   On failure: the implementor is resumed (--resume sessionId) with verifier feedback.
+///   On pass: next verifier runs, or sprint completes.
 ///
-/// Usage:
-///   dotnet fsi ConvergenceLoop.fsx init <source-dir> <target-dir>
-///   dotnet fsi ConvergenceLoop.fsx step [--auto]
-///   dotnet fsi ConvergenceLoop.fsx status
-///   dotnet fsi ConvergenceLoop.fsx analyze
+/// SESSION MANAGEMENT:
+///   Fresh start: implementor gets briefing pack (plan, test DB, learnings, context)
+///   Resume: implementor gets verifier feedback only (briefing was already in context)
 
 #load "ProjectConfig.fsx"
-#load "ContextBuilder.fsx"
-#load "FailureAnalyzer.fsx"
+#load "TestResultsDb.fsx"
 
 #r "nuget: Fli"
 
@@ -28,333 +36,510 @@ open System
 open System.IO
 open Fli
 open ProjectConfig.ProjectConfig
-open ContextBuilder.ContextBuilder
-open FailureAnalyzer.FailureAnalyzer
+open TestResultsDb.TestResultsDb
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Beads — task tracking
+// ═════════════════════════════════════════════════════════════════════════════
 
 module Beads =
-    let private bdExe =
-        // Find bd on PATH or at known location
+    let private findBd () =
         let known = @"Q:\.tools\beads\bd.exe"
         if File.Exists known then known else "bd"
 
     let private ensurePath () =
-        let doltDir = @"Q:\.tools\dolt\dolt-windows-amd64\bin"
-        let beadsDir = Path.GetDirectoryName(bdExe)
         let path = Environment.GetEnvironmentVariable("PATH")
-        if not (path.Contains(beadsDir)) then
-            Environment.SetEnvironmentVariable("PATH", $"{beadsDir};{doltDir};{path}")
+        for d in [@"Q:\.tools\beads"; @"Q:\.tools\dolt\dolt-windows-amd64\bin"] do
+            if not (path.Contains(d)) then
+                Environment.SetEnvironmentVariable("PATH", $"{d};{path}")
 
-    /// Run a bd command and return stdout.
     let run (args: string list) : string =
         ensurePath ()
         try
             let result =
-                cli {
-                    Exec bdExe
-                    Arguments (args |> Array.ofList)
-                    WorkingDirectory __SOURCE_DIRECTORY__
-                }
+                cli { Exec (findBd()); Arguments (args |> Array.ofList); WorkingDirectory __SOURCE_DIRECTORY__ }
                 |> Command.execute
             result.Text |> Option.defaultValue ""
-        with ex ->
-            eprintfn $"bd error: {ex.Message}"
-            ""
+        with ex -> eprintfn $"bd: {ex.Message}"; ""
 
-    let create title desc issueType priority : string =
-        let output = run ["create"; $"--title={title}"; $"--description={desc}"; $"--type={issueType}"; $"--priority={priority}"]
-        output.Trim()
-
-    let addDep issueId dependsOn = run ["dep"; "add"; issueId; dependsOn] |> ignore
-    let claim issueId = run ["update"; issueId; "--claim"] |> ignore
-    let close issueId reason = run ["close"; issueId; $"--reason={reason}"] |> ignore
-    let note issueId text = run ["note"; issueId; text] |> ignore
+    let create title desc itype prio = run ["create"; $"--title={title}"; $"--description={desc}"; $"--type={itype}"; $"--priority={prio}"] |> fun s -> s.Trim()
+    let addDep a b = run ["dep"; "add"; a; b] |> ignore
+    let claim id = run ["update"; id; "--claim"] |> ignore
+    let close id reason = run ["close"; id; $"--reason={reason}"] |> ignore
+    let note id text = run ["note"; id; text] |> ignore
     let remember text = run ["remember"; text] |> ignore
     let ready () = run ["ready"]
     let listOpen () = run ["list"; "--status=open"]
     let status () = run ["status"]
 
+// ═════════════════════════════════════════════════════════════════════════════
+// Toolchain — run build/test commands from project.json
+// ═════════════════════════════════════════════════════════════════════════════
+
 module Toolchain =
-    /// Run a shell command. Returns (success, stdout+stderr).
-    let runCommand (workDir: string) (command: string) : bool * string =
+    let runCmd (workDir: string) (command: string) : bool * string =
         try
             let parts = command.Split([|' '|], 2)
-            let exec = parts.[0]
-            let args = if parts.Length > 1 then parts.[1].Split(' ') else [||]
             let result =
-                cli {
-                    Exec exec
-                    Arguments args
-                    WorkingDirectory workDir
-                }
+                cli { Exec parts.[0]; Arguments (if parts.Length > 1 then parts.[1].Split(' ') else [||]); WorkingDirectory workDir }
                 |> Command.execute
-            let output = (result.Text |> Option.defaultValue "") + "\n" + (result.Error |> Option.defaultValue "")
-            (result.ExitCode = 0, output.Trim())
+            let out = (result.Text |> Option.defaultValue "") + "\n" + (result.Error |> Option.defaultValue "")
+            (result.ExitCode = 0, out.Trim())
         with ex -> (false, ex.Message)
 
-    /// Run the build command from project config.
-    let build (config: ProjectConfig) = runCommand config.TargetDir config.BuildCommand
+    let build (c: ProjectConfig) = runCmd c.TargetDir c.BuildCommand
+    let lint  (c: ProjectConfig) = runCmd c.TargetDir c.LintCommand
+    let test  (c: ProjectConfig) = runCmd c.TargetDir c.TestCommand
 
-    /// Run the lint command from project config.
-    let lint (config: ProjectConfig) = runCommand config.TargetDir config.LintCommand
+// ═════════════════════════════════════════════════════════════════════════════
+// ADR / Skills / Learnings — shared knowledge channels
+// ═════════════════════════════════════════════════════════════════════════════
 
-    /// Run the test command from project config. Returns (exitOk, output).
-    let test (config: ProjectConfig) = runCommand config.TargetDir config.TestCommand
+module Knowledge =
+    let private adrDir (config: ProjectConfig) = Path.Combine(config.TargetDir, "adr")
+    let private skillsDir (config: ProjectConfig) = Path.Combine(config.TargetDir, ".github", "skills")
+    let private instructionsFile (config: ProjectConfig) = Path.Combine(config.TargetDir, ".github", "copilot-instructions.md")
 
-module ConvergenceLoop =
+    /// Ensure knowledge directories exist.
+    let ensureDirs (config: ProjectConfig) =
+        Directory.CreateDirectory(adrDir config) |> ignore
+        Directory.CreateDirectory(skillsDir config) |> ignore
+        Directory.CreateDirectory(Path.GetDirectoryName(instructionsFile config)) |> ignore
 
-    let private planPath () = Path.Combine(__SOURCE_DIRECTORY__, "hints", "porting-plan.md")
+    /// Read the ADR index (compact, token-efficient routing file).
+    let readAdrIndex (config: ProjectConfig) : string =
+        let indexPath = Path.Combine(adrDir config, "INDEX.md")
+        if File.Exists indexPath then File.ReadAllText indexPath
+        else "(No ADR index yet. Agents: create adr/INDEX.md listing decision records.)"
 
-    /// Read the porting plan if one exists.
-    let readPlan () : string option =
-        let p = planPath ()
-        if File.Exists p then Some (File.ReadAllText p) else None
+    /// Read a specific ADR by name.
+    let readAdr (config: ProjectConfig) (name: string) : string option =
+        let path = Path.Combine(adrDir config, name)
+        if File.Exists path then Some (File.ReadAllText path) else None
 
-    /// Initialize the project. Optionally seed with a pre-written plan.
-    let init (sourceDir: string) (targetDir: string) (planFile: string option) =
-        printfn $"Initializing porting project..."
-        printfn $"  Source: {sourceDir}"
-        printfn $"  Target: {targetDir}"
+    /// Read all skills (agents auto-discover these).
+    let readSkills (config: ProjectConfig) : string =
+        let dir = skillsDir config
+        if Directory.Exists dir then
+            Directory.GetFiles(dir, "*.md")
+            |> Array.map (fun f -> $"### Skill: {Path.GetFileNameWithoutExtension f}\n{File.ReadAllText f}")
+            |> String.concat "\n\n"
+        else ""
 
-        if not (Directory.Exists sourceDir) then
-            eprintfn $"Source directory does not exist: {sourceDir}"
-            exit 1
+    /// Read copilot instructions.
+    let readInstructions (config: ProjectConfig) : string =
+        let path = instructionsFile config
+        if File.Exists path then File.ReadAllText path else ""
 
-        if not (Directory.Exists targetDir) then
-            Directory.CreateDirectory targetDir |> ignore
-
-        // Create default config — the user (or an agent) must fill in the blanks
-        let config = createDefault sourceDir targetDir
-        save config
-        printfn $"\n  Created project.json with default values."
-
-        // Create placeholder hints
-        let hintsDir = Path.Combine(__SOURCE_DIRECTORY__, "hints")
-        Directory.CreateDirectory hintsDir |> ignore
-
-        let placeholders = [
-            "architecture.md", "# Source Architecture\n\n> Generated during init. Describe the source codebase structure,\n> key modules, and their responsibilities here.\n> Subagents will read this to understand what they're porting."
-            "layer-boundaries.md", "# Layer Boundary Contracts\n\n> Define the interface contracts between layers here.\n> Each layer should export a compact set of types and functions.\n> Subagents receive ONLY adjacent layers' contracts, not the whole codebase."
-            "type-patterns.md", "# Type/Structure Translation Patterns\n\n> Document how source-language patterns map to target-language idioms.\n> This is the subagents' reference sheet for consistent translation."
+    /// Build the "learnings" section for agent context.
+    /// Only non-trivial, deep, repo-specific decisions — NOT basic type mappings.
+    let buildLearningsContext (config: ProjectConfig) : string =
+        let adrIndex = readAdrIndex config
+        let skills = readSkills config
+        let instructions = readInstructions config
+        String.concat "\n\n" [
+            if not (String.IsNullOrWhiteSpace instructions) then
+                "<copilot_instructions>"
+                instructions
+                "</copilot_instructions>"
+            if not (String.IsNullOrWhiteSpace adrIndex) then
+                "<adr_index>"
+                adrIndex
+                "</adr_index>"
+            if not (String.IsNullOrWhiteSpace skills) then
+                "<skills>"
+                skills
+                "</skills>"
         ]
 
-        for (name, content) in placeholders do
-            let path = Path.Combine(hintsDir, name)
-            if not (File.Exists path) then
-                File.WriteAllText(path, content)
-                printfn $"  Created hints/{name} (placeholder — fill in during setup)"
+    /// Guidance for agents on HOW to write ADRs and skills.
+    let writingGuidance () : string = """
+<knowledge_sharing>
+You can share learnings with future sprints via these channels:
 
-        // Copy plan file if provided
+1. **ADR (Architecture Decision Records)** — for non-trivial design decisions:
+   - Create files in `adr/NNNN-title.md` (NNNN = sequential number)
+   - Update `adr/INDEX.md` with a one-line summary + file pointer
+   - Example: "0003-sum-type-pattern.md" documenting the chosen union type approach
+   - Only write ADRs for DEEP decisions, not obvious translations
+
+2. **Skills** — for reusable agent techniques:
+   - Create files in `.github/skills/skill-name.md`
+   - Agents auto-discover these. Keep them actionable and concise.
+   - Example: "error-wrapping.md" on the project's error handling convention
+
+3. **Copilot instructions** — for global project context:
+   - Edit `.github/copilot-instructions.md`
+   - This is read by ALL copilot sessions in this repo
+   - Keep it compact — overall project context, not per-sprint details
+
+DO NOT store trivial mappings (number→int). Store DEEP insights:
+- Discovered circular dependency requiring specific initialization order
+- Non-obvious semantic difference between source and target behavior
+- Performance-critical path requiring specific implementation pattern
+</knowledge_sharing>"""
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Briefing Pack — what the implementor receives on a FRESH start
+// ═════════════════════════════════════════════════════════════════════════════
+
+module BriefingPack =
+    let private readHint (name: string) : string =
+        let path = Path.Combine(__SOURCE_DIRECTORY__, "hints", name)
+        if File.Exists path then File.ReadAllText path else ""
+
+    /// Build the full briefing pack for a fresh implementor session.
+    let build
+        (config: ProjectConfig)
+        (sprintNum: int)
+        (targetBucket: string)
+        (testDbBriefing: string)
+        (failingSamples: (string * string) list)
+        (totalTestCount: int)
+        : string =
+
+        let plan = readHint "porting-plan.md"
+        let layers = readHint "layer-boundaries.md"
+        let patterns = readHint "type-patterns.md"
+        let learnings = Knowledge.buildLearningsContext config
+
+        // Truncate plan to ~3K tokens if too large
+        let planSection =
+            if String.IsNullOrWhiteSpace plan then ""
+            else
+                let maxChars = 12_000
+                let truncated = if plan.Length <= maxChars then plan else plan.Substring(0, maxChars) + "\n_(truncated)_"
+                $"<porting_plan>\n{truncated}\n</porting_plan>"
+
+        let failuresSection =
+            let shown = failingSamples |> List.truncate 25
+            let lines = shown |> List.map (fun (f, e) -> $"  {f}: {e}")
+            String.concat "\n" [
+                $"<failing_tests count=\"{failingSamples.Length}\" showing=\"{shown.Length}\">"
+                yield! lines
+                if failingSamples.Length > 25 then $"  ... and {failingSamples.Length - 25} more"
+                "</failing_tests>"
+            ]
+
+        String.concat "\n\n" [
+            $"<sprint num=\"{sprintNum}\" bucket=\"{targetBucket}\">"
+            $"Source: {config.SourceLang} | Target: {config.TargetLang}"
+            $"Source dir: {config.SourceDir} | Target dir: {config.TargetDir}"
+            "</sprint>"
+
+            $"<test_summary total=\"{totalTestCount}\">\n{testDbBriefing}\n</test_summary>"
+
+            "<guards>"
+            $"Total test count must remain >= {totalTestCount}. Deleting tests to fake progress = instant fail."
+            "Passing rate must not decrease. Regressions are hard-gated."
+            "</guards>"
+
+            planSection
+            failuresSection
+
+            if not (String.IsNullOrWhiteSpace layers) then $"<layer_contracts>\n{layers}\n</layer_contracts>"
+            if not (String.IsNullOrWhiteSpace patterns) then $"<translation_patterns>\n{patterns}\n</translation_patterns>"
+            if not (String.IsNullOrWhiteSpace learnings) then learnings
+
+            Knowledge.writingGuidance ()
+
+            "<instructions>"
+            "You are an implementor. Your goal: increase the passing test rate."
+            $"Focus on bucket '{targetBucket}'. Fix as many failing tests as you can."
+            "After making changes, run the build and test commands to verify."
+            $"Build: {config.BuildCommand}"
+            $"Test: {config.TestCommand}"
+            "Commit your changes with a descriptive message."
+            "If you discover a non-trivial insight, write an ADR or skill file."
+            "</instructions>"
+        ]
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Agent Runner — run copilot agents with session management
+// ═════════════════════════════════════════════════════════════════════════════
+
+module Agent =
+    /// Run a copilot agent. Returns (output, sessionId).
+    let run (prompt: string) (title: string) (resumeSessionId: string option) : string * string =
+        let sessionId = resumeSessionId |> Option.defaultWith (fun () -> Guid.NewGuid().ToString())
+        try
+            let baseArgs = [| "--allow-all-tools"; "--allow-all-paths"; "--no-ask-user"; "--no-color"; "--plain-diff"; "-s"; "--stream"; "off"; "--resume"; sessionId |]
+            let escapedPrompt = prompt.Replace("{", "{{").Replace("}", "}}")
+            let result =
+                cli { Exec "copilot"; Arguments baseArgs; Input escapedPrompt }
+                |> Command.execute
+            let output = result.Text |> Option.defaultValue ""
+            (output, sessionId)
+        with ex ->
+            eprintfn $"Agent '{title}' failed: {ex.Message}"
+            ("", sessionId)
+
+    /// Resume a session with follow-up (verifier feedback → implementor).
+    let resume (sessionId: string) (feedback: string) (title: string) : string =
+        let (output, _) = run feedback title (Some sessionId)
+        output
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Verifiers — read-only reviewers that plan actions for the implementor
+// ═════════════════════════════════════════════════════════════════════════════
+
+module Verifiers =
+    let private verifiersDir = Path.Combine(__SOURCE_DIRECTORY__, "verifiers")
+
+    let listAll () : string list =
+        if Directory.Exists verifiersDir then
+            Directory.GetFiles(verifiersDir, "*.md")
+            |> Array.map Path.GetFileNameWithoutExtension
+            |> Array.sort
+            |> Array.toList
+        else []
+
+    let getPrompt (name: string) : string =
+        let path = Path.Combine(verifiersDir, name + ".md")
+        if File.Exists path then File.ReadAllText path else $"(verifier {name} not found)"
+
+    let preamble = """
+=== YOU ARE A VERIFIER AGENT ===
+You REVIEW code. You do NOT make code changes.
+Your job: assess quality and plan actions for the implementor.
+
+- VERIFY_PASSED = work is acceptable, move on.
+- VERIFY_FAILED = problems found. Your feedback becomes the implementor's next task.
+  Write SPECIFIC, ACTIONABLE instructions the implementor can follow.
+  "Fix the bug in X by doing Y" — not "there are some issues."
+
+Output exactly one of VERIFY_PASSED or VERIFY_FAILED on its own line at the end.
+"""
+
+    /// Run a verifier agent. Returns (passed, feedback).
+    let runVerifier (config: ProjectConfig) (verifierName: string) : bool * string =
+        let prompt = String.concat "\n\n" [
+            preamble
+            getPrompt verifierName
+            $"\nTarget directory: {config.TargetDir}"
+            $"\nRun this to see the diff:"
+            $"  cd {config.TargetDir} && git diff HEAD~1"
+        ]
+        let (output, _) = Agent.run prompt $"Verify-{verifierName}" None
+        let passed = output.Contains("VERIFY_PASSED") && not (output.Contains("VERIFY_FAILED"))
+        (passed, output)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// The Main Loop
+// ═════════════════════════════════════════════════════════════════════════════
+
+module ConvergenceLoop =
+    let private planPath () = Path.Combine(__SOURCE_DIRECTORY__, "hints", "porting-plan.md")
+
+    /// Initialize a new porting project.
+    let init (sourceDir: string) (targetDir: string) (planFile: string option) =
+        printfn $"Initializing porting project: {sourceDir} → {targetDir}"
+
+        if not (Directory.Exists sourceDir) then eprintfn $"Source not found: {sourceDir}"; exit 1
+        if not (Directory.Exists targetDir) then Directory.CreateDirectory targetDir |> ignore
+
+        let config = createDefault sourceDir targetDir
+        save config
+
+        // Create hint placeholders
+        let hintsDir = Path.Combine(__SOURCE_DIRECTORY__, "hints")
+        Directory.CreateDirectory hintsDir |> ignore
+        for (name, content) in [
+            "architecture.md", "# Source Architecture\n\n> Describe source codebase structure for subagents."
+            "layer-boundaries.md", "# Layer Boundary Contracts\n\n> Interface contracts between layers."
+            "type-patterns.md", "# Translation Patterns\n\n> How source patterns map to target idioms." ] do
+            let p = Path.Combine(hintsDir, name)
+            if not (File.Exists p) then File.WriteAllText(p, content)
+
+        // Copy plan if provided
         match planFile with
         | Some pf when File.Exists pf ->
-            let dest = planPath ()
-            File.Copy(pf, dest, true)
-            printfn $"  Seeded porting plan from {pf}"
-            Beads.remember $"Porting plan loaded from {Path.GetFileName pf}. Read hints/porting-plan.md for project context."
-        | Some pf ->
-            eprintfn $"  Warning: Plan file not found: {pf}"
-        | None ->
-            printfn $"  No plan provided. You can add one later at hints/porting-plan.md"
-            printfn $"  Or re-run with: init <src> <tgt> --plan <file.md>"
+            File.Copy(pf, planPath(), true)
+            printfn $"  Seeded plan from {pf}"
+        | Some pf -> eprintfn $"  Plan file not found: {pf}"
+        | None -> printfn "  No plan. Add one at hints/porting-plan.md or re-run with --plan"
 
-        // Create beads epics for project structure
-        let epicId = Beads.create
-                        $"Port {Path.GetFileName sourceDir}"
-                        $"Full port of {Path.GetFileName sourceDir}. Test-driven convergence approach."
-                        "epic" 0
-        printfn $"  Created beads epic: {epicId}"
+        // Create knowledge dirs in target
+        Knowledge.ensureDirs config
 
-        // Create setup tasks
-        let setupId = Beads.create
-                        "Configure project.json"
-                        "Fill in project.json with correct: source/target languages, build/test/lint commands, test sample directory, oracle command, layer definitions."
-                        "task" 0
-        let hintsId = Beads.create
-                        "Generate hints files"
-                        "Analyze source codebase and generate: hints/architecture.md, hints/layer-boundaries.md, hints/type-patterns.md. Use an agent to scan the source tree."
-                        "task" 0
-        let oracleId = Beads.create
-                        "Generate golden oracle"
-                        "Run the original tool on all test samples and save expected outputs as golden reference files."
-                        "task" 0
-        Beads.addDep hintsId setupId
-        Beads.addDep oracleId setupId
+        // Init test results DB
+        let conn = initSchema (currentDbPath())
+        setMeta conn "sprint" "0"
+        setMeta conn "project" config.ProjectName
+        conn.Close()
 
-        printfn $"  Created setup tasks: {setupId}, {hintsId}, {oracleId}"
-        printfn ""
-        printfn "╔══════════════════════════════════════════════════════╗"
-        printfn "║  NEXT STEPS                                         ║"
-        printfn "╠══════════════════════════════════════════════════════╣"
-        printfn "║  1. Edit project.json — fill in build/test commands, ║"
-        printfn "║     source/target languages, layers, sample dirs     ║"
-        printfn "║  2. Generate hints/ — run an agent to analyze the    ║"
-        printfn "║     source codebase and create architecture docs     ║"
-        printfn "║  3. Generate golden oracle — run GoldenOracle.fsx    ║"
-        printfn "║  4. Start converging — run 'step' to begin           ║"
-        printfn "╚══════════════════════════════════════════════════════╝"
-        printfn ""
-        printfn "  Or let an agent do it: ask copilot to configure this project."
-        printfn "  It can read the source tree, discover languages, and fill everything in."
+        // Create beads structure
+        let epicId = Beads.create $"Port {Path.GetFileName sourceDir}" "Test-driven convergence porting." "epic" 0
+        Beads.create "Configure project.json" "Fill in build/test commands, languages, layers, sample dirs." "task" 0 |> ignore
+        Beads.create "Generate hints" "Analyze source, create architecture.md, layer-boundaries.md, type-patterns.md." "task" 0 |> ignore
+        Beads.create "Generate golden oracle" "Run original tool on all samples, save expected outputs." "task" 0 |> ignore
 
-    /// Execute one convergence step. Re-entrant — safe to call repeatedly.
-    let step (autoApprove: bool) =
+        printfn $"\n  Created project.json, test DB, beads epic ({epicId})"
+        printfn "  Next: fill in project.json, generate hints, then run 'step'"
+
+    /// Execute one convergence step.
+    ///
+    /// Flow:
+    ///   1. Read test DB → find highest-impact failing bucket
+    ///   2. Build briefing pack → run implementor (fresh session)
+    ///   3. Re-run tests → update DB → check for regression (HARD GATE)
+    ///   4. Run verifiers (read-only) → if fail, resume implementor with feedback → goto 3
+    ///   5. Sprint passes → archive DB, update beads, exit
+    let step (maxRetries: int) =
         let config = require()
         printfn $"Project: {config.ProjectName} ({config.SourceLang} → {config.TargetLang})"
 
-        // Check what's ready in beads
-        let readyOutput = Beads.ready ()
-        if String.IsNullOrWhiteSpace readyOutput || readyOutput.Contains("No ready") then
-            printfn "No ready work found."
-            printfn "  Check: bd blocked"
-            printfn "  Or close completed tasks to unblock next work."
-        else
-            printfn $"Ready work:\n{readyOutput}"
+        // 1. Read current test state
+        let dbPath = currentDbPath()
+        if not (File.Exists dbPath) then
+            eprintfn "No test results DB. Run oracle population first."
+            exit 1
 
-        // Run current metrics
-        printfn "\nCurrent metrics:"
-        let (buildOk, buildOutput) = Toolchain.build config
-        printfn $"  Build: {if buildOk then "✅" else "❌"}"
+        let conn = initSchema dbPath
+        let sprintNum = getMeta conn "sprint" |> Option.map int |> Option.defaultValue 0
+        let nextSprint = sprintNum + 1
+        let (prevPassing, prevTotal) = passRate conn
+        let prevPct = if prevTotal > 0 then float prevPassing / float prevTotal * 100.0 else 0.0
 
-        if not buildOk then
-            printfn $"  Build errors (fix before proceeding):\n{buildOutput |> fun s -> if s.Length > 500 then s.Substring(0, 500) + "..." else s}"
-            // Create a fix-build task if one doesn't exist
-            let fixId = Beads.create "Fix build errors" $"Build command '{config.BuildCommand}' fails. Errors:\n{buildOutput |> fun s -> if s.Length > 1000 then s.Substring(0, 1000) else s}" "bug" 0
-            Beads.claim fixId
-            printfn $"  Created fix task: {fixId}"
-        else
-            let (lintOk, _) = Toolchain.lint config
-            printfn $"  Lint:  {if lintOk then "✅" else "⚠️"}"
+        printfn $"Sprint {nextSprint} | Current: {prevPassing}/{prevTotal} passing ({prevPct:F1}%%)"
 
-            let (testOk, testOutput) = Toolchain.test config
-            printfn $"  Tests: {if testOk then "✅" else "❌"}"
-
-            // Analyze failures
-            let failures = collectFailures config
-            if failures.Length > 0 then
-                let groups = groupFailures failures
-                let totalSamples = failures.Length + 10 // approximate — proper count from oracle
-                let passingApprox = totalSamples - failures.Length
-                printReport groups totalSamples passingApprox
-
-                match selectNextTarget groups with
-                | Some target ->
-                    printfn $"\n→ Next sprint: Fix '{target.Feature}' ({target.Count} samples)"
-
-                    // Create sprint bead
-                    let sprintId = Beads.create
-                                    $"Sprint: Fix {target.Feature}"
-                                    $"Fix {target.Count} failing samples in '{target.Feature}'. Representative: {target.Samples |> List.truncate 3 |> String.concat ", "}"
-                                    "task" 1
-                    Beads.claim sprintId
-                    Beads.note sprintId $"Pre-sprint failures: {target.Count}"
-
-                    // Build context for the agent
-                    let layerId =
-                        config.Layers
-                        |> List.tryFind (fun l -> l.Name.Contains(target.Feature))
-                        |> Option.map (fun l -> l.Id)
-                        |> Option.defaultValue "L0"
-                    let sourceDirs = featureToSourceDirs config target.Feature
-                    let sourceFiles =
-                        sourceDirs
-                        |> List.collect (fun dir ->
-                            let fullDir = Path.Combine(config.SourceDir, dir)
-                            if Directory.Exists fullDir then
-                                Directory.GetFiles(fullDir, config.SourceFileGlob, SearchOption.AllDirectories)
-                                |> Array.map (fun f -> Path.GetRelativePath(config.SourceDir, f))
-                                |> Array.toList
-                            else [])
-
-                    let failurePairs = failures |> List.map (fun f -> (f.SampleFile, f.ErrorMessage))
-                    let context = buildSprintContext config layerId target.Feature sourceFiles failurePairs 0.0 5.0
-                    reportBudget context
-
-                    if autoApprove then
-                        printfn "Auto-approve mode — would execute sprint here via Ralph."
-                        // Sprint.runRalph context true
-                    else
-                        printfn $"\nSprint context ready ({estimateTokens context} tokens)."
-                        printfn "Run with --auto to execute, or invoke Ralph manually."
-
-                | None ->
-                    printfn "✓ No actionable failures found."
-            else
-                printfn "✓ No failures detected. Check oracle comparison for convergence metric."
-
-    /// Print current status from beads + toolchain.
-    let showStatus () =
-        let configOpt = load()
-
-        printfn "╔══════════════════════════════════════════════════════╗"
-        printfn "║  CONVERGENCE STATUS                                  ║"
-        printfn "╠══════════════════════════════════════════════════════╣"
-
-        match configOpt with
-        | Some config ->
-            printfn $"║  Project: {config.ProjectName}"
-            printfn $"║  {config.SourceLang} → {config.TargetLang}"
-            printfn $"║  Source:  {config.SourceDir}"
-            printfn $"║  Target:  {config.TargetDir}"
-
-            if Directory.Exists config.TargetDir then
-                let (buildOk, _) = Toolchain.build config
-                printfn $"║  Build:   {if buildOk then "✅" else "❌"}"
-                if buildOk then
-                    let (testOk, _) = Toolchain.test config
-                    printfn $"║  Tests:   {if testOk then "✅" else "❌"}"
+        // Find highest-impact bucket
+        let ranked = bucketsRanked conn
+        match ranked |> List.tryHead with
         | None ->
-            printfn "║  No project.json — run init first"
+            printfn "✓ No failing buckets. All tests pass!"
+            conn.Close()
+        | Some (targetBucket, layer, failing, bucketTotal) ->
+            printfn $"Target: '{targetBucket}' ({layer}) — {failing}/{bucketTotal} failing"
 
-        printfn "╠══════════════════════════════════════════════════════╣"
-        let beadsStatus = Beads.status ()
-        printfn $"{beadsStatus}"
-        printfn "╠══════════════════════════════════════════════════════╣"
-        let readyWork = Beads.ready ()
-        if not (String.IsNullOrWhiteSpace readyWork) then
-            printfn $"Ready:\n{readyWork}"
-        else
-            printfn "No ready work."
-        printfn "╚══════════════════════════════════════════════════════╝"
+            let failures = failingInBucket conn targetBucket 30
+            let testBriefing = briefing conn
+            conn.Close()
 
-    /// Run failure analysis only (no sprint execution).
-    let analyze () =
-        let config = require()
-        let failures = collectFailures config
-        if failures.Length > 0 then
-            let groups = groupFailures failures
-            let total = failures.Length + 10
-            printReport groups total (total - failures.Length)
-        else
-            printfn "No failures to analyze (or test command not producing parseable output)."
+            // 2. Build briefing & run implementor
+            let briefingText = BriefingPack.build config nextSprint targetBucket testBriefing failures prevTotal
+            let sprintBeadId = Beads.create $"Sprint {nextSprint}: {targetBucket}" $"Fix {failing} failures in '{targetBucket}'." "task" 1
+            Beads.claim sprintBeadId
+            Beads.note sprintBeadId $"Pre: {prevPassing}/{prevTotal} ({prevPct:F1}%%)"
+
+            printfn $"Running implementor (briefing: {briefingText.Length / 4} est. tokens)..."
+            let (implOutput, sessionId) = Agent.run briefingText $"Impl-S{nextSprint}" None
+            printfn $"Implementor done ({implOutput.Length} chars output)"
+
+            // 3-6. Verify loop (with retries via session resume)
+            let mutable retryCount = 0
+            let mutable allPassed = false
+
+            while retryCount < maxRetries && not allPassed do
+                // 3. Re-run tests, update DB
+                printfn $"\nRecalculating stats (attempt {retryCount + 1})..."
+                let (buildOk, buildOut) = Toolchain.build config
+                if not buildOk then
+                    printfn $"❌ Build failed. Resuming implementor with errors..."
+                    let feedback = $"BUILD FAILED. Fix these errors:\n{buildOut |> fun s -> if s.Length > 3000 then s.[..2999] else s}"
+                    Agent.resume sessionId feedback $"Fix-build-S{nextSprint}" |> ignore
+                    retryCount <- retryCount + 1
+                else
+                    let (testOk, testOut) = Toolchain.test config
+                    // TODO: parse test output, update test DB
+                    printfn $"  Build: ✅ | Tests: {if testOk then "✅" else "❌"}"
+
+                    // Regression check
+                    let newConn = initSchema dbPath
+                    let (newPassing, newTotal) = passRate newConn
+                    newConn.Close()
+
+                    if newTotal < prevTotal then
+                        printfn $"❌ REGRESSION: test count dropped {prevTotal}→{newTotal}. Reverting."
+                        let feedback = $"REGRESSION DETECTED: Total tests dropped from {prevTotal} to {newTotal}. You deleted tests. Revert and fix properly."
+                        Agent.resume sessionId feedback $"Fix-regression-S{nextSprint}" |> ignore
+                        retryCount <- retryCount + 1
+                    elif newPassing < prevPassing then
+                        printfn $"❌ REGRESSION: passing dropped {prevPassing}→{newPassing}."
+                        let feedback = $"REGRESSION: Passing tests dropped from {prevPassing} to {newPassing}. Fix without breaking what worked."
+                        Agent.resume sessionId feedback $"Fix-regression-S{nextSprint}" |> ignore
+                        retryCount <- retryCount + 1
+                    else
+                        // 4-5-6. Run verifiers (read-only, plan actions)
+                        let softVerifiers = ["V06-CODE-QUALITY"; "V07-DEDUP"; "V09-HONEST-ASSESSMENT"]
+                        let mutable verifiersPassed = true
+
+                        for vName in softVerifiers do
+                            if verifiersPassed && retryCount < maxRetries then
+                                printfn $"  Running {vName}..."
+                                let (passed, feedback) = Verifiers.runVerifier config vName
+                                if passed then
+                                    printfn $"  ✅ {vName}"
+                                else
+                                    printfn $"  ❌ {vName} — resuming implementor with feedback"
+                                    // Resume implementor with verifier's action plan
+                                    let truncFeedback = if feedback.Length > 4000 then feedback.[..3999] else feedback
+                                    Agent.resume sessionId truncFeedback $"Fix-{vName}-S{nextSprint}" |> ignore
+                                    verifiersPassed <- false
+                                    retryCount <- retryCount + 1
+
+                        if verifiersPassed then
+                            allPassed <- true
+
+            // Finalize
+            let finalConn = initSchema dbPath
+            let (finalPassing, finalTotal) = passRate finalConn
+            let finalPct = if finalTotal > 0 then float finalPassing / float finalTotal * 100.0 else 0.0
+            let delta = finalPassing - prevPassing
+            setMeta finalConn "sprint" (string nextSprint)
+            finalConn.Close()
+
+            archiveAndReset nextSprint
+
+            let resultMsg = $"Post: {finalPassing}/{finalTotal} ({finalPct:F1}%%), Δ={delta:+#;-#;0}, retries={retryCount}"
+            Beads.note sprintBeadId resultMsg
+            if allPassed then
+                Beads.close sprintBeadId $"Done. {resultMsg}"
+                printfn $"✅ Sprint {nextSprint} complete. {resultMsg}"
+            else
+                Beads.note sprintBeadId "Max retries reached"
+                printfn $"⚠ Sprint {nextSprint} finished with retries exhausted. {resultMsg}"
+
+            Beads.remember $"Sprint {nextSprint} ({targetBucket}): {resultMsg}"
+
+    /// Show current status.
+    let showStatus () =
+        match load() with
+        | Some config ->
+            printfn $"╔══════════════════════════════════════════════════════╗"
+            printfn $"║  {config.ProjectName}: {config.SourceLang} → {config.TargetLang}"
+            let dbPath = currentDbPath()
+            if File.Exists dbPath then
+                let conn = initSchema dbPath
+                let sprint = getMeta conn "sprint" |> Option.defaultValue "0"
+                let brief = briefing conn
+                conn.Close()
+                printfn $"║  Sprint: {sprint}"
+                printfn $"║  {brief}"
+            printfn $"╠══════════════════════════════════════════════════════╣"
+            printfn $"{Beads.status()}"
+            let rdy = Beads.ready()
+            if not (String.IsNullOrWhiteSpace rdy) then printfn $"Ready:\n{rdy}"
+            printfn $"╚══════════════════════════════════════════════════════╝"
+        | None -> printfn "No project.json. Run init first."
 
 // CLI entry point
 match fsi.CommandLineArgs |> Array.toList |> List.tail with
 | "init" :: sourceDir :: targetDir :: rest ->
-    let planFile = 
-        match rest |> List.tryFindIndex (fun a -> a = "--plan") with
-        | Some i when i + 1 < rest.Length -> Some rest.[i + 1]
-        | _ -> None
+    let planFile = match rest |> List.tryFindIndex ((=) "--plan") with Some i when i+1 < rest.Length -> Some rest.[i+1] | _ -> None
     ConvergenceLoop.init sourceDir targetDir planFile
 | "init" :: _ ->
     printfn "Usage: dotnet fsi ConvergenceLoop.fsx init <source-dir> <target-dir> [--plan <file.md>]"
 | "step" :: rest ->
-    let auto = rest |> List.contains "--auto"
-    ConvergenceLoop.step auto
-| ["status"] ->
-    ConvergenceLoop.showStatus ()
-| ["analyze"] ->
-    ConvergenceLoop.analyze ()
+    let maxRetries = rest |> List.tryFind (fun s -> s.StartsWith("--retries=")) |> Option.map (fun s -> int (s.Split('=').[1])) |> Option.defaultValue 3
+    ConvergenceLoop.step maxRetries
+| ["status"] -> ConvergenceLoop.showStatus ()
 | ["--help"] | ["-h"] | [] ->
-    printfn "ConvergenceLoop — Re-entrant, language-agnostic porting orchestrator"
+    printfn "ConvergenceLoop — Re-entrant porting orchestrator"
     printfn ""
-    printfn "Usage:"
-    printfn "  dotnet fsi ConvergenceLoop.fsx init <source-dir> <target-dir> [--plan <file.md>]"
-    printfn "  dotnet fsi ConvergenceLoop.fsx step [--auto]"
-    printfn "  dotnet fsi ConvergenceLoop.fsx status"
-    printfn "  dotnet fsi ConvergenceLoop.fsx analyze"
+    printfn "  init <src> <tgt> [--plan file.md]   Initialize project"
+    printfn "  step [--retries=N]                   Run one convergence step"
+    printfn "  status                               Show current progress"
     printfn ""
-    printfn "The orchestrator is re-entrant: safe to interrupt and restart."
-    printfn "All state lives in beads (bd) and project.json."
-    printfn "The tool knows nothing about languages until init populates project.json."
-| other ->
-    printfn $"Unknown: {other |> String.concat " "}"
-    printfn "Try: dotnet fsi ConvergenceLoop.fsx --help"
+    printfn "Info flow: code→git, decisions→adr/, progress→beads, tests→SQLite, skills→.github/skills/"
+| other -> printfn $"Unknown: {other |> String.concat " "}. Try --help"
