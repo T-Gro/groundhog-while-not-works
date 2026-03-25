@@ -114,7 +114,7 @@ module ConvergenceLoop =
         String.concat "\n" [
             $"Sprint {sprintNum}. Target bucket: {bucket}. Source: {config.SourceDir}."
             "Incremental port — improve test pass rate piece by piece. Not a one-shot."
-            "Your focus: unpushed commits. Build, test, commit. Push happens only on full success."
+            "You MUST commit your changes (git add + git commit). Do NOT push — the orchestrator pushes on success."
             "Read .github/copilot-instructions.md and adr/INDEX.md."
             $"\n<tests total=\"{totalTests}\">\n{dbBriefing}\n</tests>"
             $"\n<failing>\n{failLines}\n</failing>"
@@ -150,6 +150,12 @@ module ConvergenceLoop =
                 with _ -> "HEAD"
 
             let (_, sid) = Agent.run prompt $"Impl-S{next}" None
+
+            // Check implementor actually committed something
+            let headAfterImpl =
+                try (cli { Exec "git"; Arguments [|"rev-parse"; "HEAD"|] } |> Command.execute).Text |> Option.defaultValue "" |> fun s -> s.Trim()
+                with _ -> ""
+            if headAfterImpl = baseCommit then printfn "  ⚠ Implementor made no commits"
             let mutable retries = 0
             let mutable passed = false
             let mutable lastFail = ""
@@ -176,17 +182,18 @@ module ConvergenceLoop =
             Beads.note bead msg
             if passed && d > 0 then
                 Beads.close bead msg; printfn $"  OK: {msg}"
-                // Push on success
-                let pushResult = try (cli { Exec "git"; Arguments [|"push"|] } |> Command.execute).ExitCode with _ -> 1
-                if pushResult <> 0 then printfn "  ⚠ git push failed — commits are local only"
-                else printfn "  Pushed."
-                // Knowledge capture with explicit diff scope
+                // Knowledge capture — runs BEFORE push so its changes get included
                 let capturePrompt = String.concat "\n" [
                     $"Sprint {next} succeeded."
                     $"EXACT SCOPE: git diff {baseCommit}..HEAD"
                     $"Log: git log --oneline {baseCommit}..HEAD"
-                    "Review only these commits. Capture non-trivial learnings if any. Say 'No learnings.' if none." ]
+                    "Review only these commits. Capture non-trivial learnings if any."
+                    "If you create/edit files, commit them. Say 'No learnings.' if none." ]
                 Agent.run capturePrompt $"Knowledge-S{next}" None |> ignore
+                // Push ALL commits (impl + knowledge capture) on success
+                let pushResult = try (cli { Exec "git"; Arguments [|"push"|] } |> Command.execute).ExitCode with _ -> 1
+                if pushResult <> 0 then printfn "  ⚠ git push failed"
+                else printfn "  Pushed."
                 (true, msg)
             else
                 Beads.note bead $"Fail:{trunc lastFail 500}"; printfn $"  Fail: {msg}"; (false, lastFail)
