@@ -102,12 +102,6 @@ module ConvergenceLoop =
         config
 
     let private buildBriefing config sprintNum bucket dbBriefing failures totalTests alts prevFailure =
-        let planPath = Path.Combine(targetDir(), "porting-plan.md")
-        let plan =
-            if File.Exists planPath then
-                let s = File.ReadAllText planPath
-                if s.Length > 12000 then s.[..12000] else s
-            else ""
         let failLines = failures |> List.truncate 25 |> List.map (fun (f,e) -> $"  {f}: {e}") |> String.concat "\n"
         let altLines = if alts = [] then "" else alts |> List.map (fun b -> $"  - {b}") |> String.concat "\n" |> sprintf "\nAlternative buckets (pick if stuck):\n%s"
         let prevBlock = match prevFailure with Some ctx -> $"\n<previous_failure>\n{trunc ctx 3000}\n</previous_failure>" | None -> ""
@@ -115,7 +109,7 @@ module ConvergenceLoop =
             $"Sprint {sprintNum}. Target bucket: {bucket}. Source: {config.SourceDir}."
             "Incremental port — improve test pass rate piece by piece. Not a one-shot."
             "You MUST commit your changes (git add + git commit). Do NOT push — the orchestrator pushes on success."
-            "Read .github/copilot-instructions.md and adr/INDEX.md."
+            "Read: .github/copilot-instructions.md, adr/INDEX.md, porting-plan.md"
             $"\n<tests total=\"{totalTests}\">\n{dbBriefing}\n</tests>"
             $"\n<failing>\n{failLines}\n</failing>"
             altLines; prevBlock
