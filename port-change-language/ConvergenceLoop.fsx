@@ -160,7 +160,11 @@ module ConvergenceLoop =
             let msg = $"{fp}/{ft} d={d}"
             Beads.note bead msg
             if passed && d > 0 then
-                Beads.close bead msg; printfn $"  OK: {msg}"; (true, msg)
+                Beads.close bead msg; printfn $"  OK: {msg}"
+                // Knowledge capture: invoke an agent with sprint commits as context
+                let capturePrompt = $"Sprint {next} just succeeded. Review what changed and capture any non-trivial learnings.\nRun: git log --oneline HEAD~10..HEAD\nPriority: amend existing skill > new skill > amend instruction > ADR > do nothing.\nMost sprints need nothing. Say 'No learnings.' if so."
+                Agent.run capturePrompt $"Knowledge-S{next}" None |> ignore
+                (true, msg)
             else
                 Beads.note bead $"Fail:{trunc lastFail 500}"; printfn $"  Fail: {msg}"; (false, lastFail)
 
