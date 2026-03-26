@@ -220,31 +220,35 @@ module TestResultsDb =
             yield! bucketLines
         ]
 
-    /// Multi-dimensional dashboard: shows pass/fail per bucket, not just aggregate.
+    /// Multi-dimensional dashboard: shows pass/fail per LAYER, not per bucket.
     let dashboard (conn: SqliteConnection) : string =
         let sprintNum = currentSprintNum conn
         let (passing, total) = passRate conn
         let pct = if total > 0 then float passing / float total * 100.0 else 0.0
         use cmd = conn.CreateCommand()
-        cmd.CommandText <- "SELECT id, layer, passing, failing, crashing, total_tests FROM buckets ORDER BY layer, id"
+        cmd.CommandText <- "SELECT layer, SUM(passing), SUM(failing), SUM(crashing), SUM(total_tests), COUNT(*) FROM buckets GROUP BY layer ORDER BY layer"
         use reader = cmd.ExecuteReader()
-        let bucketLines = [
+        let layerLines = [
             while reader.Read() do
-                let id = reader.GetString(0)
-                let layer = reader.GetString(1)
-                let p = reader.GetInt32(2)
-                let f = reader.GetInt32(3)
-                let c = reader.GetInt32(4)
-                let t = reader.GetInt32(5)
-                let bpct = if t > 0 then float p / float t * 100.0 else 0.0
+                let layer = reader.GetString(0)
+                let p = reader.GetInt32(1)
+                let f = reader.GetInt32(2)
+                let c = reader.GetInt32(3)
+                let t = reader.GetInt32(4)
+                let nBuckets = reader.GetInt32(5)
+                let lpct = if t > 0 then float p / float t * 100.0 else 0.0
                 let crashNote = if c > 0 then $" ({c} crash)" else ""
-                yield $"  {id,-25} {p,4}/{t,-4} {bpct,5:F1}%%{crashNote}  [{layer}]" ]
+                yield $"  {layer,-14} {p,5}/{t,-5} {lpct,5:F1}%%{crashNote}  ({nBuckets} buckets)" ]
+        // Top 5 worst buckets for quick glance
+        let worst = bucketsRanked conn |> List.truncate 5
+        let worstLines = worst |> List.map (fun (id, _, failing, tot) -> $"  {id,-25} {failing}/{tot} failing")
         String.concat "\n" [
             $"Sprint: {sprintNum} | Overall: {passing}/{total} ({pct:F1}%%)"
             ""
-            "  Bucket                    Pass/Tot    %%     Layer"
-            "  ─────────────────────────────────────────────────"
-            yield! bucketLines
+            yield! layerLines
+            ""
+            "Top 5 failure buckets:"
+            yield! worstLines
         ]
 
     /// Archive current DB as sprint N.
