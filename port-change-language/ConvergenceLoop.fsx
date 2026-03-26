@@ -576,7 +576,7 @@ module ConvergenceLoop =
             let k = key()
             printfn $"{c.ProjectName}: {c.SourceLang} -> {c.TargetLang}"
             let db = currentDbPath k
-            if File.Exists db then let cn = initSchema db in printfn $"{briefing cn}"; cn.Close()
+            if File.Exists db then let cn = initSchema db in printfn $"{dashboard cn}"; cn.Close()
             let trend = trendData k
             if trend.Length > 0 then
                 printfn ""

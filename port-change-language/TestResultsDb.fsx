@@ -220,6 +220,33 @@ module TestResultsDb =
             yield! bucketLines
         ]
 
+    /// Multi-dimensional dashboard: shows pass/fail per bucket, not just aggregate.
+    let dashboard (conn: SqliteConnection) : string =
+        let sprintNum = currentSprintNum conn
+        let (passing, total) = passRate conn
+        let pct = if total > 0 then float passing / float total * 100.0 else 0.0
+        use cmd = conn.CreateCommand()
+        cmd.CommandText <- "SELECT id, layer, passing, failing, crashing, total_tests FROM buckets ORDER BY layer, id"
+        use reader = cmd.ExecuteReader()
+        let bucketLines = [
+            while reader.Read() do
+                let id = reader.GetString(0)
+                let layer = reader.GetString(1)
+                let p = reader.GetInt32(2)
+                let f = reader.GetInt32(3)
+                let c = reader.GetInt32(4)
+                let t = reader.GetInt32(5)
+                let bpct = if t > 0 then float p / float t * 100.0 else 0.0
+                let crashNote = if c > 0 then $" ({c} crash)" else ""
+                yield $"  {id,-25} {p,4}/{t,-4} {bpct,5:F1}%%{crashNote}  [{layer}]" ]
+        String.concat "\n" [
+            $"Sprint: {sprintNum} | Overall: {passing}/{total} ({pct:F1}%%)"
+            ""
+            "  Bucket                    Pass/Tot    %%     Layer"
+            "  ─────────────────────────────────────────────────"
+            yield! bucketLines
+        ]
+
     /// Archive current DB as sprint N.
     let archiveAndReset (key: string) (sprintNum: int) =
         let current = currentDbPath key
