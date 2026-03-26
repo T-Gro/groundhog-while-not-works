@@ -278,6 +278,7 @@ module ConvergenceLoop =
             "Every diagnostic must come from real analysis (parse→bind→check). NEVER pattern-match Python source."
             "Do not reinvent — the TS code is battle-tested. Read it, port it, preserve all edge cases."
             "After porting: add '// Ported from: file:lines' comments to every ported function. Log any skipped edge cases in port-debt.instructions.md."
+            "If you find TS edge cases with no existing test: write a .py test in testdata/cases/ported/ and run 'python generate_baselines.py <file.py>' to create the reference baseline."
             "Commit your changes."
             nudgeBlock
             prevBlock
