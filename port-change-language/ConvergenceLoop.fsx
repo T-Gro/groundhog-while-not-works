@@ -207,6 +207,28 @@ module PortStatus =
             File.Delete pyFile
         with ex -> eprintfn "  ⚠ port_status sync failed: %s" ex.Message
 
+    /// Check if any "// Ported from:" or "// TODO(port):" comments were removed in this sprint's diff.
+    /// Returns list of removed coverage markers. Empty = no regression.
+    let checkRegressions (baseCommit: string) : string list =
+        try
+            let result = cli { Exec "git"; Arguments [| "diff"; baseCommit + "..HEAD"; "--"; "internal/" |] } |> Command.execute
+            let diff = result.Text |> Option.defaultValue ""
+            let lines = diff.Split('\n')
+            let removed = [
+                for line in lines do
+                    let trimmed = line.TrimStart()
+                    if trimmed.StartsWith("-") && not (trimmed.StartsWith("---")) then
+                        let content = trimmed.[1..]
+                        if content.Contains("// Ported from:") || content.Contains("// TODO(port):") then
+                            // Check if same marker was re-added (moved, not deleted)
+                            let marker = content.Trim()
+                            let wasReadded = lines |> Array.exists (fun l ->
+                                let t = l.TrimStart()
+                                t.StartsWith("+") && not (t.StartsWith("+++")) && t.[1..].Trim() = marker)
+                            if not wasReadded then yield content.Trim() ]
+            removed
+        with _ -> []
+
     /// Generate a brief summary of porting progress from port_status.
     let summary () =
         let dbPath = Path.Combine(targetDir(), "pyright-source-index.db")
@@ -351,6 +373,29 @@ module ConvergenceLoop =
             archiveAndReset (key()) next
             let msg = $"{fp}/{ft} d={d}"
             Beads.note bead msg
+
+            // Hard gate: check for removed "// Ported from:" or "// TODO(port):" comments
+            let regressions = PortStatus.checkRegressions baseCommit
+            if not regressions.IsEmpty then
+                let regMsg = regressions |> List.map (fun r -> $"  REMOVED: {r}") |> String.concat "\n"
+                printfn "  🚨 Coverage regression — ported logic markers removed:\n%s" regMsg
+                Beads.note bead $"COVERAGE_REGRESSION: {regressions.Length} markers removed"
+                // Tell agent to restore the removed markers
+                let fixPrompt = String.concat "\n" [
+                    "COVERAGE REGRESSION DETECTED. These '// Ported from:' or '// TODO(port):' markers were removed:"
+                    regMsg
+                    "These markers track ported TypeScript logic. Removing them means losing traceability."
+                    "Restore them. If you refactored the code, move the markers to the new location."
+                    "If you genuinely replaced the logic with something better, keep the marker and update the line range." ]
+                Agent.resume sid fixPrompt $"RestoreCoverage-S{next}" |> ignore
+                // Recheck
+                let stillRemoved = PortStatus.checkRegressions baseCommit
+                if not stillRemoved.IsEmpty then
+                    passed <- false
+                    let failMsg = $"Coverage regression: {stillRemoved.Length} Ported-from markers still removed"
+                    lastFail <- failMsg
+                    printfn "  ❌ %s" failMsg
+
             if passed && d > 0 then
                 Beads.closeSuccess bead msg; printfn $"  OK: {msg}"
                 // Sync port_status from "// Ported from:" comments — orchestrator-owned, not agent-dependent

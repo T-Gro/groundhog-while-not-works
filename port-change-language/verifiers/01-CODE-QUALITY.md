@@ -19,4 +19,12 @@ Idiomatic, clean, well-abstracted code that is a faithful port of the TypeScript
 
 - Every ported Go function MUST have a `// Ported from: <file>:<lines>` comment
 - Any skipped edge cases MUST have a `// TODO(port):` comment AND an entry in `.github/instructions/port-debt.instructions.md`
-- Check that `port_status` table in `pyright-source-index.db` was updated for touched files
+
+## Coverage regression (CRITICAL — hard gate)
+
+Run `git diff <baseCommit>..HEAD` and check:
+- If ANY line matching `// Ported from:` was REMOVED (appears as `-// Ported from:`) without a corresponding addition at the same or nearby location = **VERIFY_FAILED**
+- If ANY line matching `// TODO(port):` was REMOVED without the corresponding feature being implemented = **VERIFY_FAILED**
+- If a function with a `// Ported from:` comment was significantly shortened (>30% fewer lines) without explanation = flag for review
+
+Ported logic represents years of battle-tested TypeScript correctness. Removing it is a regression even if tests still pass — edge cases without dedicated tests will silently break.
