@@ -246,46 +246,57 @@ module ConvergenceLoop =
     let private key () = projectKey (targetDir())
     let private trunc (s: string) n = if s.Length <= n then s else s.[..n/2] + "..." + s.[(s.Length-n/2)..]
 
-    /// Run the project's harvest command and parse results into the test DB.
-    /// Output format: STATUS\tBUCKET\tTEST_ID[\tERROR_MSG]
-    /// This is the orchestrator's job — never trust the agent to self-report.
+    /// Harvest test results by asking an agent to run the project's harvest command.
+    /// The agent writes TSV to a known file, orchestrator parses it into the DB.
+    /// Format: STATUS\tBUCKET\tTEST_ID[\tERROR_MSG]
     let private harvestTests (config: ProjectConfig) (sprintNum: int) =
         let db = currentDbPath (key())
-        let conn = initSchema db
-        match config.HarvestCommand with
-        | None | Some "" ->
-            printfn "  ⚠ No HarvestCommand in project.json — skipping test harvest"
-            printfn "    Set HarvestCommand to a script that outputs: STATUS\\tBUCKET\\tTEST_ID[\\tERROR_MSG]"
+        let harvestFile = Path.Combine(targetDir(), ".ralph-harvest-output.tsv")
+        // Clean any stale harvest file
+        if File.Exists harvestFile then File.Delete harvestFile
+
+        let harvestPrompt = String.concat "\n" [
+            "HARVEST TASK: Run the project's test suite and output results."
+            "Read project.json for HarvestCommand. If it has one, run it."
+            "If not, figure out how to run tests from Makefile, README, or copilot-instructions."
+            ""
+            "Capture ALL test output (unit tests, baseline tests, integration tests — everything)."
+            $"Write the results to: {harvestFile}"
+            "Format: one line per test, tab-separated:"
+            "  STATUS\\tBUCKET\\tTEST_ID[\\tERROR_MSG]"
+            "  STATUS = pass|fail|crash|timeout|skip"
+            "  BUCKET = logical grouping"
+            "  TEST_ID = unique test name"
+            ""
+            "Do NOT commit anything. Do NOT modify code. Just run tests and write the output file."
+        ]
+        printfn "  🧪 Harvesting via agent..."
+        Agent.run harvestPrompt "Harvest" None |> ignore
+
+        // Parse the harvest file into DB
+        if File.Exists harvestFile then
+            let conn = initSchema db
+            let lines = File.ReadAllLines harvestFile
+            let mutable count = 0
+            let bucketsSeen = System.Collections.Generic.HashSet<string>()
+            for line in lines do
+                let parts = line.Trim().Split('\t')
+                if parts.Length >= 3 then
+                    let status = parts.[0].ToLowerInvariant()
+                    let bucket = parts.[1]
+                    let testId = parts.[2]
+                    let errMsg = if parts.Length >= 4 then Some parts.[3] else None
+                    if ["pass";"fail";"crash";"timeout";"skip"] |> List.contains status then
+                        if bucketsSeen.Add(bucket) then upsertBucket conn bucket bucket "test"
+                        recordTest conn sprintNum testId bucket status errMsg None
+                        count <- count + 1
+            refreshBucketStats conn
+            let (p, t) = passRate conn
+            printfn $"  📊 Harvested {count} results: {p}/{t} passing"
             conn.Close()
-        | Some cmd ->
-            printfn $"  🧪 Harvesting: {cmd}"
-            try
-                let parts = cmd.Split(' ', 2)
-                let exe = parts.[0]
-                let args = if parts.Length > 1 then parts.[1] else ""
-                let result =
-                    cli { Exec exe; WorkingDirectory (targetDir()); Arguments (args.Split(' ')) }
-                    |> Command.execute
-                let output = result.Text |> Option.defaultValue ""
-                let mutable count = 0
-                let mutable bucketsSeen = System.Collections.Generic.HashSet<string>()
-                for line in output.Split('\n') do
-                    let parts = line.Trim().Split('\t')
-                    if parts.Length >= 3 then
-                        let status = parts.[0].ToLowerInvariant()
-                        let bucket = parts.[1]
-                        let testId = parts.[2]
-                        let errMsg = if parts.Length >= 4 then Some parts.[3] else None
-                        if ["pass";"fail";"crash";"timeout";"skip"] |> List.contains status then
-                            if bucketsSeen.Add(bucket) then
-                                upsertBucket conn bucket bucket "test"
-                            recordTest conn sprintNum testId bucket status errMsg None
-                            count <- count + 1
-                refreshBucketStats conn
-                let (p, t) = passRate conn
-                printfn $"  📊 Harvested {count} results: {p}/{t} passing"
-            with ex -> eprintfn $"  ⚠ Harvest failed: {ex.Message}"
-            conn.Close()
+            File.Delete harvestFile
+        else
+            eprintfn "  ⚠ Harvest agent did not produce output file"
 
     let private ensureInit () =
         let config = require()
@@ -307,19 +318,16 @@ module ConvergenceLoop =
             else ""
         let srcDir = config.SourceDir
         String.concat "\n" [
-            $"Sprint {sprintNum}. Port TypeScript logic to Go."
-            $"Read: porting-plan.md (especially 'How To Port'), adr/INDEX.md"
-            "Check .github/instructions/port-debt.instructions.md for known gaps from previous sprints."
-            "Check port_status table in pyright-source-index.db for what is already ported."
+            $"Sprint {sprintNum}. Port {config.SourceLang} logic to {config.TargetLang}."
+            "Read all project docs: README, copilot-instructions, porting-plan, adr/INDEX if it exists."
+            "Check .github/instructions/ for scoped instructions from previous sprints."
             "You MUST commit your changes. Do NOT push."
             $"\n<test_status>\n{dbBriefing}\n</test_status>"
             $"\n<failing_buckets>\n{allBuckets}\n</failing_buckets>"
-            "\nPick a failing area. Query pyright-source-index.db to find the TS source that implements it."
-            $"Read the TypeScript source at {srcDir}. Port that logic into internal/ packages."
-            "Every diagnostic must come from real analysis (parse→bind→check). NEVER pattern-match Python source."
-            "Do not reinvent — the TS code is battle-tested. Read it, port it, preserve all edge cases."
-            "After porting: add '// Ported from: file:lines' comments to every ported function. Log any skipped edge cases in port-debt.instructions.md."
-            "If you find TS edge cases with no existing test: write a .py test in testdata/cases/ported/ and run 'python generate_baselines.py <file.py>' to create the reference baseline."
+            $"\nPick a failing area. Find the corresponding {config.SourceLang} source at {srcDir}."
+            $"Read the {config.SourceLang} source. Port that logic faithfully — preserve all edge cases."
+            "Do not reinvent — the source code is battle-tested. Read it, port it."
+            "After porting: add '// Ported from: <file>:<lines>' comments to every ported function."
             "Commit your changes."
             nudgeBlock
             prevBlock
@@ -344,15 +352,35 @@ module ConvergenceLoop =
         let ranked = bucketsRanked conn2
         match ranked with
         | [] when pt = 0 ->
-            // No test data — one-shot bootstrap, then stop for human verification
+            // No test data — bootstrap: agent discovers how to test, creates harvest script
             conn2.Close()
             printfn $"S{next} | No test data — bootstrap sprint"
+            let harvestContract = String.concat "\n" [
+                "The orchestrator needs a HarvestCommand in project.json that runs all tests and outputs results."
+                "Output format: one line per test, tab-separated:"
+                "  STATUS\\tBUCKET\\tTEST_ID[\\tERROR_MSG]"
+                "  STATUS = pass|fail|crash|timeout|skip"
+                "  BUCKET = logical grouping (e.g. unit-parser, baseline, integration)"
+                "  TEST_ID = unique test name"
+                "  ERROR_MSG = optional, first line of failure message"
+                ""
+                "Your job:"
+                "1. Figure out how this project runs tests (read Makefile, CI config, docs)"
+                "2. Create a script (in _tools/ or similar) that runs ALL test layers and outputs TSV"
+                "3. Add \"HarvestCommand\": \"<command>\" to project.json"
+                "4. Run the command yourself to verify it works and produces correct output"
+                "5. Commit everything" ]
             let prompt = String.concat "\n" [
-                $"Sprint {next}. Source: {config.SourceDir}."
-                "No test results exist yet. Read porting-plan.md Phase 0."
-                "Set up the Go test harness. Test samples are in testdata/cases/."
-                "You MUST commit your changes. Do NOT push."
-                "Read: adr/INDEX.md, porting-plan.md" ]
+                $"Sprint {next}: BOOTSTRAP. Project: {config.ProjectName}."
+                $"Source language: {config.SourceLang}. Target language: {config.TargetLang}."
+                $"Source reference: {config.SourceDir}."
+                ""
+                "Read all available docs: README, Makefile, CI config, copilot-instructions, porting-plan."
+                "Set up the test harness so tests can be discovered, run, and measured."
+                ""
+                harvestContract
+                ""
+                "You MUST commit your changes. Do NOT push." ]
             let bead = Beads.createSprint next "bootstrap" "Empty DB"
             Beads.claim bead
             let sc = initSchema db in initSprint sc next "bootstrap" 0 0; sc.Close()
