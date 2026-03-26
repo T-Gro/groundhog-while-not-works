@@ -246,57 +246,62 @@ module ConvergenceLoop =
     let private key () = projectKey (targetDir())
     let private trunc (s: string) n = if s.Length <= n then s else s.[..n/2] + "..." + s.[(s.Length-n/2)..]
 
-    /// Harvest test results by asking an agent to run the project's harvest command.
-    /// The agent writes TSV to a known file, orchestrator parses it into the DB.
-    /// Format: STATUS\tBUCKET\tTEST_ID[\tERROR_MSG]
+    /// Harvest test results by asking an agent to run tests and write directly to the DB.
+    /// The agent has full tool access — it can run tests AND write SQLite. No intermediate files.
     let private harvestTests (config: ProjectConfig) (sprintNum: int) =
-        let db = currentDbPath (key())
-        let harvestFile = Path.Combine(targetDir(), ".ralph-harvest-output.tsv")
-        // Clean any stale harvest file
-        if File.Exists harvestFile then File.Delete harvestFile
+        let db = Path.GetFullPath(currentDbPath (key()))
 
         let harvestPrompt = String.concat "\n" [
-            "HARVEST TASK: Run the project's test suite and output results."
-            "Read project.json for HarvestCommand. If it has one, run it."
-            "If not, figure out how to run tests from Makefile, README, or copilot-instructions."
+            $"HARVEST TASK: Run ALL tests and record results directly in SQLite DB."
             ""
-            "Capture ALL test output (unit tests, baseline tests, integration tests — everything)."
-            $"Write the results to: {harvestFile}"
-            "Format: one line per test, tab-separated:"
-            "  STATUS\\tBUCKET\\tTEST_ID[\\tERROR_MSG]"
-            "  STATUS = pass|fail|crash|timeout|skip"
-            "  BUCKET = logical grouping"
-            "  TEST_ID = unique test name"
+            $"DB path: {db}"
+            $"Sprint number: {sprintNum}"
             ""
-            "Do NOT commit anything. Do NOT modify code. Just run tests and write the output file."
+            "Step 1: Figure out how to run tests (read project.json, Makefile, copilot-instructions, README)"
+            "Step 2: Run ALL test layers (unit tests, baseline/golden tests, integration — everything)"
+            "Step 3: Write results to the DB using SQL. Full schema:"
+            ""
+            "  Table 'buckets' (upsert per logical test group):"
+            "    id TEXT PRIMARY KEY           -- e.g. 'unit-scanner', 'baseline'"
+            "    description TEXT              -- human-readable name"
+            "    layer TEXT                    -- e.g. 'unit', 'baseline', 'integration'"
+            "    total_tests INTEGER DEFAULT 0"
+            "    passing INTEGER DEFAULT 0"
+            "    failing INTEGER DEFAULT 0"
+            "    crashing INTEGER DEFAULT 0"
+            ""
+            "  Table 'tests' (one row per test):"
+            "    id TEXT PRIMARY KEY           -- unique test ID, e.g. 'TestTypeEval/assignment1.py'"
+            "    bucket_id TEXT NOT NULL        -- FK to buckets.id"
+            "    sprint_num INTEGER NOT NULL    -- use the sprint number above"
+            "    status TEXT NOT NULL           -- one of: pass, fail, crash, timeout, skip"
+            "    error_message TEXT             -- first line of error, or NULL"
+            "    error_category TEXT            -- optional grouping of error type"
+            "    duration_ms INTEGER            -- optional"
+            ""
+            "Step 4: After inserting all test rows, update bucket aggregates:"
+            "  UPDATE buckets SET"
+            "    total_tests = (SELECT COUNT(*) FROM tests WHERE bucket_id = buckets.id),"
+            "    passing = (SELECT COUNT(*) FROM tests WHERE bucket_id = buckets.id AND status = 'pass'),"
+            "    failing = (SELECT COUNT(*) FROM tests WHERE bucket_id = buckets.id AND status = 'fail'),"
+            "    crashing = (SELECT COUNT(*) FROM tests WHERE bucket_id = buckets.id AND status IN ('crash','timeout'))"
+            ""
+            "IMPORTANT:"
+            "- Use INSERT OR REPLACE for both tables"
+            "- Do NOT commit any code changes. Do NOT modify source."
+            "- Run EVERY test layer — do not skip any."
         ]
         printfn "  🧪 Harvesting via agent..."
         Agent.run harvestPrompt "Harvest" None |> ignore
 
-        // Parse the harvest file into DB
-        if File.Exists harvestFile then
+        // Read back what the agent wrote
+        try
             let conn = initSchema db
-            let lines = File.ReadAllLines harvestFile
-            let mutable count = 0
-            let bucketsSeen = System.Collections.Generic.HashSet<string>()
-            for line in lines do
-                let parts = line.Trim().Split('\t')
-                if parts.Length >= 3 then
-                    let status = parts.[0].ToLowerInvariant()
-                    let bucket = parts.[1]
-                    let testId = parts.[2]
-                    let errMsg = if parts.Length >= 4 then Some parts.[3] else None
-                    if ["pass";"fail";"crash";"timeout";"skip"] |> List.contains status then
-                        if bucketsSeen.Add(bucket) then upsertBucket conn bucket bucket "test"
-                        recordTest conn sprintNum testId bucket status errMsg None
-                        count <- count + 1
-            refreshBucketStats conn
             let (p, t) = passRate conn
-            printfn $"  📊 Harvested {count} results: {p}/{t} passing"
+            if t > 0 then printfn $"  📊 {p}/{t} passing"
+            else eprintfn "  ⚠ Agent wrote 0 test results to DB"
             conn.Close()
-            File.Delete harvestFile
-        else
-            eprintfn "  ⚠ Harvest agent did not produce output file"
+        with _ -> eprintfn "  ⚠ Could not read harvest results"
 
     let private ensureInit () =
         let config = require()
