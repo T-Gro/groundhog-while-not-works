@@ -14,6 +14,11 @@ module ProjectConfig =
         SourceDir: string
         SourceLang: string
         TargetLang: string
+        /// Command that outputs test results in harvest format (one line per test):
+        /// STATUS\tBUCKET\tTEST_ID[\tERROR_MSG]
+        /// STATUS = pass|fail|crash|timeout|skip
+        /// If not set, orchestrator will prompt the agent to run tests and report.
+        HarvestCommand: string option
     }
 
     let targetDir () = Environment.CurrentDirectory

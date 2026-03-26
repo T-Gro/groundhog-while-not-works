@@ -246,6 +246,47 @@ module ConvergenceLoop =
     let private key () = projectKey (targetDir())
     let private trunc (s: string) n = if s.Length <= n then s else s.[..n/2] + "..." + s.[(s.Length-n/2)..]
 
+    /// Run the project's harvest command and parse results into the test DB.
+    /// Output format: STATUS\tBUCKET\tTEST_ID[\tERROR_MSG]
+    /// This is the orchestrator's job — never trust the agent to self-report.
+    let private harvestTests (config: ProjectConfig) (sprintNum: int) =
+        let db = currentDbPath (key())
+        let conn = initSchema db
+        match config.HarvestCommand with
+        | None | Some "" ->
+            printfn "  ⚠ No HarvestCommand in project.json — skipping test harvest"
+            printfn "    Set HarvestCommand to a script that outputs: STATUS\\tBUCKET\\tTEST_ID[\\tERROR_MSG]"
+            conn.Close()
+        | Some cmd ->
+            printfn $"  🧪 Harvesting: {cmd}"
+            try
+                let parts = cmd.Split(' ', 2)
+                let exe = parts.[0]
+                let args = if parts.Length > 1 then parts.[1] else ""
+                let result =
+                    cli { Exec exe; WorkingDirectory (targetDir()); Arguments (args.Split(' ')) }
+                    |> Command.execute
+                let output = result.Text |> Option.defaultValue ""
+                let mutable count = 0
+                let mutable bucketsSeen = System.Collections.Generic.HashSet<string>()
+                for line in output.Split('\n') do
+                    let parts = line.Trim().Split('\t')
+                    if parts.Length >= 3 then
+                        let status = parts.[0].ToLowerInvariant()
+                        let bucket = parts.[1]
+                        let testId = parts.[2]
+                        let errMsg = if parts.Length >= 4 then Some parts.[3] else None
+                        if ["pass";"fail";"crash";"timeout";"skip"] |> List.contains status then
+                            if bucketsSeen.Add(bucket) then
+                                upsertBucket conn bucket bucket "test"
+                            recordTest conn sprintNum testId bucket status errMsg None
+                            count <- count + 1
+                refreshBucketStats conn
+                let (p, t) = passRate conn
+                printfn $"  📊 Harvested {count} results: {p}/{t} passing"
+            with ex -> eprintfn $"  ⚠ Harvest failed: {ex.Message}"
+            conn.Close()
+
     let private ensureInit () =
         let config = require()
         let db = currentDbPath (key())
@@ -289,13 +330,22 @@ module ConvergenceLoop =
         let db = currentDbPath (key())
         let conn = initSchema db
         let sNum = currentSprintNum conn
+
+        // Harvest test results if DB is empty — orchestrator-owned measurement
+        let (existingP, existingT) = passRate conn
+        conn.Close()
+        if existingT = 0 then
+            printfn "  📊 DB empty — harvesting current test results..."
+            harvestTests config (max sNum 0)
+
+        let conn2 = initSchema db
         let next = sNum + 1
-        let (pp, pt) = passRate conn
-        let ranked = bucketsRanked conn
+        let (pp, pt) = passRate conn2
+        let ranked = bucketsRanked conn2
         match ranked with
         | [] when pt = 0 ->
             // No test data — one-shot bootstrap, then stop for human verification
-            conn.Close()
+            conn2.Close()
             printfn $"S{next} | No test data — bootstrap sprint"
             let prompt = String.concat "\n" [
                 $"Sprint {next}. Source: {config.SourceDir}."
@@ -313,14 +363,14 @@ module ConvergenceLoop =
             printfn "  Bootstrap done. Verify test harness works, then restart ralph-port run."
             (true, "ALL_PASS") // stops the run loop
         | [] ->
-            conn.Close(); printfn "All pass!"; (true, "ALL_PASS")
+            conn2.Close(); printfn "All pass!"; (true, "ALL_PASS")
         | _ ->
             // Build a full bucket list for the agent to choose from
             let allBuckets =
                 ranked |> List.map (fun (b, l, f, t) -> $"  {b} ({l}): {f}/{t} failing")
                 |> String.concat "\n"
-            let brief = briefing conn
-            conn.Close()
+            let brief = briefing conn2
+            conn2.Close()
             printfn $"S{next} | {pp}/{pt} | {ranked.Length} failing buckets"
 
             let prompt = buildBriefing config next brief allBuckets prevFailure
@@ -345,6 +395,10 @@ module ConvergenceLoop =
                 printfn "  ⚠ Implementor made no commits"
             else
                 Beads.note bead $"PHASE:impl:done commits={headAfterImpl.[..7]}"
+
+            // Harvest test results AFTER agent finishes — orchestrator-owned measurement
+            Beads.note bead "PHASE:harvest"
+            harvestTests config next
 
             let mutable retries = 0
             let mutable passed = false
