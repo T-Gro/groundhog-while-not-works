@@ -160,6 +160,8 @@ module ConvergenceLoop =
         String.concat "\n" [
             $"Sprint {sprintNum}. Port TypeScript logic to Go."
             $"Read: porting-plan.md (especially 'How To Port'), adr/INDEX.md"
+            "Check .github/instructions/port-debt.instructions.md for known gaps from previous sprints."
+            "Check port_status table in pyright-source-index.db for what is already ported."
             "You MUST commit your changes. Do NOT push."
             $"\n<test_status>\n{dbBriefing}\n</test_status>"
             $"\n<failing_buckets>\n{allBuckets}\n</failing_buckets>"
@@ -167,6 +169,7 @@ module ConvergenceLoop =
             $"Read the TypeScript source at {srcDir}. Port that logic into internal/ packages."
             "Every diagnostic must come from real analysis (parse→bind→check). NEVER pattern-match Python source."
             "Do not reinvent — the TS code is battle-tested. Read it, port it, preserve all edge cases."
+            "After porting: add '// Ported from: file:lines' comments, update port_status table, log any gaps in port-debt.instructions.md."
             "Commit your changes."
             nudgeBlock
             prevBlock

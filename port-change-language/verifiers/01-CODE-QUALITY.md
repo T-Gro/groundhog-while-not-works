@@ -14,3 +14,9 @@ Idiomatic, clean, well-abstracted code that is a faithful port of the TypeScript
 - `runChecker()` in testrunner_test.go must call the real pipeline, not ad-hoc analysis
 - Regex or pattern-matching on Python source text to produce diagnostics = FAIL
 - Every new feature must trace to corresponding TypeScript source — the port must be recognizable as derived from the TS code
+
+## Source traceability
+
+- Every ported Go function MUST have a `// Ported from: <file>:<lines>` comment
+- Any skipped edge cases MUST have a `// TODO(port):` comment AND an entry in `.github/instructions/port-debt.instructions.md`
+- Check that `port_status` table in `pyright-source-index.db` was updated for touched files
