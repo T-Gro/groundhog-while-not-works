@@ -156,15 +156,18 @@ module ConvergenceLoop =
                 printfn $"  📌 Nudge picked up: {content.[..min 80 (content.Length-1)]}..."
                 $"\n<human_nudge>\n{content}\n</human_nudge>"
             else ""
+        let srcDir = config.SourceDir
         String.concat "\n" [
-            $"Sprint {sprintNum}. Source: {config.SourceDir}."
-            "Incremental port — improve test pass rate. Not a one-shot."
+            $"Sprint {sprintNum}. Port TypeScript logic to Go."
+            $"Read: porting-plan.md (especially 'How To Port'), adr/INDEX.md"
             "You MUST commit your changes. Do NOT push."
-            "Read: adr/INDEX.md, porting-plan.md"
             $"\n<test_status>\n{dbBriefing}\n</test_status>"
             $"\n<failing_buckets>\n{allBuckets}\n</failing_buckets>"
-            "\nPick what to work on. Easy wins first is totally fine — the more tests you make pass in one go, the better."
-            "Build up the implementation piece by piece. Commit your changes."
+            "\nPick a failing area. Query pyright-source-index.db to find the TS source that implements it."
+            $"Read the TypeScript source at {srcDir}. Port that logic into internal/ packages."
+            "Every diagnostic must come from real analysis (parse→bind→check). NEVER pattern-match Python source."
+            "Do not reinvent — the TS code is battle-tested. Read it, port it, preserve all edge cases."
+            "Commit your changes."
             nudgeBlock
             prevBlock
         ]
