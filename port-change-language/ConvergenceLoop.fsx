@@ -134,6 +134,66 @@ module Verifiers =
         let (passed, fullOut) = parseVerdict out sid name
         (passed, fullOut)
 
+module PortStatus =
+    /// Scan Go files for "// Ported from:" comments and update port_status in the source index DB.
+    /// Runs after each successful sprint — orchestrator-owned, not agent-dependent.
+    let sync (sprintNum: int) =
+        let dbPath = Path.Combine(targetDir(), "pyright-source-index.db")
+        if not (File.Exists dbPath) then () else
+        let internalDir = Path.Combine(targetDir(), "internal")
+        if not (Directory.Exists internalDir) then () else
+        let goFiles = Directory.GetFiles(internalDir, "*.go", SearchOption.AllDirectories)
+                      |> Array.filter (fun f -> not (f.EndsWith("_test.go")))
+        let pattern = System.Text.RegularExpressions.Regex(@"//\s*Ported from:\s*(\S+?)(?::(\d+[\-–]\d+))?\s*$", System.Text.RegularExpressions.RegexOptions.Multiline)
+        let entries = [
+            for goFile in goFiles do
+                let content = File.ReadAllText goFile
+                let ms = pattern.Matches content
+                for m in ms do
+                    let tsFile = m.Groups.[1].Value
+                    let tsLines = if m.Groups.[2].Success then m.Groups.[2].Value else ""
+                    let sep = string Path.DirectorySeparatorChar
+                    let goRel = goFile.Replace(targetDir() + sep, "").Replace('\\', '/')
+                    yield (tsFile, tsLines, goRel) ]
+        if entries.IsEmpty then () else
+        try
+            // Write entries to a temp JSON file, then run Python to upsert
+            let tmpJson = Path.GetTempFileName()
+            let jsonData = System.Text.Json.JsonSerializer.Serialize(entries |> List.map (fun (t,l,g) -> {| ts=t; lines=l; go=g |}))
+            File.WriteAllText(tmpJson, jsonData)
+            let pyScript = String.concat "\n" [
+                "import sqlite3, json, sys"
+                "db, jf, sprint = sys.argv[1], sys.argv[2], int(sys.argv[3])"
+                "conn = sqlite3.connect(db)"
+                "c = conn.cursor()"
+                "entries = json.load(open(jf))"
+                "for e in entries:"
+                "    c.execute('INSERT INTO port_status (ts_file, ts_lines, concept, go_file, status, sprint, updated_at) VALUES (?, ?, ?, ?, ?, ?, datetime(\"now\")) ON CONFLICT(ts_file, concept) DO UPDATE SET go_file=excluded.go_file, status=\"partial\", sprint=excluded.sprint, updated_at=datetime(\"now\")', (e['ts'], e['lines'], 'ported-function', e['go'], 'partial', sprint))"
+                "conn.commit()"
+                "print('port_status: synced ' + str(len(entries)) + ' entries')"
+                "conn.close()" ]
+            let pyFile = Path.GetTempFileName() + ".py"
+            File.WriteAllText(pyFile, pyScript)
+            let sn = string sprintNum
+            let result = cli { Exec "python"; Arguments [| pyFile; dbPath; tmpJson; sn |] } |> Command.execute
+            result.Text |> Option.iter (fun t -> printfn "  📊 %s" (t.Trim()))
+            File.Delete tmpJson
+            File.Delete pyFile
+        with ex -> eprintfn "  ⚠ port_status sync failed: %s" ex.Message
+
+    /// Generate a brief summary of porting progress from port_status.
+    let summary () =
+        let dbPath = Path.Combine(targetDir(), "pyright-source-index.db")
+        if not (File.Exists dbPath) then "" else
+        try
+            let pyScript = "import sqlite3,sys\nconn=sqlite3.connect(sys.argv[1])\nrows=conn.execute('SELECT status,COUNT(*) FROM port_status GROUP BY status').fetchall()\nprint(' | '.join(f'{s}: {n}' for s,n in rows))\nconn.close()"
+            let pyFile = Path.GetTempFileName() + ".py"
+            File.WriteAllText(pyFile, pyScript)
+            let result = cli { Exec "python"; Arguments [| pyFile; dbPath |] } |> Command.execute
+            File.Delete pyFile
+            result.Text |> Option.defaultValue "" |> fun s -> s.Trim()
+        with _ -> ""
+
 module ConvergenceLoop =
     let private key () = projectKey (targetDir())
     let private trunc (s: string) n = if s.Length <= n then s else s.[..n/2] + "..." + s.[(s.Length-n/2)..]
@@ -169,7 +229,7 @@ module ConvergenceLoop =
             $"Read the TypeScript source at {srcDir}. Port that logic into internal/ packages."
             "Every diagnostic must come from real analysis (parse→bind→check). NEVER pattern-match Python source."
             "Do not reinvent — the TS code is battle-tested. Read it, port it, preserve all edge cases."
-            "After porting: add '// Ported from: file:lines' comments, update port_status table, log any gaps in port-debt.instructions.md."
+            "After porting: add '// Ported from: file:lines' comments to every ported function. Log any skipped edge cases in port-debt.instructions.md."
             "Commit your changes."
             nudgeBlock
             prevBlock
@@ -267,6 +327,8 @@ module ConvergenceLoop =
             Beads.note bead msg
             if passed && d > 0 then
                 Beads.closeSuccess bead msg; printfn $"  OK: {msg}"
+                // Sync port_status from "// Ported from:" comments — orchestrator-owned, not agent-dependent
+                PortStatus.sync next
                 // Knowledge capture — runs BEFORE push so its changes get included
                 let capturePrompt = String.concat "\n" [
                     $"Sprint {next} succeeded."
