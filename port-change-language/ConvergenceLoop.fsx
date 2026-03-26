@@ -585,13 +585,16 @@ module ConvergenceLoop =
 
     /// Watch mode — refreshes status every N seconds.
     let watch interval =
-        let mutable go = true
-        Console.CancelKeyPress.Add(fun a -> a.Cancel <- true; go <- false)
-        while go do
-            Console.Clear()
-            status ()
-            printfn $"\n(refreshing every {interval}s — Ctrl+C to stop)"
-            System.Threading.Thread.Sleep(interval * 1000)
+        let cts = new System.Threading.CancellationTokenSource()
+        Console.CancelKeyPress.Add(fun a -> a.Cancel <- true; cts.Cancel())
+        try
+            while not cts.Token.IsCancellationRequested do
+                Console.Clear()
+                status ()
+                printfn $"\n(refreshing every {interval}s — Ctrl+C to stop)"
+                try cts.Token.WaitHandle.WaitOne(interval * 1000) |> ignore with :? OperationCanceledException -> ()
+        with :? OperationCanceledException -> ()
+        printfn "\nStopped."
 
 let retries rest = rest |> List.tryFind (fun (s:string) -> s.StartsWith "--retries=") |> Option.map (fun s -> int(s.Split('=').[1])) |> Option.defaultValue 3
 
