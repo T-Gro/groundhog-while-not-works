@@ -254,8 +254,9 @@ module TestResultsDb =
             let archive = sprintDbPath key sprintNum
             File.Copy(current, archive, true)
 
-    /// Read pass rates from all archived sprint DBs. Returns (sprintNum, passing, total) list.
-    let trendData (key: string) : (int * int * int) list =
+    /// Read pass rates from all archived sprint DBs.
+    /// Returns (sprintNum, overall_passing, overall_total, layer_stats) where layer_stats = (layer, passing, total) list.
+    let trendData (key: string) : (int * int * int * (string * int * int) list) list =
         let dir = runtimeDir key
         if not (Directory.Exists dir) then []
         else
@@ -267,19 +268,38 @@ module TestResultsDb =
                     let num = int (name.Replace("sprint_", ""))
                     let conn = initSchema f
                     let (p, t) = passRate conn
+                    // Read per-layer aggregates
+                    use cmd = conn.CreateCommand()
+                    cmd.CommandText <- "SELECT layer, SUM(passing), SUM(total_tests) FROM buckets GROUP BY layer ORDER BY layer"
+                    use reader = cmd.ExecuteReader()
+                    let layers = [
+                        while reader.Read() do
+                            let layer = reader.GetString(0)
+                            let lp = reader.GetInt32(1)
+                            let lt = reader.GetInt32(2)
+                            yield (layer, lp, lt) ]
                     conn.Close()
-                    Some (num, p, t)
+                    Some (num, p, t, layers)
                 with _ -> None)
             |> Array.toList
 
-    /// Render an ASCII progress chart from trend data.
-    let renderChart (data: (int * int * int) list) (width: int) : string =
+    /// Render an ASCII progress chart with per-layer columns.
+    let renderChart (data: (int * int * int * (string * int * int) list) list) (width: int) : string =
         if data.IsEmpty then "(no sprint data yet)"
         else
-            let lines = data |> List.map (fun (s, p, t) ->
+            // Collect all layer names across all sprints
+            let allLayers = data |> List.collect (fun (_, _, _, ls) -> ls |> List.map (fun (l,_,_) -> l)) |> List.distinct |> List.sort
+            let header =
+                let layerCols = allLayers |> List.map (fun l -> sprintf "%-14s" l) |> String.concat " "
+                sprintf "       %-*s  %%     %s" width "" layerCols
+            let lines = data |> List.map (fun (s, p, t, layers) ->
                 let pct = if t > 0 then float p / float t * 100.0 else 0.0
                 let bars = int (pct / 100.0 * float width)
                 let bar = String.replicate bars "█" + String.replicate (width - bars) "░"
-                sprintf "S%3d %s %5.1f%% (%d/%d)" s bar pct p t)
-            String.concat "\n" lines
+                let layerCols = allLayers |> List.map (fun l ->
+                    match layers |> List.tryFind (fun (ll,_,_) -> ll = l) with
+                    | Some (_, lp, lt) -> sprintf "%4d/%-4d     " lp lt
+                    | None -> sprintf "  -/  -       ") |> String.concat " "
+                sprintf "S%3d %s %5.1f%% %s" s bar pct layerCols)
+            String.concat "\n" (header :: lines)
         // Don't delete current — it becomes the baseline for next sprint
