@@ -62,7 +62,7 @@ module Beads =
         (run args).Trim()
 
     let claim id = run ["update"; id; "--claim"] |> ignore
-    let note id text = run ["note"; id; text] |> ignore
+    let note id text = run ["comments"; "add"; id; text] |> ignore
 
     /// Record a verifier result as a labeled note.
     let verifierResult id (verifier: string) (passed: bool) (attempt: int) =
