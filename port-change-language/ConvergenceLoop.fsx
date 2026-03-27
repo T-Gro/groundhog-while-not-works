@@ -596,12 +596,54 @@ module ConvergenceLoop =
         with :? OperationCanceledException -> ()
         printfn "\nStopped."
 
+    /// Show phase timing breakdown from beads comments.
+    let timing () =
+        // Query all sprint tasks
+        let tasksJson = Beads.run ["query"; "type=task"; "--json"]
+        if tasksJson = "" then printfn "No sprint data." else
+        try
+            let doc = System.Text.Json.JsonDocument.Parse(tasksJson)
+            let tasks = doc.RootElement.EnumerateArray() |> Seq.toList
+                        |> List.sortBy (fun t -> t.GetProperty("created_at").GetString())
+            printfn "=== PHASE TIMING ==="
+            for task in tasks do
+                let id = task.GetProperty("id").GetString()
+                let title = task.GetProperty("title").GetString()
+                let commentsJson = Beads.run ["comments"; id; "--json"]
+                if commentsJson <> "" && commentsJson <> "[]" then
+                    try
+                        let cdoc = System.Text.Json.JsonDocument.Parse(commentsJson)
+                        let comments = cdoc.RootElement.EnumerateArray() |> Seq.toList
+                                       |> List.choose (fun c ->
+                                           try
+                                               let text = c.GetProperty("text").GetString()
+                                               let ts = DateTime.Parse(c.GetProperty("created_at").GetString())
+                                               Some (ts, text)
+                                           with _ -> None)
+                                       |> List.sortBy fst
+                        if comments.Length > 0 then
+                            printfn ""
+                            printfn $"  {title} ({id})"
+                            let mutable prev = comments.Head |> fst
+                            for (ts, text) in comments do
+                                let delta = (ts - prev).TotalMinutes
+                                let deltaStr = if delta < 1.0 then "" else sprintf "+%.0fm" delta
+                                let tsStr = ts.ToString("HH:mm:ss")
+                                printfn $"    {tsStr} {deltaStr,6}  {text}"
+                                prev <- ts
+                            let total = ((comments |> List.last |> fst) - (comments.Head |> fst)).TotalMinutes
+                            printfn $"    ───── total: %.0f{total}m"
+                    with _ -> ()
+            printfn ""
+        with ex -> eprintfn $"Parse error: {ex.Message}"
+
 let retries rest = rest |> List.tryFind (fun (s:string) -> s.StartsWith "--retries=") |> Option.map (fun s -> int(s.Split('=').[1])) |> Option.defaultValue 3
 
 match fsi.CommandLineArgs |> Array.toList |> List.tail with
 | "run" :: r -> ConvergenceLoop.run (retries r)
 | "step" :: r -> ConvergenceLoop.step (retries r) None |> ignore
 | ["status"] -> ConvergenceLoop.status ()
+| ["timing"] -> ConvergenceLoop.timing ()
 | "watch" :: r ->
     let interval = r |> List.tryHead |> Option.map int |> Option.defaultValue 30
     ConvergenceLoop.watch interval
@@ -610,4 +652,5 @@ match fsi.CommandLineArgs |> Array.toList |> List.tail with
     printfn "  run   [--retries=N]  Autonomous loop. Ctrl+C safe."
     printfn "  step  [--retries=N]  One sprint."
     printfn "  status               Current state + progress chart."
+    printfn "  timing               Phase timing breakdown from beads."
     printfn "  watch [seconds]      Live dashboard (default: 30s refresh)."
