@@ -79,7 +79,7 @@ module Agent =
         let sid = resumeId |> Option.defaultWith (fun () -> Guid.NewGuid().ToString())
         try
             let result =
-                cli { Exec "copilot"; Arguments [| "-p"; prompt; "--resume"; sid; "--allow-all"; "--no-ask-user"; "--autopilot"; "--max-autopilot-continues"; "200"; "-s"; "--no-color"; "--plain-diff"; "--stream"; "off" |] }
+                cli { Exec "copilot"; Arguments [| "-p"; prompt; "--resume"; sid; "--allow-all"; "--no-ask-user"; "--autopilot"; "--max-autopilot-continues"; "50"; "-s"; "--no-color"; "--plain-diff"; "--stream"; "off" |] }
                 |> Command.execute
             (result.Text |> Option.defaultValue "", sid)
         with ex -> eprintfn $"Agent '{title}': {ex.Message}"; ("", sid)
