@@ -146,7 +146,7 @@ module TestResultsDb =
             UPDATE buckets SET
                 total_tests = (SELECT COUNT(*) FROM tests WHERE bucket_id = buckets.id),
                 passing = (SELECT COUNT(*) FROM tests WHERE bucket_id = buckets.id AND status = 'pass'),
-                failing = (SELECT COUNT(*) FROM tests WHERE bucket_id = buckets.id AND status = 'fail'),
+                failing = (SELECT COUNT(*) FROM tests WHERE bucket_id = buckets.id AND status IN ('fail','skip')),
                 crashing = (SELECT COUNT(*) FROM tests WHERE bucket_id = buckets.id AND status IN ('crash','timeout'))
         """
         cmd.ExecuteNonQuery() |> ignore
@@ -160,10 +160,10 @@ module TestResultsDb =
         let total = cmd.ExecuteScalar() :?> int64 |> int
         (passing, total)
 
-    /// Get buckets sorted by most failing (highest-impact first).
+    /// Get buckets sorted by most non-passing (highest-impact first).
     let bucketsRanked (conn: SqliteConnection) : (string * string * int * int) list =
         use cmd = conn.CreateCommand()
-        cmd.CommandText <- "SELECT id, layer, failing, total_tests FROM buckets WHERE failing > 0 ORDER BY failing DESC"
+        cmd.CommandText <- "SELECT id, layer, (total_tests - passing), total_tests FROM buckets WHERE total_tests > passing ORDER BY (total_tests - passing) DESC"
         use reader = cmd.ExecuteReader()
         [ while reader.Read() do
             yield (reader.GetString(0), reader.GetString(1), reader.GetInt32(2), reader.GetInt32(3)) ]
