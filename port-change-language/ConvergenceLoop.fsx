@@ -345,13 +345,11 @@ module ConvergenceLoop =
         let db = currentDbPath (key())
         let conn = initSchema db
         let sNum = currentSprintNum conn
-
-        // Harvest test results if DB is empty — orchestrator-owned measurement
-        let (existingP, existingT) = passRate conn
         conn.Close()
-        if existingT = 0 then
-            printfn "  📊 DB empty — harvesting current test results..."
-            harvestTests config (max sNum 0)
+
+        // ALWAYS harvest before deciding what to do — stale data causes false "All pass!"
+        printfn "  📊 Harvesting current test results..."
+        harvestTests config (max sNum 0)
 
         let conn2 = initSchema db
         let next = sNum + 1
