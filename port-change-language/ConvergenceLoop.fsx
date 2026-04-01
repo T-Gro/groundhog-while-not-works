@@ -245,61 +245,34 @@ module ConvergenceLoop =
     let private key () = projectKey (targetDir())
     let private trunc (s: string) n = if s.Length <= n then s else s.[..n/2] + "..." + s.[(s.Length-n/2)..]
 
-    /// Harvest test results by asking an agent to run tests and write directly to the DB.
-    /// The agent has full tool access — it can run tests AND write SQLite. No intermediate files.
+    /// Harvest test results by running the project's harvest script directly.
+    /// Falls back to agent if script doesn't exist.
     let private harvestTests (config: ProjectConfig) (sprintNum: int) =
         let db = Path.GetFullPath(currentDbPath (key()))
+        let harvestScript = Path.Combine(targetDir(), "_tools", "harvest_tests.py")
 
-        let harvestPrompt = String.concat "\n" [
-            $"HARVEST TASK: Run ALL tests and record results directly in SQLite DB."
-            ""
-            $"DB path: {db}"
-            $"Sprint number: {sprintNum}"
-            ""
-            "Step 1: Read .github/instructions/harvest.instructions.md for EXACT commands to run."
-            "        Run EVERY command listed there. Do NOT skip any."
-            "Step 2: Parse the JSON output. Each line with Action=pass or Action=fail is a test result."
-            "Step 3: Write results to the DB using SQL. Full schema:"
-            ""
-            "  Table 'buckets' (upsert per logical test group):"
-            "    id TEXT PRIMARY KEY           -- e.g. 'unit-scanner', 'baseline'"
-            "    description TEXT              -- human-readable name"
-            "    layer TEXT                    -- e.g. 'unit', 'baseline', 'integration'"
-            "    total_tests INTEGER DEFAULT 0"
-            "    passing INTEGER DEFAULT 0"
-            "    failing INTEGER DEFAULT 0"
-            "    crashing INTEGER DEFAULT 0"
-            ""
-            "  Table 'tests' (one row per test):"
-            "    id TEXT PRIMARY KEY           -- unique test ID, e.g. 'TestTypeEval/assignment1.py'"
-            "    bucket_id TEXT NOT NULL        -- FK to buckets.id"
-            "    sprint_num INTEGER NOT NULL    -- use the sprint number above"
-            "    status TEXT NOT NULL           -- one of: pass, fail, crash, timeout, skip"
-            "    error_message TEXT             -- first line of error, or NULL"
-            "    error_category TEXT            -- optional grouping of error type"
-            "    duration_ms INTEGER            -- optional"
-            ""
-            "Step 4: After inserting all test rows, update bucket aggregates:"
-            "  UPDATE buckets SET"
-            "    total_tests = (SELECT COUNT(*) FROM tests WHERE bucket_id = buckets.id),"
-            "    passing = (SELECT COUNT(*) FROM tests WHERE bucket_id = buckets.id AND status = 'pass'),"
-            "    failing = (SELECT COUNT(*) FROM tests WHERE bucket_id = buckets.id AND status = 'fail'),"
-            "    crashing = (SELECT COUNT(*) FROM tests WHERE bucket_id = buckets.id AND status IN ('crash','timeout'))"
-            ""
-            "IMPORTANT:"
-            "- Use INSERT OR REPLACE for both tables"
-            "- Do NOT commit any code changes. Do NOT modify source."
-            "- Run EVERY test layer — do not skip any."
-        ]
-        printfn "  🧪 Harvesting via agent..."
-        Agent.run harvestPrompt "Harvest" None |> ignore
+        if File.Exists harvestScript then
+            printfn "  🧪 Harvesting via script..."
+            try
+                let result =
+                    cli { Exec "python"; WorkingDirectory (targetDir()); Arguments [| harvestScript; db; string sprintNum |] }
+                    |> Command.execute
+                // Print stderr (where the script logs)
+                result.Error |> Option.iter (fun e ->
+                    for line in e.Split('\n') do
+                        let t = line.Trim()
+                        if t.Length > 0 then printfn "  %s" t)
+            with ex -> eprintfn $"  ⚠ Harvest script failed: {ex.Message}"
+        else
+            printfn "  🧪 Harvesting via agent (no _tools/harvest_tests.py)..."
+            let harvestPrompt = $"HARVEST TASK: Run ALL tests and record results in SQLite DB at {db}. Sprint {sprintNum}. Read .github/instructions/harvest.instructions.md for commands and schema."
+            Agent.run harvestPrompt "Harvest" None |> ignore
 
-        // Read back what the agent wrote
         try
             let conn = initSchema db
             let (p, t) = passRate conn
             if t > 0 then printfn $"  📊 {p}/{t} passing"
-            else eprintfn "  ⚠ Agent wrote 0 test results to DB"
+            else eprintfn "  ⚠ 0 test results in DB"
             conn.Close()
         with _ -> eprintfn "  ⚠ Could not read harvest results"
 
