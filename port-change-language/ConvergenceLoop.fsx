@@ -283,17 +283,17 @@ module ConvergenceLoop =
         Beads.ensureEpic config.ProjectName |> ignore
         config
 
+    let private nudgeBlock () =
+        let nudgePath = Path.Combine(targetDir(), "nudge.md")
+        if File.Exists nudgePath then
+            let content = File.ReadAllText nudgePath
+            File.Delete nudgePath // consume it — one-shot
+            printfn $"  📌 Nudge picked up: {content.[..min 80 (content.Length-1)]}..."
+            $"\n<human_nudge>\n{content}\n</human_nudge>"
+        else ""
+
     let private buildBriefing config sprintNum dbBriefing allBuckets prevFailure =
         let prevBlock = match prevFailure with Some ctx -> $"\n<previous_failure>\n{trunc ctx 3000}\n</previous_failure>" | None -> ""
-        // Check for nudge.md — human can drop instructions for the next sprint
-        let nudgePath = Path.Combine(targetDir(), "nudge.md")
-        let nudgeBlock =
-            if File.Exists nudgePath then
-                let content = File.ReadAllText nudgePath
-                File.Delete nudgePath // consume it — one-shot
-                printfn $"  📌 Nudge picked up: {content.[..min 80 (content.Length-1)]}..."
-                $"\n<human_nudge>\n{content}\n</human_nudge>"
-            else ""
         let srcDir = config.SourceDir
         String.concat "\n" [
             $"Sprint {sprintNum}. Port {config.SourceLang} logic to {config.TargetLang}."
@@ -309,7 +309,33 @@ module ConvergenceLoop =
             "Do not reinvent — the source code is battle-tested. Read it, port it."
             "After porting: add '// Ported from: <file>:<lines>' comments to every ported function."
             "Commit your changes."
-            nudgeBlock
+            nudgeBlock ()
+            prevBlock
+        ]
+
+    let private buildImprovementBriefing config sprintNum dbBriefing prevFailure =
+        let prevBlock = match prevFailure with Some ctx -> $"\n<previous_failure>\n{trunc ctx 3000}\n</previous_failure>" | None -> ""
+        let srcDir = config.SourceDir
+        String.concat "\n" [
+            $"Sprint {sprintNum}. IMPROVEMENT SPRINT — all tests pass but project quality can be improved."
+            $"Port {config.SourceLang} logic to {config.TargetLang}."
+            "Read all project docs: README, copilot-instructions, porting-plan, adr/INDEX if it exists."
+            "Check .github/instructions/ for scoped instructions from previous sprints."
+            "You MUST commit your changes. Do NOT push."
+            $"\n<test_status>\n{dbBriefing}\n</test_status>"
+            ""
+            "All tests currently pass. Your job is to IMPROVE coverage and correctness:"
+            "1. Run the real-world parity tests (-run TestRealWorldParity) and read the PARITY SUMMARY table."
+            "2. Look at TOP MISSING RULES — these are diagnostic rules from the source that aren't firing."
+            "3. Pick the rule with the highest missing count that you can make progress on."
+            "4. Check .github/instructions/parity-strategy.instructions.md for guidance."
+            $"5. Find the corresponding {config.SourceLang} implementation at {srcDir}."
+            $"6. Port that logic faithfully — preserve all edge cases."
+            "7. After porting: add '// Ported from: <file>:<lines>' comments to every ported function."
+            "8. Update the parity ratchet file if your changes improved parity numbers."
+            ""
+            "Focus on ONE rule. Do it well. Commit and stop."
+            nudgeBlock ()
             prevBlock
         ]
 
@@ -366,12 +392,83 @@ module ConvergenceLoop =
             let pushResult = try (cli { Exec "git"; Arguments [|"push"|] } |> Command.execute).ExitCode with _ -> 1
             if pushResult = 0 then printfn "  Pushed." else printfn "  ⚠ push failed"
             Beads.closeSuccess bead "Bootstrap done"
-            printfn "  Bootstrap done. Verify test harness works, then restart ralph-port run."
-            (true, "ALL_PASS") // stops the run loop
+            printfn "  Bootstrap done. Continuing to first improvement sprint..."
+            (true, "BOOTSTRAP") // continue — don't stop
         | [] ->
-            conn2.Close(); printfn "All pass!"; (true, "ALL_PASS")
+            // All tests pass — run an improvement sprint instead of stopping.
+            let brief = briefing conn2
+            conn2.Close()
+            printfn $"S{next} | {pp}/{pt} | All pass — improvement sprint"
+            let prompt = buildImprovementBriefing config next brief prevFailure
+            let topBucket = "improvement"
+            let bead = Beads.createSprint next topBucket $"Pre:{pp}/{pt}"
+            Beads.claim bead
+            let sc = initSchema db in initSprint sc next topBucket pp pt; sc.Close()
+
+            // Record base commit BEFORE implementor runs — this defines the sprint's diff scope
+            let baseCommit =
+                try (cli { Exec "git"; Arguments [|"rev-parse"; "HEAD"|] } |> Command.execute).Text |> Option.defaultValue "HEAD" |> fun s -> s.Trim()
+                with _ -> "HEAD"
+
+            Beads.note bead $"PHASE:impl baseCommit={baseCommit.[..7]}"
+            let (_, sid) = Agent.run prompt $"Impl-S{next}" None
+
+            let headAfterImpl =
+                try (cli { Exec "git"; Arguments [|"rev-parse"; "HEAD"|] } |> Command.execute).Text |> Option.defaultValue "" |> fun s -> s.Trim()
+                with _ -> ""
+            let agentCommitted = headAfterImpl <> baseCommit
+            if not agentCommitted then
+                Beads.note bead "PHASE:impl:NO_COMMITS"
+                printfn "  ⚠ Implementor made no commits"
+            else
+                Beads.note bead $"PHASE:impl:done commits={headAfterImpl.[..7]}"
+
+            // Harvest test results AFTER agent finishes — orchestrator-owned measurement
+            Beads.note bead "PHASE:harvest"
+            harvestTests config next
+
+            let mutable retries = 0
+            let mutable passed = false
+            let mutable lastFail = ""
+
+            while retries < maxRetries && not passed do
+                Beads.note bead $"PHASE:verify attempt={retries+1}"
+                let results = Verifiers.listAll() |> List.map (fun v -> async {
+                    let (vp,vo,vsid) = Verifiers.runVerifier v baseCommit
+                    let verdict = if vp then "PASS" else "FAIL"
+                    Beads.verifierResult bead v (verdict = "PASS") (retries+1)
+                    return (v,vp,vo,vsid) }) |> Async.Parallel |> Async.RunSynchronously |> Array.toList
+                let failed = results |> List.filter (fun (_,vp,_,_) -> not vp)
+                if failed.IsEmpty then passed <- true
+                else
+                    let fb = failed |> List.map (fun (v,_,vo,_) -> $"=== {v} ===\n{trunc vo 2000}") |> String.concat "\n\n"
+                    lastFail <- fb
+                    let failedNames = failed |> List.map (fun (v,_,_,_) -> v) |> String.concat ","
+                    Beads.note bead $"PHASE:fix attempt={retries+1} fixing={failedNames}"
+                    Agent.resume sid fb $"Fix-S{next}" |> ignore
+                    Beads.note bead $"PHASE:recheck attempt={retries+1}"
+                    let rechecks = failed |> List.map (fun (v,_,_,vsid) -> async { let (r,_) = Verifiers.resumeVerifier vsid v in return (v,r) }) |> Async.Parallel |> Async.RunSynchronously
+                    if rechecks |> Array.forall snd then passed <- true
+                    retries <- retries + 1
+
+            let fc = initSchema db in let (fp,ft) = passRate fc in let d = fp-pp in finalizeSprint fc fp ft; fc.Close()
+            archiveAndReset (key()) next
+            let msg = $"{fp}/{ft} d={d}"
+            Beads.note bead msg
+
+            // Improvement sprints succeed if agent committed and didn't regress (d >= 0)
+            if passed && agentCommitted && d >= 0 then
+                Beads.closeSuccess bead msg; printfn $"  OK (improvement): {msg}"
+                PortStatus.sync next
+                let pushResult = try (cli { Exec "git"; Arguments [|"push"|] } |> Command.execute).ExitCode with _ -> 1
+                if pushResult <> 0 then printfn "  ⚠ git push failed"
+                else printfn "  Pushed."
+                (true, msg)
+            else
+                Beads.closeFailed bead msg; printfn $"  Fail (improvement): {msg}"; (false, lastFail)
+
         | _ ->
-            // Build a full bucket list for the agent to choose from
+            // Normal sprint: there are failing buckets to fix.
             let allBuckets =
                 ranked |> List.map (fun (b, l, f, t) -> $"  {b} ({l}): {f}/{t} failing")
                 |> String.concat "\n"
@@ -483,6 +580,7 @@ module ConvergenceLoop =
         let mutable go = true
         let mutable prev: string option = None
         let mutable consecutiveErrors = 0
+        let mutable consecutiveFails = 0
         let mutable sprintsSinceReview = 0
         let reviewInterval = 7
         Console.CancelKeyPress.Add(fun a -> a.Cancel <- true; go <- false; printfn "\nStopping...")
@@ -531,9 +629,18 @@ module ConvergenceLoop =
                 else
                     let (ok, s) = step maxRetries prev
                     consecutiveErrors <- 0
-                    if s = "ALL_PASS" then go <- false
-                    elif ok then prev <- None
-                    else prev <- Some s
+                    if ok then
+                        prev <- None
+                        consecutiveFails <- 0
+                    else
+                        prev <- Some s
+                        consecutiveFails <- consecutiveFails + 1
+                        if consecutiveFails >= 3 then
+                            printfn $"  ⏳ {consecutiveFails} consecutive failed sprints — cooling down 5 min"
+                            System.Threading.Thread.Sleep(5 * 60 * 1000)
+                        if consecutiveFails >= 10 then
+                            printfn "  ⏳ 10 consecutive failures — extended cooldown 30 min"
+                            System.Threading.Thread.Sleep(25 * 60 * 1000) // extra 25 on top of the 5
             with ex ->
                 consecutiveErrors <- consecutiveErrors + 1
                 eprintfn $"Sprint error ({consecutiveErrors}): {ex.Message}"
