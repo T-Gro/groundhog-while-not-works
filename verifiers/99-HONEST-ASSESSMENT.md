@@ -6,9 +6,9 @@ Assess completeness and correctness of the overall delivery against the sprint's
 
 <part_1_completeness>
 1. Get the branch diff and the diff stat.
-2. Read the sprint file's Description and every DoD item.
-3. For each DoD item, verify it is addressed by concrete code in the diff. Mark each as: fully addressed, partially addressed, or missing.
-4. If the `expert-reviewer` agent is available, invoke it to assess relevant dimensions for the changed files. Use its findings as input, but apply your own judgment — the agent may produce nitpicks. Focus on material issues: correctness, completeness, design flaws.
+2. Read the sprint file's full Description and every DoD item. Also read the overall request/scope if referenced — review against the complete intent, not just the DoD bullet points.
+3. For each DoD item, verify it is addressed by concrete code in the diff. Mark each as: fully addressed, partially addressed, or missing. If partially addressed, list specifically what is missing.
+4. You MUST launch `expert-reviewer` as a sub-agent for the dimensions relevant to the changed files. Treat its findings as required input, then apply your own judgment — adopt material findings, discard nitpicks. If the sub-agent invocation fails technically, state that explicitly in your ManagementSummary and continue manually.
 5. Check for skipped or stubbed work: placeholder implementations, TODO markers for core functionality, half-done features.
 6. Check for bugs or regressions visible in the diff.
 </part_1_completeness>

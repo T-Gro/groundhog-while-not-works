@@ -5,7 +5,7 @@ Check ONLY production behavior against the sprint's Definition of Done. Do NOT c
 </scope>
 
 <checks>
-1. Read the sprint file's Description and Definition of Done items.
+1. Read the sprint file's full Description, Definition of Done items, and any referenced overall scope. Review against the complete intent, not just the DoD bullet points.
 2. Get the branch diff. For each DoD item, locate the code that implements it.
 3. Trace the logic: does the implementation handle the stated scenarios correctly?
 4. Verify error messages and diagnostics are accurate and actionable for any new/changed error paths.

@@ -14,10 +14,11 @@ Focus on code that runs per-file, per-expression, or per-type during compilation
    - CodeGen/IlxGen expression compilation
    - Any function called once per syntax node, type, or expression
 3. For hot-path code, check for:
-   - Heap allocations inside loops (list/array creation, closures, string concatenation)
+   - Heap allocations inside loops (list/array creation, closures, boxing, string concatenation via + or sprintf)
    - O(n²) algorithms where O(n) or O(n log n) is possible
    - Redundant recomputation of the same value with immutable inputs (memoize or hoist)
    - Thread-safety issues in shared mutable state or caches
+   - Struct vs class choice for types created frequently and retained across compilation phases (not short-lived locals)
 4. For cold-path code (setup, one-time init, driver): skip — minor allocations there are irrelevant.
 </checks>
 
