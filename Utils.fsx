@@ -9,7 +9,7 @@ open System.Collections.Generic
 open YamlDotNet.Serialization
 
 module Config =
-    let Model = "claude-opus-4.6"
+    let Model = "claude-opus-4.7"
     let MaxIterations = 15
     let ArbiterThreshold = 6  // Iterations per sprint before calling arbiter
     let MaxArbiterAttempts = 6  // Max arbiter invocations before giving up
