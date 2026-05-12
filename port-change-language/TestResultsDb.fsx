@@ -214,10 +214,37 @@ module TestResultsDb =
         let pct = if total > 0 then float passing / float total * 100.0 else 0.0
         let ranked = bucketsRanked conn |> List.truncate 10
         let bucketLines = ranked |> List.map (fun (id, layer, failing, tot) -> $"  {layer} {id}: {failing}/{tot} failing")
+        // Show 5 sample failing tests + their first-line error from the TOP bucket so
+        // the implementor has a concrete handle, not just counts. Without this the
+        // loop stalled for 43+ consecutive sprints with no commits (observed 2026-05-12).
+        let sampleBlock =
+            match ranked with
+            | (topId, _, _, _) :: _ ->
+                let samples = failingInBucket conn topId 5
+                if List.isEmpty samples then ""
+                else
+                    let firstLine (s: string) =
+                        let t = s.Trim()
+                        let nl = t.IndexOf('\n')
+                        if nl < 0 then t else t.Substring(0, nl)
+                    let lines =
+                        samples |> List.map (fun (testId, errMsg) ->
+                            let trimmedTest = if testId.Length > 60 then testId.Substring(0, 57) + "..." else testId
+                            let trimmedErr =
+                                let f = firstLine errMsg
+                                if f.Length > 200 then f.Substring(0, 197) + "..." else f
+                            $"    {trimmedTest}\n      {trimmedErr}")
+                    String.concat "\n" [
+                        ""
+                        $"Top bucket '{topId}' sample failures (first 5):"
+                        yield! lines
+                    ]
+            | _ -> ""
         String.concat "\n" [
             $"Sprint: {sprintNum} | Pass rate: {passing}/{total} ({pct:F1}%%)"
             "Top failure buckets:"
             yield! bucketLines
+            sampleBlock
         ]
 
     /// Multi-dimensional dashboard: shows pass/fail per LAYER, not per bucket.
