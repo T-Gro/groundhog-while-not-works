@@ -75,11 +75,13 @@ module Beads =
 
 module Agent =
 
+    let Model = "claude-opus-4.7-1m-internal"
+
     let run (prompt: string) (title: string) (resumeId: string option) : string * string =
         let sid = resumeId |> Option.defaultWith (fun () -> Guid.NewGuid().ToString())
         try
             let result =
-                cli { Exec "copilot"; Arguments [| "-p"; prompt; "--resume"; sid; "--allow-all"; "--no-ask-user"; "-s"; "--no-color"; "--plain-diff"; "--stream"; "off" |] }
+                cli { Exec "copilot"; Arguments [| "-p"; prompt; "--resume"; sid; "--allow-all"; "--no-ask-user"; "-s"; "--no-color"; "--plain-diff"; "--model"; Model; "--stream"; "off" |] }
                 |> Command.execute
             (result.Text |> Option.defaultValue "", sid)
         with ex -> eprintfn $"Agent '{title}': {ex.Message}"; ("", sid)
@@ -379,8 +381,18 @@ module ConvergenceLoop =
             conn2.Close()
             printfn $"S{next} | {pp}/{pt} | {ranked.Length} failing buckets"
 
-            let prompt = buildBriefing config next brief allBuckets prevFailure
-            let topBucket = ranked |> List.head |> fun (b,_,_,_) -> b
+            // Bucket rotation: if implementor has been stalled for ≥3 sprints,
+            // skip the top-N buckets so we don't keep beating the same dead horse.
+            let streak = getNoCommitStreak (key())
+            let rotateBy = if streak >= 3 then min (streak - 2) (List.length ranked - 1) else 0
+            let rotatedRanked = ranked |> List.skip rotateBy
+            let topBucket = rotatedRanked |> List.head |> fun (b,_,_,_) -> b
+            let stallNotice =
+                if streak >= 3 then
+                    $"\n<stall_warning>\nImplementor has produced ZERO commits for {streak} consecutive sprints.\nRotating past the top-{rotateBy} bucket(s). Try '{topBucket}' instead.\nIf you cannot make ANY progress on this bucket either, pick a SMALLER concrete target inside it (one test file, one diagnostic message) and ship a one-line fix.\n</stall_warning>"
+                else ""
+
+            let prompt = (buildBriefing config next brief allBuckets prevFailure) + stallNotice
             let bead = Beads.createSprint next topBucket $"Pre:{pp}/{pt}"
             Beads.claim bead
             let sc = initSchema db in initSprint sc next topBucket pp pt; sc.Close()
@@ -390,16 +402,28 @@ module ConvergenceLoop =
                 try (cli { Exec "git"; Arguments [|"rev-parse"; "HEAD"|] } |> Command.execute).Text |> Option.defaultValue "HEAD" |> fun s -> s.Trim()
                 with _ -> "HEAD"
 
-            Beads.note bead $"PHASE:impl baseCommit={baseCommit.[..7]}"
-            let (_, sid) = Agent.run prompt $"Impl-S{next}" None
+            Beads.note bead $"PHASE:impl baseCommit={baseCommit.[..7]} streak={streak} rotate={rotateBy}"
+            let (implOut, sid) = Agent.run prompt $"Impl-S{next}" None
+
+            // Capture implementor stdout — diagnostic gold for debugging no-commit sprints.
+            let logPath =
+                try writeImplLog (key()) next implOut
+                with ex -> eprintfn $"  ⚠ failed to write impl log: {ex.Message}"; ""
+            if logPath <> "" then printfn $"  📝 impl log: {logPath} ({implOut.Length} chars)"
 
             let headAfterImpl =
                 try (cli { Exec "git"; Arguments [|"rev-parse"; "HEAD"|] } |> Command.execute).Text |> Option.defaultValue "" |> fun s -> s.Trim()
                 with _ -> ""
             if headAfterImpl = baseCommit then
-                Beads.note bead "PHASE:impl:NO_COMMITS"
-                printfn "  ⚠ Implementor made no commits"
+                let newStreak = incrementNoCommitStreak (key())
+                Beads.note bead $"PHASE:impl:NO_COMMITS streak={newStreak}"
+                printfn $"  ⚠ Implementor made no commits (streak={newStreak})"
+                // Surface the tail of the impl log so the human can see WHY immediately
+                if implOut.Length > 0 then
+                    let tail = if implOut.Length > 800 then implOut.Substring(implOut.Length - 800) else implOut
+                    printfn $"  ── impl tail ──\n{tail}\n  ───────────────"
             else
+                resetNoCommitStreak (key())
                 Beads.note bead $"PHASE:impl:done commits={headAfterImpl.[..7]}"
 
             // Harvest test results AFTER agent finishes — orchestrator-owned measurement

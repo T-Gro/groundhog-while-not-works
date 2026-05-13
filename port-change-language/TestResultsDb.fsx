@@ -33,6 +33,38 @@ module TestResultsDb =
     let currentDbPath (key: string) = Path.Combine(runtimeDir key, "current_results.db")
     let sprintDbPath (key: string) (sprintNum: int) = Path.Combine(runtimeDir key, $"sprint_{sprintNum:D4}.db")
 
+    /// Public path helper for ad-hoc runtime artifacts (logs, streak counters, etc.).
+    let runtimeFile (key: string) (relativePath: string) = Path.Combine(runtimeDir key, relativePath)
+
+    /// File-backed counter of consecutive sprints where the implementor produced no commits.
+    /// Re-entrant across orchestrator restarts; lets us rotate buckets when stuck.
+    let noCommitStreakPath (key: string) = runtimeFile key "no_commit_streak.txt"
+    let getNoCommitStreak (key: string) =
+        let p = noCommitStreakPath key
+        if File.Exists p then
+            match Int32.TryParse(File.ReadAllText(p).Trim()) with
+            | true, n -> n
+            | _ -> 0
+        else 0
+    let setNoCommitStreak (key: string) (n: int) = File.WriteAllText(noCommitStreakPath key, string n)
+    let incrementNoCommitStreak (key: string) =
+        let n = getNoCommitStreak key + 1
+        setNoCommitStreak key n
+        n
+    let resetNoCommitStreak (key: string) = setNoCommitStreak key 0
+
+    /// Per-sprint implementor stdout log. Lets a human (or follow-up agent) see WHY
+    /// the implementor decided not to commit. Truncated to last ~200 KB to stay sane.
+    let implLogPath (key: string) (sprintNum: int) =
+        let dir = runtimeFile key "sprint_logs"
+        Directory.CreateDirectory dir |> ignore
+        Path.Combine(dir, $"sprint_{sprintNum:D4}.log")
+    let writeImplLog (key: string) (sprintNum: int) (text: string) =
+        let p = implLogPath key sprintNum
+        let trimmed = if text.Length > 200_000 then text.Substring(text.Length - 200_000) else text
+        File.WriteAllText(p, trimmed)
+        p
+
     /// Initialize the schema in a new or existing DB.
     let initSchema (dbPath: string) =
         Directory.CreateDirectory(Path.GetDirectoryName dbPath) |> ignore
