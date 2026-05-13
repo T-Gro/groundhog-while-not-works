@@ -311,6 +311,19 @@ module ConvergenceLoop =
             "Do not reinvent — the source code is battle-tested. Read it, port it."
             "After porting: add '// Ported from: <file>:<lines>' comments to every ported function."
             "Commit your changes."
+            ""
+            "<anti_deadlock>"
+            "If after analysis you conclude the bucket is too deep to fix this sprint, DO NOT exit"
+            "with zero commits. Land at least ONE of the following durable artifacts and commit:"
+            "  (a) A PORT-DEBT comment at the relevant Go call-site + a 3-5 line entry in"
+            "      .github/instructions/port-debt.instructions.md (§ Active debt) describing the gap."
+            "  (b) One failing-test seed (a new _test.go that hard-codes the expected behavior,"
+            "      with t.Skip(\"PORT-DEBT: ...\") if not yet passing). Pyright sample reproduction."
+            "  (c) A status-DB update marking a verified-complete port as 'done' in port_status."
+            "Analysis that lives only in chat context vanishes when this sprint ends. The next"
+            "sprint starts with FRESH context — only artifacts on disk persist. A 5-line note is"
+            "infinitely more valuable than a no-commit sprint. NEVER exit with zero commits."
+            "</anti_deadlock>"
             nudgeBlock ()
             prevBlock
         ]
