@@ -42,13 +42,16 @@ let setMessage msg = StateOps.setMessage &state liveCtx msg
 let buildDashboard () = GUI.buildDashboard state (Verifiers.listAll ())
 
 
-/// Run a copilot agent session. Returns (output, sessionId) where sessionId can be used with askFollowUp.
+/// Run a copilot agent session. Returns (output, sessionName) where sessionName can be used with askFollowUp.
 /// If resumeSessionId is provided (Some), resumes that session instead of starting a new one.
 let runAgent (prompt: string) (title: string) (_showWindow: bool) (resumeSessionId: string option) = async {
     Directory.CreateDirectory Config.ralphDir |> ignore
     
-    let sessionId = resumeSessionId |> Option.defaultWith (fun () -> Guid.NewGuid().ToString())
-    Logging.info $"Starting agent: {title} (session: {sessionId})"
+    // For fresh sessions, generate a unique name; for follow-ups, reuse the existing name.
+    let sessionName = resumeSessionId |> Option.defaultWith (fun () ->
+        let suffix = Guid.NewGuid().ToString("N").Substring(0,8)
+        $"{title}-{suffix}")
+    Logging.info $"Starting agent: {title} (session: {sessionName}, resume: {resumeSessionId.IsSome})"
     
     // Mark agent as running with task info
     state <- { state with AgentStartTime = Some DateTime.Now; CurrentAgentTask = title }
@@ -61,8 +64,13 @@ let runAgent (prompt: string) (title: string) (_showWindow: bool) (resumeSession
         // which interprets { and } as format placeholders
         let escapedPrompt = prompt.Replace("{", "{{").Replace("}", "}}")
         
-        // Build arguments: include --resume {sessionId} for session tracking
-        let baseArgs = [| "--allow-all-tools"; "--allow-all-paths"; "--no-ask-user";"--no-color";"--plain-diff";"-s";"--model"; Config.Model; "--stream"; "off"; "--resume"; sessionId |]
+        // First invocation: --name creates a named session.
+        // Subsequent invocations: --resume= continues an existing session by name.
+        let sessionArgs = 
+            match resumeSessionId with
+            | None   -> [| "--name"; sessionName |]
+            | Some n -> [| $"--resume={n}" |]
+        let baseArgs = Array.append [| "--allow-all-tools"; "--allow-all-paths"; "--no-ask-user";"--no-color";"--plain-diff";"-s";"--model"; Config.Model; "--stream"; "off" |] sessionArgs
         
         // Run copilot via Fli
         let result = 
@@ -89,7 +97,7 @@ let runAgent (prompt: string) (title: string) (_showWindow: bool) (resumeSession
     
     match exn with
     | Some ex -> return raise ex
-    | None -> return (output, sessionId)
+    | None -> return (output, sessionName)
 }
 
 /// Resume a previous session with a short clarifying question.
