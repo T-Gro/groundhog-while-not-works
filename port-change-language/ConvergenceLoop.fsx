@@ -78,12 +78,22 @@ module Agent =
     let Model = "claude-opus-4.7-1m-internal"
 
     let run (prompt: string) (title: string) (resumeId: string option) : string * string =
+        // Copilot CLI distinguishes new sessions (--name) from resumes (--resume).
+        // Passing an unknown GUID to --resume now errors out (exit 1, "No session matched").
+        // For brand-new sessions we use --name; for actual resumes we use --resume.
+        let isResume = resumeId.IsSome
         let sid = resumeId |> Option.defaultWith (fun () -> Guid.NewGuid().ToString())
+        let sessionFlag = if isResume then "--resume" else "--name"
         try
             let result =
-                cli { Exec "copilot"; Arguments [| "-p"; prompt; "--resume"; sid; "--allow-all"; "--no-ask-user"; "-s"; "--no-color"; "--plain-diff"; "--model"; Model; "--stream"; "off" |] }
+                cli { Exec "copilot"; Arguments [| "-p"; prompt; sessionFlag; sid; "--allow-all"; "--no-ask-user"; "-s"; "--no-color"; "--plain-diff"; "--model"; Model; "--stream"; "off" |] }
                 |> Command.execute
-            (result.Text |> Option.defaultValue "", sid)
+            let stdout = result.Text |> Option.defaultValue ""
+            if stdout = "" then
+                let err = result.Error |> Option.defaultValue ""
+                if err <> "" then
+                    eprintfn $"Agent '{title}' empty stdout, stderr: {err.[..min 400 (err.Length-1)]}"
+            (stdout, sid)
         with ex -> eprintfn $"Agent '{title}': {ex.Message}"; ("", sid)
 
     let resume sid feedback title =
