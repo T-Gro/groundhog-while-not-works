@@ -73,12 +73,13 @@ let runAgent (prompt: string) (title: string) (_showWindow: bool) (resumeSession
             | Some n -> [| $"--resume={n}" |]
         let baseArgs = Array.append [| "--allow-all-tools"; "--allow-all-paths"; "--no-ask-user";"--no-color";"--plain-diff";"-s";"--model"; Config.Model; "--stream"; "off" |] sessionArgs
         
-        // Run copilot via Fli
+        // Run copilot via Fli — use Config.workDir so copilot runs in the target repo
         let result = 
             cli {
                 Exec "copilot"
                 Arguments baseArgs
                 Input escapedPrompt
+                WorkingDirectory Config.workDir
             }
             |> Command.execute
         

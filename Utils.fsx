@@ -14,7 +14,11 @@ module Config =
     let ArbiterThreshold = 6  // Iterations per sprint before calling arbiter
     let MaxArbiterAttempts = 6  // Max arbiter invocations before giving up
     let scriptDir = __SOURCE_DIRECTORY__
-    let ralphDir = Path.Combine(Directory.GetCurrentDirectory(), ".tools", "ralph")
+    let workDir =
+        Environment.GetEnvironmentVariable("RALPH_WORK_DIR")
+        |> Option.ofObj
+        |> Option.defaultValue (Directory.GetCurrentDirectory())
+    let ralphDir = Path.Combine(workDir, ".tools", "ralph")
     let sprintsDir = Path.Combine(ralphDir, "sprints")
     let backlogFile = Path.Combine(ralphDir, "BACKLOG.md")
     let verifiersDir = Path.Combine(scriptDir, "verifiers")
