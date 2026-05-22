@@ -27,6 +27,7 @@ open CI_Retries
 
 let mutable state: State = emptyState
 let mutable liveCtx: LiveDisplayContext option = None
+let mutable dashboardDisabled: bool = false
 
 let updateStatus sprintPath status msg = StateOps.updateStatus &state liveCtx sprintPath status msg
 let updateTiming sprintPath f = StateOps.updateTiming &state sprintPath f
@@ -219,29 +220,30 @@ let runAllVerifiers showWin sprintFilePath (sprintItem: BacklogItem) = async {
 }
 
 /// Run the live dashboard refresh loop while a task executes on a background thread.
-/// Falls back to plain polling when no console is available (headless/service context).
+/// In headless mode, skips the dashboard entirely and just polls for completion.
 let withLiveDashboard (isFinished: unit -> bool) (task: Task) =
-    let mutable usedLive = false
-    try
-        AnsiConsole.Live(buildDashboard())
-            .AutoClear(false)
-            .Overflow(VerticalOverflow.Ellipsis)
-            .Start(fun ctx ->
-                usedLive <- true
-                liveCtx <- Some ctx
-                while not (isFinished()) do
-                    ctx.UpdateTarget(buildDashboard())
-                    ctx.Refresh()
-                    Thread.Sleep(500)
-                ctx.UpdateTarget(buildDashboard())
-                ctx.Refresh()
-                liveCtx <- None
-            )
-    with :? System.IO.IOException ->
-        // No console handle (headless/service/locked screen) — poll without dashboard
-        liveCtx <- None
+    if dashboardDisabled then
         while not (isFinished()) do
             Thread.Sleep(2000)
+    else
+        try
+            AnsiConsole.Live(buildDashboard())
+                .AutoClear(false)
+                .Overflow(VerticalOverflow.Ellipsis)
+                .Start(fun ctx ->
+                    liveCtx <- Some ctx
+                    while not (isFinished()) do
+                        ctx.UpdateTarget(buildDashboard())
+                        ctx.Refresh()
+                        Thread.Sleep(500)
+                    ctx.UpdateTarget(buildDashboard())
+                    ctx.Refresh()
+                    liveCtx <- None
+                )
+        with :? System.IO.IOException ->
+            liveCtx <- None
+            while not (isFinished()) do
+                Thread.Sleep(2000)
     task.Wait()
 
 let showPlan (sprints: BacklogItem list) (overview: string) =
@@ -1012,19 +1014,22 @@ match fsi.CommandLineArgs |> Array.toList |> List.tail with
 | [] -> runInteractive () |> ignore
 | ["--help"] | ["-h"] ->
     printfn "Ralph - Autonomous AI Coding Loop\n"
-    printfn "Usage:  dotnet fsi Ralph.fsx [request] [--yes] [--hidden] [--push] [--restart] [--help]"
+    printfn "Usage:  dotnet fsi Ralph.fsx [request] [--yes] [--hidden] [--headless] [--push] [--restart] [--help]"
     printfn ""
     printfn "Options:"
     printfn "  --yes       Auto-approve all prompts"
     printfn "  --hidden    Hide agent windows"
+    printfn "  --headless  Disable live dashboard (for background/service execution)"
     printfn "  --push      Push after completion and monitor CI, fix failures"
     printfn "  --restart   Learn from previous failed run and restart with new plan"
 | args ->
     let request = args |> List.filter (fun a -> not (a.StartsWith "--")) |> String.concat " "
     let showWin = not (List.contains "--hidden" args)
+    let headless = List.contains "--headless" args
     let auto = List.contains "--yes" args
     let push = List.contains "--push" args
     let restart = List.contains "--restart" args
+    if headless then dashboardDisabled <- true
     if String.IsNullOrWhiteSpace request then printfn "No request.  Use --help"; exit 1
     if restart then runRestart request showWin auto |> exit
     elif push then runWithPush request showWin auto 0 |> exit
