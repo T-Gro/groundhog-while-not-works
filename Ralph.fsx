@@ -219,20 +219,29 @@ let runAllVerifiers showWin sprintFilePath (sprintItem: BacklogItem) = async {
 }
 
 /// Run the live dashboard refresh loop while a task executes on a background thread.
+/// Falls back to plain polling when no console is available (headless/service context).
 let withLiveDashboard (isFinished: unit -> bool) (task: Task) =
-    AnsiConsole.Live(buildDashboard())
-        .AutoClear(false)
-        .Overflow(VerticalOverflow.Ellipsis)
-        .Start(fun ctx ->
-            liveCtx <- Some ctx
-            while not (isFinished()) do
+    let mutable usedLive = false
+    try
+        AnsiConsole.Live(buildDashboard())
+            .AutoClear(false)
+            .Overflow(VerticalOverflow.Ellipsis)
+            .Start(fun ctx ->
+                usedLive <- true
+                liveCtx <- Some ctx
+                while not (isFinished()) do
+                    ctx.UpdateTarget(buildDashboard())
+                    ctx.Refresh()
+                    Thread.Sleep(500)
                 ctx.UpdateTarget(buildDashboard())
                 ctx.Refresh()
-                Thread.Sleep(500)
-            ctx.UpdateTarget(buildDashboard())
-            ctx.Refresh()
-            liveCtx <- None
-        )
+                liveCtx <- None
+            )
+    with :? System.IO.IOException ->
+        // No console handle (headless/service/locked screen) — poll without dashboard
+        liveCtx <- None
+        while not (isFinished()) do
+            Thread.Sleep(2000)
     task.Wait()
 
 let showPlan (sprints: BacklogItem list) (overview: string) =
