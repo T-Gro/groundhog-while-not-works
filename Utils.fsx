@@ -18,6 +18,22 @@ module Config =
         Environment.GetEnvironmentVariable("RALPH_WORK_DIR")
         |> Option.ofObj
         |> Option.defaultValue (Directory.GetCurrentDirectory())
+    /// Resolve copilot binary — Fli needs full path or .cmd extension on Windows
+    let CopilotExe =
+        // Try .cmd wrapper (npm global install)
+        let npmGlobal =
+            let baseDir = Environment.GetEnvironmentVariable("DM_BASE_DIR") |> Option.ofObj |> Option.defaultValue ""
+            if baseDir <> "" then Path.Combine(baseDir, ".tools", ".npm-global")
+            else ""
+        let cmdPath = if npmGlobal <> "" then Path.Combine(npmGlobal, "copilot.cmd") else ""
+        if cmdPath <> "" && File.Exists(cmdPath) then cmdPath
+        else
+            // Try finding copilot.cmd on PATH
+            let pathDirs = (Environment.GetEnvironmentVariable("PATH") |> Option.ofObj |> Option.defaultValue "").Split(';')
+            pathDirs |> Array.tryPick (fun d ->
+                let candidate = Path.Combine(d, "copilot.cmd")
+                if File.Exists(candidate) then Some candidate else None)
+            |> Option.defaultValue "copilot"
     let ralphDir = Path.Combine(workDir, ".tools", "ralph")
     let sprintsDir = Path.Combine(ralphDir, "sprints")
     let backlogFile = Path.Combine(ralphDir, "BACKLOG.md")

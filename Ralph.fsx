@@ -76,7 +76,7 @@ let runAgent (prompt: string) (title: string) (_showWindow: bool) (resumeSession
         // Run copilot via Fli — use Config.workDir so copilot runs in the target repo
         let result = 
             cli {
-                Exec "copilot"
+                Exec Config.CopilotExe
                 Arguments baseArgs
                 Input escapedPrompt
                 WorkingDirectory Config.workDir
