@@ -424,8 +424,36 @@ module ConvergenceLoop =
             Beads.closeSuccess bead "Bootstrap done"
             printfn "  Bootstrap done. Continuing to first improvement sprint..."
             (true, "BOOTSTRAP") // continue — don't stop
-        | [] ->
-            conn2.Close(); printfn "All pass!"; (true, "ALL_PASS")
+        | [] when pt > 0 ->
+            // All buckets pass — BUT verify this isn't a false positive from a build failure.
+            // A build failure can silently drop test count (e.g., merge conflict markers in Go code
+            // cause test packages to fail to compile → harvest sees only a subset → 0 failing buckets).
+            // Guard: if total tests dropped >20% from the historical high, it's a build failure, not success.
+            let histHigh =
+                try
+                    let hConn = initSchema db
+                    let cmd = hConn.CreateCommand()
+                    cmd.CommandText <- "SELECT MAX(total_tests) FROM sprint"
+                    let result = cmd.ExecuteScalar()
+                    hConn.Close()
+                    match result with :? int64 as v -> int v | :? int as v -> v | _ -> pt
+                with _ -> pt
+            if pt < histHigh * 80 / 100 then
+                conn2.Close()
+                printfn $"  🚨 FALSE ALL-PASS: {pt} tests vs historical high {histHigh} — build likely broken!"
+                printfn "  Attempting build fix sprint..."
+                let fixPrompt = String.concat "\n" [
+                    $"Sprint {next}: BUILD REPAIR. The test count dropped from {histHigh} to {pt}."
+                    "This means the Go code has a build failure causing test packages to not compile."
+                    "Run: go build ./... and fix ALL compile errors."
+                    "Common causes: merge conflict markers (<<<<<<< ======= >>>>>>>), missing imports, syntax errors."
+                    "Search for: <<<<<<< in all .go files: grep -r '<<<<<<' internal/"
+                    "Fix every build error. Then run: go test -timeout 60s ./internal/..."
+                    "Commit the fix." ]
+                let (_, _) = Agent.run fixPrompt $"BuildFix-S{next}" None
+                (false, "BUILD_REPAIR")
+            else
+                conn2.Close(); printfn "All pass!"; (true, "ALL_PASS")
         | _ ->
             // Normal sprint: there are failing buckets to fix.
             let allBuckets =
