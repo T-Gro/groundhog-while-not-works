@@ -307,20 +307,32 @@ module ConvergenceLoop =
     let private buildBriefing config sprintNum dbBriefing allBuckets prevFailure =
         let prevBlock = match prevFailure with Some ctx -> $"\n<previous_failure>\n{trunc ctx 3000}\n</previous_failure>" | None -> ""
         let srcDir = config.SourceDir
+        // Load project-specific briefing template if it exists; otherwise use generic porting briefing.
+        // The template can use {{sprint}}, {{source_lang}}, {{target_lang}}, {{source_dir}} placeholders.
+        let templatePath = Path.Combine(targetDir(), ".github", "instructions", "sprint-briefing.md")
+        let projectSpecific =
+            if File.Exists templatePath then
+                let raw = File.ReadAllText templatePath
+                raw.Replace("{{sprint}}", string sprintNum)
+                   .Replace("{{source_lang}}", config.SourceLang)
+                   .Replace("{{target_lang}}", config.TargetLang)
+                   .Replace("{{source_dir}}", srcDir)
+                   .Replace("{{project}}", config.ProjectName)
+            else ""
         String.concat "\n" [
             $"Sprint {sprintNum}. Port {config.SourceLang} logic to {config.TargetLang}."
             ""
             "<sprint_scope>"
             "THIS SPRINT = 2 MONTHS OF DEVELOPER TIME. Plan accordingly."
             ""
-            "You are opus on 1M context. AI agents MASSIVELY UNDERESTIMATE what they can do"
-            "in a single session. What feels like 'a lot of work' to you is actually a"
-            "reasonable single-session task. You can read 50 full source files, port thousands"
-            "of lines, and make dozens of commits in one sprint."
+            "AI agents MASSIVELY UNDERESTIMATE what they can do in a single session."
+            "What feels like 'a lot of work' is actually a reasonable single-session task."
+            "You have a 1-million token context window. You can read 50 full source files,"
+            "port thousands of lines, and make dozens of commits in one sprint."
             ""
             "A MEDIOCRE sprint: reads a few files, ports 1-2 functions, makes 2 commits."
-            "A GOOD sprint: ports an entire TS file (1000-3000 LOC), makes 10+ commits, flips 20+ tests."
-            "A GREAT sprint: ports MULTIPLE TS files, flips 50+ tests, moves real-world parity by percentage points."
+            "A GOOD sprint: ports an ENTIRE source file (1000-3000 LOC), makes 10+ commits, flips 20+ tests."
+            "A GREAT sprint: ports MULTIPLE source files, flips 50+ tests, moves parity by percentage points."
             ""
             "Be the GREAT sprint."
             "</sprint_scope>"
@@ -328,28 +340,28 @@ module ConvergenceLoop =
             "<parity_rules>"
             "EVERY COMMIT MUST MAKE AT LEAST ONE TEST FLIP FROM FAIL TO PASS."
             "Measure before. Port. Measure after. Delta must be positive."
-            "Commit message format: 'chunk-name: description (NNN/MMM → NNN+K/MMM)'"
+            "Commit message format: 'area: description (NNN/MMM → NNN+K/MMM)'"
             ""
             "BANNED (these waste cycles without parity gains):"
             "  - Refactoring that doesn't fix a failing test"
             "  - Review-fix rounds on comments/formatting"
-            "  - Port-debt documentation instead of actual porting"
-            "  - Type-printer work when underlying types are Unknown"
+            "  - Documentation instead of actual porting"
             "  - Infrastructure that doesn't produce test wins in THIS sprint"
             ""
             "REQUIRED WORKFLOW:"
-            "  1. Run: go test -run TestTypeEval -timeout 600s ./internal/testrunner/ 2>&1 | grep CONVERGENCE"
-            "  2. Note the current pass count"
-            "  3. Pick a failing bucket. Read the ENTIRE TS source file for that area."
+            "  1. Run the project's test suite and note the current pass count"
+            "  2. Pick a failing bucket. Read the ENTIRE source file for that area."
             "     Not a function. The ENTIRE FILE. You have 1M tokens."
-            "  4. Port EVERY unported function in that file. Build + test after each one."
-            "  5. Each commit must increase the pass count. If it doesn't, keep porting until it does."
-            "  6. When the file is done, pick the NEXT failing area and repeat."
-            "  7. STOP ONLY when you have genuinely run out of productive porting work to do."
+            "  3. Port EVERY unported function in that file. Build + test after each one."
+            "  4. Each commit must increase the pass count. Keep porting until it does."
+            "  5. When the file is done, pick the NEXT failing area and repeat."
+            "  6. STOP ONLY when you have genuinely run out of productive porting work to do."
             "</parity_rules>"
             ""
-            "READ: .github/instructions/chunk-catalog.instructions.md for chunk specs."
-            $"TS reference: {srcDir}"
+            // Project-specific instructions from template file
+            if projectSpecific <> "" then $"<project_instructions>\n{projectSpecific}\n</project_instructions>"
+            ""
+            $"Source reference: {srcDir}"
             "You MUST commit your changes. Do NOT push."
             ""
             $"<test_status>\n{dbBriefing}\n</test_status>"
@@ -358,8 +370,8 @@ module ConvergenceLoop =
             "<persistence>"
             "You are NOT 'almost done' after 2 commits. You are NOT 'making good progress'."
             "You are done when the failing bucket count has materially dropped and you've"
-            "ported every function you can from the TS source. If you've only changed 200 lines"
-            "of Go, you have barely started. Keep going."
+            "ported every function you can from the source. If you've only changed 200 lines,"
+            "you have barely started. Keep going."
             "</persistence>"
             nudgeBlock ()
             prevBlock
@@ -538,31 +550,33 @@ module ConvergenceLoop =
             Beads.note bead msg
 
             // Hard gate: check for removed "// Ported from:" or "// TODO(port):" comments
-            let regressions = PortStatus.checkRegressions baseCommit
-            if not regressions.IsEmpty then
-                let regMsg = regressions |> List.map (fun r -> $"  REMOVED: {r}") |> String.concat "\n"
-                printfn "  🚨 Coverage regression — ported logic markers removed:\n%s" regMsg
-                Beads.note bead $"COVERAGE_REGRESSION: {regressions.Length} markers removed"
-                // Tell agent to restore the removed markers
-                let fixPrompt = String.concat "\n" [
-                    "COVERAGE REGRESSION DETECTED. These '// Ported from:' or '// TODO(port):' markers were removed:"
-                    regMsg
-                    "These markers track ported TypeScript logic. Removing them means losing traceability."
-                    "Restore them. If you refactored the code, move the markers to the new location."
-                    "If you genuinely replaced the logic with something better, keep the marker and update the line range." ]
-                Agent.resume sid fixPrompt $"RestoreCoverage-S{next}" |> ignore
-                // Recheck
-                let stillRemoved = PortStatus.checkRegressions baseCommit
-                if not stillRemoved.IsEmpty then
-                    passed <- false
-                    let failMsg = $"Coverage regression: {stillRemoved.Length} Ported-from markers still removed"
-                    lastFail <- failMsg
-                    printfn "  ❌ %s" failMsg
+            // Only runs if the project uses port-traceability markers (opt-in).
+            let sourceIndexDb = Path.Combine(targetDir(), "pyright-source-index.db")
+            let hasPortStatus = File.Exists sourceIndexDb
+            if hasPortStatus then
+                let regressions = PortStatus.checkRegressions baseCommit
+                if not regressions.IsEmpty then
+                    let regMsg = regressions |> List.map (fun r -> $"  REMOVED: {r}") |> String.concat "\n"
+                    printfn "  🚨 Coverage regression — ported logic markers removed:\n%s" regMsg
+                    Beads.note bead $"COVERAGE_REGRESSION: {regressions.Length} markers removed"
+                    let fixPrompt = String.concat "\n" [
+                        "COVERAGE REGRESSION DETECTED. These '// Ported from:' or '// TODO(port):' markers were removed:"
+                        regMsg
+                        "These markers track ported logic. Removing them means losing traceability."
+                        "Restore them. If you refactored the code, move the markers to the new location."
+                        "If you genuinely replaced the logic with something better, keep the marker and update the line range." ]
+                    Agent.resume sid fixPrompt $"RestoreCoverage-S{next}" |> ignore
+                    let stillRemoved = PortStatus.checkRegressions baseCommit
+                    if not stillRemoved.IsEmpty then
+                        passed <- false
+                        let failMsg = $"Coverage regression: {stillRemoved.Length} Ported-from markers still removed"
+                        lastFail <- failMsg
+                        printfn "  ❌ %s" failMsg
 
             if passed && d > 0 then
                 Beads.closeSuccess bead msg; printfn $"  OK: {msg}"
-                // Sync port_status from "// Ported from:" comments — orchestrator-owned, not agent-dependent
-                PortStatus.sync next
+                // Sync port_status if the project uses a source-index DB (opt-in)
+                if hasPortStatus then PortStatus.sync next
                 // Knowledge capture — runs BEFORE push so its changes get included
                 let capturePrompt = String.concat "\n" [
                     $"Sprint {next} succeeded."
