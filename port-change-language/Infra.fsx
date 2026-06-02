@@ -1,10 +1,11 @@
 #!/usr/bin/env dotnet fsi
 /// Infrastructure: Agent, Git, Harvest, Verify, Triage, Briefing, Streak, Bootstrap, Status
-#r "nuget: Fli"
+#load "Db.fsx"
 
 open System
 open System.IO
 open Fli
+open Db
 
 // ─── Domain types ───────────────────────────────────────────────
 
@@ -39,9 +40,19 @@ module Agent =
 // ─── Git ────────────────────────────────────────────────────────
 
 module Git =
-    let head ()            = try (cli { Exec "git"; Arguments [|"rev-parse";"HEAD"|] } |> Command.execute).Text |> Option.defaultValue "HEAD" |> fun s -> s.Trim() with _ -> "HEAD"
-    let push ()            = try (cli { Exec "git"; Arguments [|"push"|] } |> Command.execute).ExitCode = 0 |> fun ok -> if ok then printfn "  Pushed." else printfn "  ⚠ push failed"; ok with _ -> false
-    let hasNewCommits bc   = head () <> bc
+    let head () =
+        try (cli { Exec "git"; Arguments [|"rev-parse";"HEAD"|] } |> Command.execute).Text
+            |> Option.defaultValue "HEAD" |> fun s -> s.Trim()
+        with _ -> "HEAD"
+
+    let push () =
+        try
+            let ok = (cli { Exec "git"; Arguments [|"push"|] } |> Command.execute).ExitCode = 0
+            if ok then printfn "  Pushed." else printfn "  ⚠ push failed"
+            ok
+        with _ -> false
+
+    let hasNewCommits bc = head () <> bc
 
 // ─── Harvest ────────────────────────────────────────────────────
 
@@ -138,6 +149,21 @@ module Bootstrap =
             ""
             "You MUST commit. Do NOT push." ]
 
+// ─── Verifiers ──────────────────────────────────────────────────
+
+module Verifiers =
+    let private dir = Path.Combine(__SOURCE_DIRECTORY__, "verifiers")
+    let listAll () = if Directory.Exists dir then Directory.GetFiles(dir, "*.md") |> Array.map Path.GetFileNameWithoutExtension |> Array.sort |> Array.toList else []
+    let private read n = let p = Path.Combine(dir, n + ".md") in if File.Exists p then File.ReadAllText p else ""
+
+    let runOne name baseCommit =
+        let preamble = $"VERIFIER. Scope: git diff {baseCommit}..HEAD\nOutput VERIFY_PASSED or VERIFY_FAILED."
+        let prompt = preamble + "\n\n" + read name
+        Agent.run prompt $"Verify-{name}"
+        let out = Agent.lastOutput ()
+        let passed = out.Contains "VERIFY_PASSED" && not (out.Contains "VERIFY_FAILED")
+        (passed, out, "")
+
 // ─── Verify ─────────────────────────────────────────────────────
 
 module Verify =
@@ -152,20 +178,7 @@ module Verify =
                 |> Async.Parallel |> Async.RunSynchronously |> Array.toList
             let failed = results |> List.filter (fun (_, p, _) -> not p)
             if failed.IsEmpty then (true, "")
-            else (false, failed |> List.map (fun (v,_,o) -> $"=== {v} ===\n{o.[..min 2000 (o.Length-1)]}") |> String.concat "\n")
-
-module Verifiers =
-    let private dir = Path.Combine(__SOURCE_DIRECTORY__, "verifiers")
-    let listAll () = if Directory.Exists dir then Directory.GetFiles(dir, "*.md") |> Array.map Path.GetFileNameWithoutExtension |> Array.sort |> Array.toList else []
-    let private read n = let p = Path.Combine(dir, n + ".md") in if File.Exists p then File.ReadAllText p else ""
-
-    let runOne name baseCommit =
-        let preamble = $"VERIFIER. Scope: git diff {baseCommit}..HEAD\nOutput VERIFY_PASSED or VERIFY_FAILED."
-        let prompt = preamble + "\n\n" + read name
-        Agent.run prompt $"Verify-{name}"
-        let out = Agent.lastOutput ()
-        let passed = out.Contains "VERIFY_PASSED" && not (out.Contains "VERIFY_FAILED")
-        (passed, out, "")
+            else (false, failed |> List.map (fun (v,_,o:string) -> $"=== {v} ===\n{o.[..min 2000 (o.Length-1)]}") |> String.concat "\n")
 
 // ─── Streak (file-backed, survives restarts) ────────────────────
 

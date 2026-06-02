@@ -1,16 +1,9 @@
 #!/usr/bin/env dotnet fsi
-/// ╔══════════════════════════════════════════════════════════════╗
-/// ║  ralph-port — autonomous porting convergence loop            ║
-/// ║                                                              ║
-/// ║  Usage: dotnet fsi ralph-port.fsx <source-dir>               ║
-/// ║         (run from inside the target repo)                    ║
-/// ║                                                              ║
-/// ║  Sprint 0 bootstraps everything automatically:               ║
-/// ║    discovers languages, creates harvest script, writes       ║
-/// ║    sprint-briefing template. No manual setup needed.         ║
-/// ╚══════════════════════════════════════════════════════════════╝
+// NuGet references — must be at the top-level entry point for FSI
+#r "nuget: Microsoft.Data.Sqlite"
+#r "nuget: Fli"
+
 #load "Infra.fsx"
-#load "Db.fsx"
 
 open System
 open Infra
@@ -18,6 +11,7 @@ open Db
 
 // ─── THE LOOP (this is the whole thing) ─────────────────────────
 
+/// Returns true if the loop should continue, false to stop.
 let step sourceDir =
     let db    = Db.open' ()
     let sn    = Db.sprintNum db
@@ -34,15 +28,17 @@ let step sourceDir =
     | Bootstrap ->
         printfn $"S{next} | Bootstrap"
         Agent.run (Bootstrap.prompt sourceDir next) $"S{next}"
-        Git.push ()
+        Git.push () |> ignore
+        true
 
     | FalseAllPass (n, high) ->
         printfn $"  🚨 FALSE ALL-PASS: {n} tests vs high {high}"
         Agent.run "BUILD REPAIR: fix all compile errors. Search for <<<<<<< in source." $"Fix-S{next}"
-        
+        true
+
     | AllPass ->
         printfn "✅ All pass!"
-        false  // signal: stop the loop
+        false
 
     | Sprint ->
         let brief   = Db.briefing (Db.open' ())
@@ -61,22 +57,19 @@ let step sourceDir =
         if Git.hasNewCommits bc then Streak.reset ()
         else Streak.bump () |> fun s -> printfn $"  ⚠ No commits (streak={s})"
 
-        Harvest.run next                          // measure AFTER impl
+        Harvest.run next
 
-        let vOk, _  = Verify.runAll bc            // quality gates
+        let vOk, _   = Verify.runAll bc
         let fp, ft   = Db.passRate (Db.open' ())
         let delta    = fp - pp
 
         printfn $"  {fp}/{ft} d={delta}"
         if vOk && delta > 0 then
             Agent.run $"Sprint {next} done. Capture learnings." $"Learn-S{next}"
-            Git.push ()
+            Git.push () |> ignore
             printfn $"  ✅ OK"
         else printfn $"  ❌ Fail"
-
-        delta > 0  // signal: did we improve?
-
-    true  // signal: keep looping
+        true
 
 let run sourceDir =
     printfn $"═══ ralph-port: {sourceDir} ═══"
@@ -94,9 +87,10 @@ let run sourceDir =
 // ─── CLI ────────────────────────────────────────────────────────
 
 match fsi.CommandLineArgs |> Array.toList |> List.tail with
-| [sourceDir]          -> run sourceDir
 | "status" :: _        -> Status.show ()
 | "watch"  :: rest     -> Status.watch (rest |> List.tryHead |> Option.map int |> Option.defaultValue 30)
+| [sourceDir]          -> run sourceDir
+| sourceDir :: _       -> run sourceDir
 | _ ->
     printfn "ralph-port — autonomous porting convergence loop"
     printfn ""

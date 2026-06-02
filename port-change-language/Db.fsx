@@ -1,6 +1,5 @@
 #!/usr/bin/env dotnet fsi
 /// Sprint SQLite database — test tracking, bucket ranking, trend data.
-#r "nuget: Microsoft.Data.Sqlite"
 
 open System
 open System.IO
@@ -50,7 +49,7 @@ module Db =
         conn.Close()
         String.concat "\n" (lines @ blines)
 
-    let writeLog sprintNum text =
+    let writeLog sprintNum (text: string) =
         let dir = Path.Combine(runtimeDir (), "sprint_logs") in Directory.CreateDirectory dir |> ignore
         let p = Path.Combine(dir, $"sprint_{sprintNum:D4}.log")
         File.WriteAllText(p, if text.Length > 200_000 then text.[text.Length-200_000..] else text)
