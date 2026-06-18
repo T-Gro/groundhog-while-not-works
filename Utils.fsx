@@ -9,7 +9,9 @@ open System.Collections.Generic
 open YamlDotNet.Serialization
 
 module Config =
-    let Model = "claude-opus-4.7"
+    let Model = Environment.GetEnvironmentVariable("DM_COPILOT_MODEL") |> Option.ofObj |> Option.defaultValue "claude-opus-4.8"
+    let Effort = Environment.GetEnvironmentVariable("DM_COPILOT_EFFORT") |> Option.ofObj |> Option.defaultValue "high"
+    let Context = Environment.GetEnvironmentVariable("DM_COPILOT_CONTEXT") |> Option.ofObj |> Option.defaultValue "long_context"
     let MaxIterations = 15
     let ArbiterThreshold = 6  // Iterations per sprint before calling arbiter
     let MaxArbiterAttempts = 6  // Max arbiter invocations before giving up

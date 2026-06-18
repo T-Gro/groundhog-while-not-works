@@ -71,7 +71,7 @@ let runAgent (prompt: string) (title: string) (_showWindow: bool) (resumeSession
             match resumeSessionId with
             | None   -> [| "--name"; sessionName |]
             | Some n -> [| $"--resume={n}" |]
-        let baseArgs = Array.append [| "--allow-all-tools"; "--allow-all-paths"; "--no-ask-user";"--no-color";"--plain-diff";"-s";"--model"; Config.Model; "--stream"; "off" |] sessionArgs
+        let baseArgs = Array.append [| "--allow-all-tools"; "--allow-all-paths"; "--no-ask-user";"--no-color";"--plain-diff";"-s";"--model"; Config.Model; "--effort"; Config.Effort; "--context"; Config.Context; "--stream"; "off" |] sessionArgs
         
         // Run copilot via Fli — use Config.workDir so copilot runs in the target repo
         let result = 
