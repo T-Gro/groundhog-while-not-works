@@ -378,6 +378,65 @@ module ConvergenceLoop =
             prevBlock
         ]
 
+    /// Design-review-BEFORE-implementation: a PROPOSER drafts a port design (no code),
+    /// an adversarial CRITIC checks it is a FAITHFUL port (not an invention/gate/patch)
+    /// against the cited source anchors, and the proposer revises until approved (bounded).
+    /// Returns the approved (or best) design text to hand to the implementor. Cheap
+    /// (usually 2 agent calls) and catches unfaithful ports before any code is written.
+    let private designReview config sprintNum (baseBrief: string) bead : string =
+        let maxRounds = 2
+        let proposePrompt = String.concat "\n" [
+            $"You are the PROPOSER for sprint {sprintNum} of a {config.SourceLang} -> {config.TargetLang} PORT."
+            "Do NOT write code and do NOT change files. Produce a concise DESIGN for the slice you will port."
+            "First READ the relevant SOURCE file(s) at the anchors and the TARGET file(s) you would change."
+            "Your design MUST state:"
+            "  1. The exact source symbol(s)/logic to port, with file:line anchors."
+            "  2. The target file(s)/functions to change, and how."
+            "  3. Why this is FAITHFUL to the source (a port, not an invention/gate/patch)."
+            "  4. The specific failing diagnostics/tests it will flip, and the regression risks."
+            "Keep it under ~40 lines. Wrap the final plan in <DESIGN> ... </DESIGN>."
+            ""
+            baseBrief ]
+        let (design0, proposerSid) = Agent.run proposePrompt $"Propose-S{sprintNum}" None
+        Beads.note bead "PHASE:design proposed"
+        let mutable design = design0
+        let mutable approved = false
+        let mutable round = 0
+        while not approved && round < maxRounds do
+            let criticPrompt = String.concat "\n" [
+                $"You are the CRITIC — an adversarial DESIGN reviewer for a {config.SourceLang} -> {config.TargetLang} PORT."
+                "You review a DESIGN, not code. You WRITE NO CODE and change NO files."
+                "Open the cited source file:line anchors and verify the design is a FAITHFUL port:"
+                "  - Does it reproduce the source logic, or invent / gate / patch around it?"
+                "  - Are the anchors real and correct?"
+                "  - Will it regress existing matching diagnostics? Is the slice coherent and shippable?"
+                "  - Is it the biggest-leverage slice available, or busywork?"
+                "If the design is a sound, faithful port, reply with the exact token DESIGN_APPROVED."
+                "Otherwise reply DESIGN_REVISE and give 2-5 specific, actionable fixes."
+                ""
+                "=== DESIGN UNDER REVIEW ==="
+                design ]
+            let (criticOut, _) = Agent.run criticPrompt $"Critic-S{sprintNum}" None
+            if criticOut.Contains "DESIGN_APPROVED" && not (criticOut.Contains "DESIGN_REVISE") then
+                approved <- true
+                Beads.note bead $"PHASE:design approved round={round+1}"
+            else
+                Beads.note bead $"PHASE:design revise round={round+1}"
+                let revisePrompt = String.concat "\n" [
+                    "The CRITIC rejected your design. Revise it to address EVERY point. Still NO code, NO file changes."
+                    "Re-read the source anchors if needed. Wrap the revised plan in <DESIGN> ... </DESIGN>."
+                    ""
+                    "=== CRITIC FEEDBACK ==="
+                    trunc criticOut 3000 ]
+                design <- Agent.resume proposerSid revisePrompt $"Revise-S{sprintNum}"
+                round <- round + 1
+        if not approved then
+            Beads.note bead "PHASE:design UNAPPROVED — proceeding with best design"
+            printfn $"  ⚠ Design not approved after {maxRounds} rounds; proceeding with best design."
+        else
+            printfn "  ✔ Design approved."
+        design
+
     let step maxRetries prevFailure : bool * string =
         let config = ensureInit ()
         let db = currentDbPath (key())
@@ -483,10 +542,22 @@ module ConvergenceLoop =
                     $"\n<stall_warning>\nImplementor has produced ZERO commits for {streak} consecutive sprints on the top bucket.\nThis bucket is almost certainly blocked on a KEYSTONE — a foundational port (field population, flow narrowing, overload resolution, builtin symbol tables) that many diagnostics sit behind.\nDo NOT abandon it for a smaller unrelated bucket, and do NOT ship a cosmetic one-line fix.\nInstead: consult _porting/PROCESS.md and run `python _porting/tools/next.py`, identify the KEYSTONE this bucket depends on, and port the smallest coherent STRUCTURAL slice of that keystone from the source (cite source file:line). Land that; the bucket unblocks itself.\n</stall_warning>"
                 else ""
 
-            let prompt = (buildBriefing config next brief allBuckets prevFailure) + stallNotice
+            let baseBrief = (buildBriefing config next brief allBuckets prevFailure) + stallNotice
             let bead = Beads.createSprint next topBucket $"Pre:{pp}/{pt}"
             Beads.claim bead
             let sc = initSchema db in initSprint sc next topBucket pp pt; sc.Close()
+
+            // Design-review BEFORE implementation: proposer drafts a port design,
+            // adversarial critic checks faithfulness to the source, proposer revises
+            // until approved (bounded). Catches unfaithful ports before code is written.
+            Beads.note bead "PHASE:design"
+            let approvedDesign = designReview config next baseBrief bead
+            let prompt =
+                baseBrief
+                + "\n\n<approved_design>\nA proposer/critic review approved this port design. IMPLEMENT IT."
+                + " Deviate only if the source code proves it wrong (and say why).\n"
+                + approvedDesign
+                + "\n</approved_design>"
 
             // Record base commit BEFORE implementor runs — this defines the sprint's diff scope
             let baseCommit =
