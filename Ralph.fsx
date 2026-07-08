@@ -62,7 +62,7 @@ let runAgent (prompt: string) (title: string) (_showWindow: bool) (resumeSession
         let escapedPrompt = prompt.Replace("{", "{{").Replace("}", "}}")
         
         // Build arguments: include --resume {sessionId} for session tracking
-        let baseArgs = [| "--allow-all-tools"; "--allow-all-paths"; "--no-ask-user";"--no-color";"--plain-diff";"-s";"--model"; Config.Model; "--stream"; "off"; "--resume"; sessionId |]
+        let baseArgs = [| "--allow-all-tools"; "--allow-all-paths"; "--no-ask-user";"--no-color";"--plain-diff";"-s";"--model"; Config.Model; "--effort"; Config.Effort; "--stream"; "off"; "--resume"; sessionId |]
         
         // Run copilot via Fli
         let result = 

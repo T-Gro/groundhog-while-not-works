@@ -75,7 +75,8 @@ module Beads =
 
 module Agent =
 
-    let Model = "claude-opus-4.7-1m-internal"
+    let Model = "claude-opus-4.8"
+    let Effort = "xhigh"  // reasoning effort: none|low|medium|high|xhigh|max
 
     let run (prompt: string) (title: string) (resumeId: string option) : string * string =
         // Copilot CLI distinguishes new sessions (--name) from resumes (--resume).
@@ -86,7 +87,7 @@ module Agent =
         let sessionFlag = if isResume then "--resume" else "--name"
         try
             let result =
-                cli { Exec "copilot"; Arguments [| "-p"; prompt; sessionFlag; sid; "--allow-all"; "--no-ask-user"; "-s"; "--no-color"; "--plain-diff"; "--model"; Model; "--stream"; "off" |] }
+                cli { Exec "copilot"; Arguments [| "-p"; prompt; sessionFlag; sid; "--allow-all"; "--no-ask-user"; "-s"; "--no-color"; "--plain-diff"; "--model"; Model; "--effort"; Effort; "--stream"; "off" |] }
                 |> Command.execute
             let stdout = result.Text |> Option.defaultValue ""
             if stdout = "" then
@@ -479,7 +480,7 @@ module ConvergenceLoop =
             let topBucket = rotatedRanked |> List.head |> fun (b,_,_,_) -> b
             let stallNotice =
                 if streak >= 3 then
-                    $"\n<stall_warning>\nImplementor has produced ZERO commits for {streak} consecutive sprints.\nRotating past the top-{rotateBy} bucket(s). Try '{topBucket}' instead.\nIf you cannot make ANY progress on this bucket either, pick a SMALLER concrete target inside it (one test file, one diagnostic message) and ship a one-line fix.\n</stall_warning>"
+                    $"\n<stall_warning>\nImplementor has produced ZERO commits for {streak} consecutive sprints on the top bucket.\nThis bucket is almost certainly blocked on a KEYSTONE — a foundational port (field population, flow narrowing, overload resolution, builtin symbol tables) that many diagnostics sit behind.\nDo NOT abandon it for a smaller unrelated bucket, and do NOT ship a cosmetic one-line fix.\nInstead: consult _porting/PROCESS.md and run `python _porting/tools/next.py`, identify the KEYSTONE this bucket depends on, and port the smallest coherent STRUCTURAL slice of that keystone from the source (cite source file:line). Land that; the bucket unblocks itself.\n</stall_warning>"
                 else ""
 
             let prompt = (buildBriefing config next brief allBuckets prevFailure) + stallNotice
