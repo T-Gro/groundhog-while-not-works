@@ -179,19 +179,21 @@ module PortStatus =
             let jsonData = System.Text.Json.JsonSerializer.Serialize(entries |> List.map (fun (t,l,g) -> {| ts=t; lines=l; go=g |}))
             File.WriteAllText(tmpJson, jsonData)
             let pyScript = String.concat "\n" [
-                "import sqlite3, json, sys"
+                "import sqlite3, json, sys, os"
                 "db, jf, sprint = sys.argv[1], sys.argv[2], int(sys.argv[3])"
                 "conn = sqlite3.connect(db)"
                 "c = conn.cursor()"
                 "entries = json.load(open(jf))"
                 ""
-                "# Load function-level entries for range matching"
+                "# Load function-level ranges, keyed by BASENAME so bare-name markers"
+                "# (e.g. 'typeEvaluator.ts') canonicalize to the prefixed index path"
+                "# ('analyzer/typeEvaluator.ts'). Store the real ts_file for the UPDATE."
                 "func_ranges = {}"
-                "for row in c.execute('SELECT ts_file, ts_lines, concept FROM port_status WHERE ts_lines IS NOT NULL AND ts_lines != \"\"'):"
+                "for row in c.execute(\"SELECT ts_file, ts_lines, concept FROM port_status WHERE ts_lines IS NOT NULL AND ts_lines != '' AND ts_file LIKE '%.ts' AND concept NOT LIKE 'phantom:%'\"):"
                 "    f, lr, concept = row"
                 "    if '-' in lr:"
                 "        parts = lr.replace('\\u2013', '-').split('-')"
-                "        try: func_ranges.setdefault(f, []).append((int(parts[0]), int(parts[1]), concept))"
+                "        try: func_ranges.setdefault(os.path.basename(f), []).append((int(parts[0]), int(parts[1]), concept, f))"
                 "        except: pass"
                 ""
                 "updated = 0"
@@ -199,28 +201,30 @@ module PortStatus =
                 "for e in entries:"
                 "    ts, lines, go = e['ts'], e['lines'], e['go']"
                 "    matched_concept = None"
+                "    real_file = None"
                 "    if lines and '-' in lines:"
                 "        parts = lines.replace('\\u2013', '-').split('-')"
                 "        try:"
                 "            start = int(parts[0])"
-                "            for (fs, fe, fc) in func_ranges.get(ts, []):"
+                "            for (fs, fe, fc, rf) in func_ranges.get(os.path.basename(ts), []):"
                 "                if fs <= start <= fe:"
-                "                    matched_concept = fc"
+                "                    matched_concept = fc; real_file = rf"
                 "                    break"
                 "        except: pass"
                 "    if matched_concept:"
                 "        # Marker maps to a real TS function range -> honest coverage."
-                "        c.execute('UPDATE port_status SET go_file=?, status=\"implemented\", sprint=?, updated_at=datetime(\"now\") WHERE ts_file=? AND concept=?', (go, sprint, ts, matched_concept))"
+                "        # 'partial' = ported (a marker present); promotion to 'complete'"
+                "        # is earned by the faithfulness verifier, not by typing a comment."
+                "        c.execute('UPDATE port_status SET go_file=?, status=\"partial\", sprint=?, updated_at=datetime(\"now\") WHERE ts_file=? AND concept=? AND status!=\"complete\"', (go, sprint, real_file, matched_concept))"
                 "        updated += 1"
                 "    else:"
-                "        # PHANTOM marker: cites a TS file/range with no known function range."
-                "        # Do NOT let it inflate coverage — record it as 'phantom' for the audit,"
-                "        # never as ported. (Agents could otherwise raise coverage by typing comments.)"
+                "        # PHANTOM marker: cites a TS file/range with no known function"
+                "        # range. Do NOT write it (it would not advance coverage and the"
+                "        # schema CHECK forbids a 'phantom' status) — just count for audit."
                 "        phantom += 1"
-                "        c.execute('INSERT INTO port_status (ts_file, ts_lines, concept, go_file, status, sprint, updated_at) VALUES (?, ?, ?, ?, ?, ?, datetime(\"now\")) ON CONFLICT(ts_file, concept) DO UPDATE SET go_file=excluded.go_file, sprint=excluded.sprint, updated_at=datetime(\"now\")', (ts, lines, 'phantom:'+ts+':'+str(lines), go, 'phantom', sprint))"
                 "conn.commit()"
                 "stats = dict(c.execute('SELECT status, COUNT(*) FROM port_status GROUP BY status').fetchall())"
-                "print('port_status: %d verified markers, %d PHANTOM (unmatched TS range) | ' % (updated, phantom) + ' '.join('%s=%d'%(s,n) for s,n in stats.items()))"
+                "print('port_status: %d markers matched, %d PHANTOM (unmatched TS range) | ' % (updated, phantom) + ' '.join('%s=%d'%(s,n) for s,n in stats.items()))"
                 "conn.close()" ]
             let pyFile = Path.GetTempFileName() + ".py"
             File.WriteAllText(pyFile, pyScript)
@@ -264,17 +268,26 @@ module PortStatus =
             let dbPath = sourceIndexPath ()
             if not (File.Exists dbPath) then 0 else
             let py = String.concat "\n" [
-                "import sqlite3,subprocess,re,sys"
+                "import sqlite3,subprocess,re,sys,os"
                 "db,base=sys.argv[1],sys.argv[2]"
-                "files=set(r[0] for r in sqlite3.connect(db).execute('SELECT DISTINCT ts_file FROM port_status'))"
+                "# basename -> list of (start,end) real concept ranges (phantom excluded)."
+                "ranges={}"
+                "for f,lr in sqlite3.connect(db).execute(\"SELECT ts_file,ts_lines FROM port_status WHERE ts_lines IS NOT NULL AND ts_lines!='' AND ts_file LIKE '%.ts' AND concept NOT LIKE 'phantom:%'\"):"
+                "    if '-' in lr:"
+                "        p=lr.replace('\\u2013','-').split('-')"
+                "        try: ranges.setdefault(os.path.basename(f),[]).append((int(p[0]),int(p[1])))"
+                "        except: pass"
                 "diff=subprocess.run(['git','diff',base+'..HEAD','--','internal/'],capture_output=True,text=True).stdout"
-                "pat=re.compile(r'//\\s*Ported from:\\s*(\\S+?)(?::\\d+[-\\u2013]\\d+)?(?:\\s|$)',re.I)"
+                "pat=re.compile(r'//\\s*Ported from:\\s*(\\S+?):(\\d+)[-\\u2013]\\d+',re.I)"
+                "def valid(m):"
+                "    bn=os.path.basename(m.group(1)); start=int(m.group(2))"
+                "    return any(fs<=start<=fe for (fs,fe) in ranges.get(bn,[]))"
                 "def cnt(sign):"
                 "    n=0"
                 "    for l in diff.split('\\n'):"
                 "        if l.startswith(sign) and not l.startswith(sign*3):"
                 "            m=pat.search(l)"
-                "            if m and m.group(1) in files: n+=1"
+                "            if m and valid(m): n+=1"
                 "    return n"
                 "print(cnt('+')-cnt('-'))" ]
             let pyFile = Path.GetTempFileName() + ".py"
@@ -748,9 +761,14 @@ module ConvergenceLoop =
             let hardRegression =
                 parityHarvestBroken || (not passed) || not protectedTouched.IsEmpty || d < 0
                 || matchingRegressed || superfluousIncreased || markerRegression
+            // Coverage credit must not paper over a real parity bleed (Opus #4):
+            // a marker-only sprint that quietly drops matches or adds false positives
+            // is not durable progress. covNoiseFloor tolerates small ±noise only.
+            let covNoiseFloor = 50
+            let coverageCredit = covGain > 0 && matchGain > -covNoiseFloor && supDelta <= 0
             let durableProgress =
                 (not parityHarvestBroken)
-                && ((covGain > 0) || (d > 0) || (matchGain > noiseBand) || precisionWin)
+                && (coverageCredit || (d > 0) || (matchGain > noiseBand) || precisionWin)
 
             let revert (reason: string) =
                 (try cli { Exec "git"; Arguments [| "reset"; "--hard"; baseCommit |] } |> Command.execute |> ignore with _ -> ())
