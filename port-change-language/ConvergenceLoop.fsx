@@ -147,10 +147,15 @@ module Verifiers =
         (passed, fullOut)
 
 module PortStatus =
+    /// Canonical source-index DB path. The 908-row port_status table lives under
+    /// _tools/ (the repo root copy is an empty stray file) — pointing at the root
+    /// made sync/coverage a silent no-op.
+    let sourceIndexPath () = Path.Combine(targetDir(), "_tools", "pyright-source-index.db")
+
     /// Scan Go files for "// Ported from:" comments and update port_status in the source index DB.
     /// Runs after each successful sprint — orchestrator-owned, not agent-dependent.
     let sync (sprintNum: int) =
-        let dbPath = Path.Combine(targetDir(), "pyright-source-index.db")
+        let dbPath = sourceIndexPath ()
         if not (File.Exists dbPath) then () else
         let internalDir = Path.Combine(targetDir(), "internal")
         if not (Directory.Exists internalDir) then () else
@@ -248,9 +253,42 @@ module PortStatus =
             removed
         with _ -> []
 
+    /// Deterministic, NOISE-FREE progress signal: net count of `// Ported from:`
+    /// markers ADDED in this sprint's diff whose cited TS file exists in the source
+    /// index (a marker to an unknown file does not count — anti-inflation). New
+    /// faithful ports add markers, so structural / keystone work accretes on HEAD
+    /// even when it flips no diagnostic yet. This is what dissolves the revert-spin:
+    /// coverage is immune to the ±250 parity noise.
+    let coverageGain (baseCommit: string) : int =
+        try
+            let dbPath = sourceIndexPath ()
+            if not (File.Exists dbPath) then 0 else
+            let py = String.concat "\n" [
+                "import sqlite3,subprocess,re,sys"
+                "db,base=sys.argv[1],sys.argv[2]"
+                "files=set(r[0] for r in sqlite3.connect(db).execute('SELECT DISTINCT ts_file FROM port_status'))"
+                "diff=subprocess.run(['git','diff',base+'..HEAD','--','internal/'],capture_output=True,text=True).stdout"
+                "pat=re.compile(r'//\\s*Ported from:\\s*(\\S+?)(?::\\d+[-\\u2013]\\d+)?(?:\\s|$)',re.I)"
+                "def cnt(sign):"
+                "    n=0"
+                "    for l in diff.split('\\n'):"
+                "        if l.startswith(sign) and not l.startswith(sign*3):"
+                "            m=pat.search(l)"
+                "            if m and m.group(1) in files: n+=1"
+                "    return n"
+                "print(cnt('+')-cnt('-'))" ]
+            let pyFile = Path.GetTempFileName() + ".py"
+            File.WriteAllText(pyFile, py)
+            let r = cli { Exec "python"; Arguments [| pyFile; dbPath; baseCommit |] } |> Command.execute
+            (try File.Delete pyFile with _ -> ())
+            match System.Int32.TryParse((r.Text |> Option.defaultValue "0").Trim()) with
+            | true, n -> n
+            | _ -> 0
+        with _ -> 0
+
     /// Generate a brief summary of porting progress from port_status.
     let summary () =
-        let dbPath = Path.Combine(targetDir(), "pyright-source-index.db")
+        let dbPath = sourceIndexPath ()
         if not (File.Exists dbPath) then "" else
         try
             let pyScript = "import sqlite3,sys\nconn=sqlite3.connect(sys.argv[1])\nrows=conn.execute('SELECT status,COUNT(*) FROM port_status GROUP BY status').fetchall()\nprint(' | '.join(f'{s}: {n}' for s,n in rows))\nconn.close()"
@@ -548,7 +586,13 @@ module ConvergenceLoop =
                 if b.StartsWith("parity-") then b.Substring(7).Replace("-fp", "") else ""
             let headBucket = ranked |> List.head |> fun (b, _, _, _) -> b
             let topBucket =
-                if next % 5 = 0 then
+                if next % 3 = 0 then
+                    // Coverage-driven sprint: systematically port the WHOLE product in
+                    // source order (G2), not just what the 6 sample projects exercise.
+                    match ranked |> List.tryFind (fun (b, _, _, _) -> b.StartsWith("coverage-")) with
+                    | Some (b, _, _, _) -> b
+                    | None -> headBucket
+                elif next % 5 = 0 then
                     let headProj = projOf headBucket
                     match ranked |> List.tryFind (fun (b, _, _, _) -> b.StartsWith("parity-") && projOf b <> "" && projOf b <> headProj) with
                     | Some (b, _, _, _) -> b
@@ -679,7 +723,7 @@ module ConvergenceLoop =
             // Marker-removal gate (F1 fix): removing a `// Ported from:` marker is only a
             // regression if NOT accompanied by a precision win — deleting over-broad ported
             // logic to kill false positives is legitimate porting work.
-            let sourceIndexDb = Path.Combine(targetDir(), "pyright-source-index.db")
+            let sourceIndexDb = PortStatus.sourceIndexPath ()
             let hasPortStatus = File.Exists sourceIndexDb
             let markerRegression =
                 if hasPortStatus && not precisionWin then
@@ -696,10 +740,17 @@ module ConvergenceLoop =
                         not (PortStatus.checkRegressions baseCommit).IsEmpty
                 else false
 
+            // Deterministic coverage progress (noise-free): new faithful ports add
+            // validated `// Ported from:` markers. Credit this so structural/keystone
+            // work accretes on HEAD even before it flips a diagnostic (kills the spin).
+            let covGain = if hasPortStatus then PortStatus.coverageGain baseCommit else 0
+
             let hardRegression =
                 parityHarvestBroken || (not passed) || not protectedTouched.IsEmpty || d < 0
                 || matchingRegressed || superfluousIncreased || markerRegression
-            let durableProgress = (not parityHarvestBroken) && ((d > 0) || (matchGain > noiseBand) || precisionWin)
+            let durableProgress =
+                (not parityHarvestBroken)
+                && ((covGain > 0) || (d > 0) || (matchGain > noiseBand) || precisionWin)
 
             let revert (reason: string) =
                 (try cli { Exec "git"; Arguments [| "reset"; "--hard"; baseCommit |] } |> Command.execute |> ignore with _ -> ())
