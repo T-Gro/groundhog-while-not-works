@@ -190,6 +190,7 @@ module PortStatus =
                 "        except: pass"
                 ""
                 "updated = 0"
+                "phantom = 0"
                 "for e in entries:"
                 "    ts, lines, go = e['ts'], e['lines'], e['go']"
                 "    matched_concept = None"
@@ -203,12 +204,18 @@ module PortStatus =
                 "                    break"
                 "        except: pass"
                 "    if matched_concept:"
-                "        c.execute('UPDATE port_status SET go_file=?, status=\"partial\", sprint=?, updated_at=datetime(\"now\") WHERE ts_file=? AND concept=?', (go, sprint, ts, matched_concept))"
+                "        # Marker maps to a real TS function range -> honest coverage."
+                "        c.execute('UPDATE port_status SET go_file=?, status=\"implemented\", sprint=?, updated_at=datetime(\"now\") WHERE ts_file=? AND concept=?', (go, sprint, ts, matched_concept))"
+                "        updated += 1"
                 "    else:"
-                "        c.execute('INSERT INTO port_status (ts_file, ts_lines, concept, go_file, status, sprint, updated_at) VALUES (?, ?, ?, ?, ?, ?, datetime(\"now\")) ON CONFLICT(ts_file, concept) DO UPDATE SET go_file=excluded.go_file, status=\"partial\", sprint=excluded.sprint, updated_at=datetime(\"now\")', (ts, lines, 'ported-function', go, 'partial', sprint))"
-                "    updated += 1"
+                "        # PHANTOM marker: cites a TS file/range with no known function range."
+                "        # Do NOT let it inflate coverage — record it as 'phantom' for the audit,"
+                "        # never as ported. (Agents could otherwise raise coverage by typing comments.)"
+                "        phantom += 1"
+                "        c.execute('INSERT INTO port_status (ts_file, ts_lines, concept, go_file, status, sprint, updated_at) VALUES (?, ?, ?, ?, ?, ?, datetime(\"now\")) ON CONFLICT(ts_file, concept) DO UPDATE SET go_file=excluded.go_file, sprint=excluded.sprint, updated_at=datetime(\"now\")', (ts, lines, 'phantom:'+ts+':'+str(lines), go, 'phantom', sprint))"
                 "conn.commit()"
-                "print('port_status: synced ' + str(updated) + ' entries')"
+                "stats = dict(c.execute('SELECT status, COUNT(*) FROM port_status GROUP BY status').fetchall())"
+                "print('port_status: %d verified markers, %d PHANTOM (unmatched TS range) | ' % (updated, phantom) + ' '.join('%s=%d'%(s,n) for s,n in stats.items()))"
                 "conn.close()" ]
             let pyFile = Path.GetTempFileName() + ".py"
             File.WriteAllText(pyFile, pyScript)
@@ -532,18 +539,28 @@ module ConvergenceLoop =
             conn2.Close()
             printfn $"S{next} | {pp}/{pt} | {ranked.Length} failing buckets"
 
-            // Bucket rotation: if implementor has been stalled for ≥3 sprints,
-            // skip the top-N buckets so we don't keep beating the same dead horse.
+            // Focus selection with per-project FAIRNESS: mostly work the biggest bucket,
+            // but every 5th sprint pick the biggest bucket of a DIFFERENT project so django
+            // (~9k missing) cannot starve pydantic/requests. No rotation toward SMALLER
+            // buckets (the old rotateBy contradicted the keystone stall notice).
             let streak = getNoCommitStreak (key())
-            let rotateBy = if streak >= 3 then min (streak - 2) (List.length ranked - 1) else 0
-            let rotatedRanked = ranked |> List.skip rotateBy
-            let topBucket = rotatedRanked |> List.head |> fun (b,_,_,_) -> b
+            let projOf (b: string) =
+                if b.StartsWith("parity-") then b.Substring(7).Replace("-fp", "") else ""
+            let headBucket = ranked |> List.head |> fun (b, _, _, _) -> b
+            let topBucket =
+                if next % 5 = 0 then
+                    let headProj = projOf headBucket
+                    match ranked |> List.tryFind (fun (b, _, _, _) -> b.StartsWith("parity-") && projOf b <> "" && projOf b <> headProj) with
+                    | Some (b, _, _, _) -> b
+                    | None -> headBucket
+                else headBucket
+            let focusNotice = $"\n<focus_bucket>\nTHIS SPRINT focus on the bucket: {topBucket}. Work the biggest lever inside it; port the responsible source logic.\n</focus_bucket>"
             let stallNotice =
                 if streak >= 3 then
-                    $"\n<stall_warning>\nImplementor has produced ZERO commits for {streak} consecutive sprints on the top bucket.\nThis bucket is almost certainly blocked on a KEYSTONE — a foundational port (field population, flow narrowing, overload resolution, builtin symbol tables) that many diagnostics sit behind.\nDo NOT abandon it for a smaller unrelated bucket, and do NOT ship a cosmetic one-line fix.\nInstead: consult _porting/PROCESS.md and run `python _porting/tools/next.py`, identify the KEYSTONE this bucket depends on, and port the smallest coherent STRUCTURAL slice of that keystone from the source (cite source file:line). Land that; the bucket unblocks itself.\n</stall_warning>"
+                    $"\n<stall_warning>\nImplementor produced ZERO commits for {streak} consecutive sprints on this bucket.\nIt is almost certainly blocked on a KEYSTONE — a foundational port (field population, flow narrowing, overload resolution, builtin symbol tables) that many diagnostics sit behind.\nDo NOT abandon it for a smaller unrelated bucket, and do NOT ship a cosmetic one-line fix.\nRead .github/instructions/parity-strategy.instructions.md, identify the KEYSTONE this bucket depends on, and port the smallest coherent STRUCTURAL slice of that keystone from the source (cite source file:line). Land that; the bucket unblocks itself.\n</stall_warning>"
                 else ""
 
-            let baseBrief = (buildBriefing config next brief allBuckets prevFailure) + stallNotice
+            let baseBrief = (buildBriefing config next brief allBuckets prevFailure) + focusNotice + stallNotice
             let bead = Beads.createSprint next topBucket $"Pre:{pp}/{pt}"
             Beads.claim bead
             let sc = initSchema db in initSprint sc next topBucket pp pt; sc.Close()
@@ -565,7 +582,7 @@ module ConvergenceLoop =
                 try (cli { Exec "git"; Arguments [|"rev-parse"; "HEAD"|] } |> Command.execute).Text |> Option.defaultValue "HEAD" |> fun s -> s.Trim()
                 with _ -> "HEAD"
 
-            Beads.note bead $"PHASE:impl baseCommit={baseCommit.[..7]} streak={streak} rotate={rotateBy}"
+            Beads.note bead $"PHASE:impl baseCommit={baseCommit.[..7]} streak={streak} focus={topBucket}"
             let (implOut, sid) = Agent.run prompt $"Impl-S{next}" None
 
             // Capture implementor stdout — diagnostic gold for debugging no-commit sprints.
