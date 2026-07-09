@@ -189,12 +189,14 @@ module PortStatus =
                 "# (e.g. 'typeEvaluator.ts') canonicalize to the prefixed index path"
                 "# ('analyzer/typeEvaluator.ts'). Store the real ts_file for the UPDATE."
                 "func_ranges = {}"
-                "for row in c.execute(\"SELECT ts_file, ts_lines, concept FROM port_status WHERE ts_lines IS NOT NULL AND ts_lines != '' AND ts_file LIKE '%.ts' AND concept NOT LIKE 'phantom:%'\"):"
+                "for row in c.execute(\"SELECT ps.ts_file, ps.ts_lines, ps.concept FROM port_status ps WHERE ps.ts_lines IS NOT NULL AND ps.ts_lines != '' AND ps.ts_file LIKE '%.ts' AND ps.concept NOT LIKE 'phantom:%' AND ps.ts_file IN (SELECT path FROM files)\"):"
                 "    f, lr, concept = row"
                 "    if '-' in lr:"
                 "        parts = lr.replace('\\u2013', '-').split('-')"
                 "        try: func_ranges.setdefault(os.path.basename(f), []).append((int(parts[0]), int(parts[1]), concept, f))"
                 "        except: pass"
+                "# Refuse to guess when a basename is owned by >1 real file (cross-dir collision)."
+                "ambig = set(b for b,v in func_ranges.items() if len(set(x[3] for x in v))>1)"
                 ""
                 "updated = 0"
                 "phantom = 0"
@@ -202,11 +204,12 @@ module PortStatus =
                 "    ts, lines, go = e['ts'], e['lines'], e['go']"
                 "    matched_concept = None"
                 "    real_file = None"
-                "    if lines and '-' in lines:"
+                "    bn = os.path.basename(ts)"
+                "    if lines and '-' in lines and bn not in ambig:"
                 "        parts = lines.replace('\\u2013', '-').split('-')"
                 "        try:"
                 "            start = int(parts[0])"
-                "            for (fs, fe, fc, rf) in func_ranges.get(os.path.basename(ts), []):"
+                "            for (fs, fe, fc, rf) in func_ranges.get(bn, []):"
                 "                if fs <= start <= fe:"
                 "                    matched_concept = fc; real_file = rf"
                 "                    break"
@@ -272,7 +275,7 @@ module PortStatus =
                 "db,base=sys.argv[1],sys.argv[2]"
                 "# basename -> list of (start,end) real concept ranges (phantom excluded)."
                 "ranges={}"
-                "for f,lr in sqlite3.connect(db).execute(\"SELECT ts_file,ts_lines FROM port_status WHERE ts_lines IS NOT NULL AND ts_lines!='' AND ts_file LIKE '%.ts' AND concept NOT LIKE 'phantom:%'\"):"
+                "for f,lr in sqlite3.connect(db).execute(\"SELECT ts_file,ts_lines FROM port_status WHERE ts_lines IS NOT NULL AND ts_lines!='' AND ts_file LIKE '%.ts' AND concept NOT LIKE 'phantom:%' AND ts_file IN (SELECT path FROM files)\"):"
                 "    if '-' in lr:"
                 "        p=lr.replace('\\u2013','-').split('-')"
                 "        try: ranges.setdefault(os.path.basename(f),[]).append((int(p[0]),int(p[1])))"
@@ -298,6 +301,95 @@ module PortStatus =
             | true, n -> n
             | _ -> 0
         with _ -> 0
+
+    /// Faithfulness promoter (partial -> complete). Orchestrator-owned, DETERMINISTIC
+    /// (no agent): a 'partial' concept (a marker exists) is promoted to 'complete' only
+    /// when the Go function carrying its marker is not a stub — no panic()/TODO(port)/
+    /// unimplemented sentinel AND its body is proportional to the TS range (>= 25%, min
+    /// 5 lines). This makes 'complete' an honest, non-forgeable terminus signal and stops
+    /// marker-on-stub farming from ever reaching "done".
+    let promote (sprintNum: int) =
+        try
+            let dbPath = sourceIndexPath ()
+            if not (File.Exists dbPath) then () else
+            let py = String.concat "\n" [
+                "import sqlite3,sys,os,re"
+                "db,sprint,root=sys.argv[1],int(sys.argv[2]),sys.argv[3]"
+                "conn=sqlite3.connect(db); c=conn.cursor()"
+                "rows=c.execute(\"SELECT ts_file,ts_lines,concept,go_file FROM port_status WHERE status='partial' AND go_file IS NOT NULL AND go_file!='' AND ts_lines LIKE '%-%' AND concept NOT LIKE 'phantom:%' AND ts_file IN (SELECT path FROM files) LIMIT 60\").fetchall()"
+                "STUB=re.compile(r'panic\\(|TODO\\(port\\)|not[ _]?implemented|unimplemented',re.I)"
+                "promoted=0"
+                "for ts_file,ts_lines,concept,go_file in rows:"
+                "    gp=os.path.join(root,go_file)"
+                "    if not os.path.exists(gp): continue"
+                "    try: lines=open(gp,encoding='utf-8').read().split('\\n')"
+                "    except: continue"
+                "    bn=os.path.basename(ts_file)"
+                "    try:"
+                "        a,b=ts_lines.replace('\\u2013','-').split('-'); tsn=int(b)-int(a)+1"
+                "    except: tsn=0"
+                "    ok=False"
+                "    for i,l in enumerate(lines):"
+                "        if 'Ported from' in l and bn in l:"
+                "            j=i"
+                "            while j>=0 and not lines[j].lstrip().startswith('func '): j-=1"
+                "            if j<0: continue"
+                "            depth=0; started=False; body=[]"
+                "            for k in range(j,len(lines)):"
+                "                body.append(lines[k]); depth+=lines[k].count('{')-lines[k].count('}')"
+                "                if '{' in lines[k]: started=True"
+                "                if started and depth<=0: break"
+                "            fn='\\n'.join(body); gon=len([x for x in body if x.strip()])"
+                "            if not STUB.search(fn) and gon>=max(5,int(tsn*0.25)): ok=True; break"
+                "    if ok:"
+                "        c.execute(\"UPDATE port_status SET status='complete', sprint=?, updated_at=datetime('now') WHERE ts_file=? AND concept=?\",(sprint,ts_file,concept)); promoted+=1"
+                "conn.commit(); print('promoted %d partial->complete'%promoted); conn.close()" ]
+            let pyFile = Path.GetTempFileName() + ".py"
+            File.WriteAllText(pyFile, py)
+            let r = cli { Exec "python"; Arguments [| pyFile; dbPath; string sprintNum; targetDir () |] } |> Command.execute
+            (try File.Delete pyFile with _ -> ())
+            r.Text |> Option.iter (fun t -> if t.Trim() <> "" then printfn "  🎓 %s" (t.Trim()))
+        with ex -> eprintfn "  ⚠ promote failed: %s" ex.Message
+
+    /// Honest convergence terminus. Returns a status string. DONE requires every real
+    /// indexed concept 'complete' AND every non-test source file present in the index
+    /// (the index-completeness gate: a truncated index can NEVER falsely fire "done" —
+    /// it forces the loop to extend the index instead).
+    let convergenceStatus () : string =
+        try
+            let dbPath = sourceIndexPath ()
+            if not (File.Exists dbPath) then "no-index" else
+            let py = String.concat "\n" [
+                "import sqlite3,sys,os"
+                "db,src=sys.argv[1],sys.argv[2]"
+                "conn=sqlite3.connect(db); c=conn.cursor()"
+                "remaining=c.execute(\"SELECT COUNT(*) FROM port_status WHERE status!='complete' AND concept NOT LIKE 'phantom:%' AND ts_file IN (SELECT path FROM files)\").fetchone()[0]"
+                "indexed=set(r[0] for r in c.execute('SELECT DISTINCT ts_file FROM port_status'))"
+                "missing=0"
+                "srcdir=os.path.join(src,'packages','pyright-internal','src')"
+                "if os.path.isdir(srcdir):"
+                "    for dp,_,fs in os.walk(srcdir):"
+                "        for f in fs:"
+                "            if f.endswith('.ts') and not f.endswith('.test.ts') and 'fourslash' not in dp:"
+                "                rel=os.path.relpath(os.path.join(dp,f),srcdir).replace(os.sep,'/')"
+                "                if rel not in indexed and os.path.basename(rel) not in set(os.path.basename(x) for x in indexed): missing+=1"
+                "conn.close()"
+                "print('%d %d'%(remaining,missing))" ]
+            let pyFile = Path.GetTempFileName() + ".py"
+            File.WriteAllText(pyFile, py)
+            let srcDir = ProjectConfig.ProjectConfig.load() |> Option.map (fun c -> c.SourceDir) |> Option.defaultValue ""
+            let r = cli { Exec "python"; Arguments [| pyFile; dbPath; srcDir |] } |> Command.execute
+            (try File.Delete pyFile with _ -> ())
+            let parts = (r.Text |> Option.defaultValue "1 1").Trim().Split(' ')
+            match parts with
+            | [| rem; mis |] ->
+                let remaining = (match System.Int32.TryParse rem with | true, n -> n | _ -> 1)
+                let missing = (match System.Int32.TryParse mis with | true, n -> n | _ -> 1)
+                if remaining = 0 && missing = 0 then "FULL_PRODUCT_DONE"
+                elif remaining = 0 then $"INDEXED_SCOPE_DONE_ONLY (index missing {missing} source files)"
+                else $"in-progress ({remaining} concepts unverified, {missing} files unindexed)"
+            | _ -> "unknown"
+        with _ -> "unknown"
 
     /// Generate a brief summary of porting progress from port_status.
     let summary () =
@@ -794,7 +886,14 @@ module ConvergenceLoop =
                 (false, "no durable progress")
             else
                 Beads.closeSuccess bead msg; printfn $"  OK: {msg}"
-                if hasPortStatus then PortStatus.sync next
+                if hasPortStatus then
+                    PortStatus.sync next        // markers -> 'partial'
+                    PortStatus.promote next     // faithfulness-verified 'partial' -> 'complete'
+                    let conv = PortStatus.convergenceStatus ()
+                    printfn $"  📈 convergence: {conv}"
+                    Beads.note bead $"convergence: {conv}"
+                    if conv = "FULL_PRODUCT_DONE" then
+                        printfn "  🏁 FULL PRODUCT PORTED — every source concept faithfully complete. Dropping to verify-only watch."
                 // Knowledge capture — runs BEFORE push so its changes get included
                 let capturePrompt = String.concat "\n" [
                     $"Sprint {next} landed durable progress ({msg})."
