@@ -192,6 +192,29 @@ module TestResultsDb =
         let total = cmd.ExecuteScalar() :?> int64 |> int
         (passing, total)
 
+    /// Real-world diagnostic parity aggregates read from the BUCKETS table (not
+    /// test rows). Returns (matching, missing, superfluous). parity-<proj> buckets
+    /// carry total_tests=reference count, passing=matching; parity-<proj>-fp buckets
+    /// carry the superfluous (false-positive) count as total_tests. This is the
+    /// signal the credit gate must use — passRate (test rows) is blind to parity.
+    let parityTotals (conn: SqliteConnection) : int * int * int =
+        use cmd = conn.CreateCommand()
+        cmd.CommandText <-
+            "SELECT " +
+            "COALESCE(SUM(CASE WHEN id LIKE 'parity-%' AND id NOT LIKE '%-fp' THEN passing END),0), " +
+            "COALESCE(SUM(CASE WHEN id LIKE 'parity-%' AND id NOT LIKE '%-fp' THEN total_tests - passing END),0), " +
+            "COALESCE(SUM(CASE WHEN id LIKE 'parity-%-fp' THEN total_tests END),0) " +
+            "FROM buckets"
+        use r = cmd.ExecuteReader()
+        if r.Read() then (int (r.GetInt64 0), int (r.GetInt64 1), int (r.GetInt64 2)) else (0, 0, 0)
+
+    /// Count of parity project buckets present (health check — must be 6, else the
+    /// parity harvest failed and the objective silently vanished).
+    let parityProjectCount (conn: SqliteConnection) : int =
+        use cmd = conn.CreateCommand()
+        cmd.CommandText <- "SELECT COUNT(*) FROM buckets WHERE id LIKE 'parity-%' AND id NOT LIKE '%-fp'"
+        cmd.ExecuteScalar() :?> int64 |> int
+
     /// Get buckets sorted by most non-passing (highest-impact first).
     let bucketsRanked (conn: SqliteConnection) : (string * string * int * int) list =
         use cmd = conn.CreateCommand()

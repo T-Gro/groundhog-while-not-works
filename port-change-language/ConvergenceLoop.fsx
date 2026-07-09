@@ -451,6 +451,7 @@ module ConvergenceLoop =
         let conn2 = initSchema db
         let next = sNum + 1
         let (pp, pt) = passRate conn2
+        let (pMatch0, _pMiss0, pSup0) = parityTotals conn2
         let ranked = bucketsRanked conn2
         match ranked with
         | [] when pt = 0 ->
@@ -616,54 +617,107 @@ module ConvergenceLoop =
                     if rechecks |> Array.forall snd then passed <- true
                     retries <- retries + 1
 
-            let fc = initSchema db in let (fp,ft) = passRate fc in let d = fp-pp in finalizeSprint fc fp ft; fc.Close()
+            let fc = initSchema db
+            let (fp, ft) = passRate fc
+            let d = fp - pp
+            let (pMatch1, _pMiss1, pSup1) = parityTotals fc
+            let pProj1 = parityProjectCount fc
+            finalizeSprint fc fp ft
+            fc.Close()
             archiveAndReset (key()) next
-            let msg = $"{fp}/{ft} d={d}"
+
+            // Parity deltas from BUCKET STATS. passRate/d counts test ROWS; parity
+            // buckets carry no pass rows, so parity progress is invisible to d — the
+            // credit gate MUST read parityTotals. (This was the credit-assignment
+            // inversion: real porting showed d<=0 and was discarded.)
+            let noiseBand = 250          // django ±250 flap (keystone K6); drop to 0 once K6 lands
+            // Fail-closed: if fewer than 6 parity project buckets were harvested, the
+            // checker build/run failed and the objective silently vanished (F2).
+            let parityHarvestBroken = pMatch0 > 0 && pProj1 < 6
+            let matchGain = pMatch1 - pMatch0
+            let supDelta = pSup1 - pSup0
+            let matchingRegressed = (not parityHarvestBroken) && (pMatch0 - pMatch1) > noiseBand
+            let superfluousIncreased = (not parityHarvestBroken) && supDelta > noiseBand
+            let precisionWin = (not parityHarvestBroken) && pSup1 < pSup0
+            let gainStr = (if matchGain >= 0 then "+" else "") + string matchGain
+            let msg = $"parity match {pMatch0}->{pMatch1} ({gainStr}) fp {pSup0}->{pSup1} | tests {fp}/{ft} d={d}"
             Beads.note bead msg
 
-            // Hard gate: check for removed "// Ported from:" or "// TODO(port):" comments
-            // Only runs if the project uses port-traceability markers (opt-in).
+            // Protected files: the objective/oracle (reference baselines, source-index,
+            // harvest, project config) must never be edited by a sprint — else the loop
+            // can cheat its own metric.
+            let changedFiles =
+                try (cli { Exec "git"; Arguments [| "diff"; "--name-only"; baseCommit + "..HEAD" |] } |> Command.execute).Text |> Option.defaultValue ""
+                with _ -> ""
+            let protectedTouched =
+                changedFiles.Split('\n')
+                |> Array.map (fun s -> s.Trim().Replace('\\', '/'))
+                |> Array.filter (fun f -> f <> "" && (
+                        f.StartsWith("testdata/baselines/reference/") ||
+                        f.EndsWith("pyright-source-index.db") ||
+                        f.EndsWith("_tools/harvest_tests.py") ||
+                        f = "project.json"))
+                |> Array.toList
+
+            // Marker-removal gate (F1 fix): removing a `// Ported from:` marker is only a
+            // regression if NOT accompanied by a precision win — deleting over-broad ported
+            // logic to kill false positives is legitimate porting work.
             let sourceIndexDb = Path.Combine(targetDir(), "pyright-source-index.db")
             let hasPortStatus = File.Exists sourceIndexDb
-            if hasPortStatus then
-                let regressions = PortStatus.checkRegressions baseCommit
-                if not regressions.IsEmpty then
-                    let regMsg = regressions |> List.map (fun r -> $"  REMOVED: {r}") |> String.concat "\n"
-                    printfn "  🚨 Coverage regression — ported logic markers removed:\n%s" regMsg
-                    Beads.note bead $"COVERAGE_REGRESSION: {regressions.Length} markers removed"
-                    let fixPrompt = String.concat "\n" [
-                        "COVERAGE REGRESSION DETECTED. These '// Ported from:' or '// TODO(port):' markers were removed:"
-                        regMsg
-                        "These markers track ported logic. Removing them means losing traceability."
-                        "Restore them. If you refactored the code, move the markers to the new location."
-                        "If you genuinely replaced the logic with something better, keep the marker and update the line range." ]
-                    Agent.resume sid fixPrompt $"RestoreCoverage-S{next}" |> ignore
-                    let stillRemoved = PortStatus.checkRegressions baseCommit
-                    if not stillRemoved.IsEmpty then
-                        passed <- false
-                        let failMsg = $"Coverage regression: {stillRemoved.Length} Ported-from markers still removed"
-                        lastFail <- failMsg
-                        printfn "  ❌ %s" failMsg
+            let markerRegression =
+                if hasPortStatus && not precisionWin then
+                    let regressions = PortStatus.checkRegressions baseCommit
+                    if regressions.IsEmpty then false
+                    else
+                        let regMsg = regressions |> List.map (fun r -> $"  REMOVED: {r}") |> String.concat "\n"
+                        Beads.note bead $"COVERAGE_REGRESSION: {regressions.Length} markers removed"
+                        let fixPrompt = String.concat "\n" [
+                            "COVERAGE REGRESSION: these '// Ported from:' / '// TODO(port):' markers were removed WITHOUT a false-positive reduction:"
+                            regMsg
+                            "Restore them, or (if you refactored) move them to the new location with updated line ranges." ]
+                        Agent.resume sid fixPrompt $"RestoreCoverage-S{next}" |> ignore
+                        not (PortStatus.checkRegressions baseCommit).IsEmpty
+                else false
 
-            if passed && d > 0 then
+            let hardRegression =
+                parityHarvestBroken || (not passed) || not protectedTouched.IsEmpty || d < 0
+                || matchingRegressed || superfluousIncreased || markerRegression
+            let durableProgress = (not parityHarvestBroken) && ((d > 0) || (matchGain > noiseBand) || precisionWin)
+
+            let revert (reason: string) =
+                (try cli { Exec "git"; Arguments [| "reset"; "--hard"; baseCommit |] } |> Command.execute |> ignore with _ -> ())
+                (try cli { Exec "git"; Arguments [| "clean"; "-fd" |] } |> Command.execute |> ignore with _ -> ())
+                Beads.note bead $"REVERT: {reason}"
+                Beads.closeFailed bead reason
+                printfn $"  ⟲ Reverted: {reason}"
+
+            if hardRegression then
+                let pf = String.concat "," protectedTouched
+                let reason =
+                    if parityHarvestBroken then "checker build/run failed (parity harvest empty) — fix the build"
+                    elif not passed then "verifiers failed"
+                    elif not protectedTouched.IsEmpty then $"edited protected files: {pf}"
+                    elif d < 0 then $"unit/baseline regression d={d}"
+                    elif matchingRegressed then $"parity matching lost {pMatch0 - pMatch1} (> noise {noiseBand})"
+                    elif superfluousIncreased then $"superfluous +{supDelta} (> noise {noiseBand})"
+                    else "coverage markers removed"
+                revert reason
+                (false, reason)
+            elif not durableProgress then
+                revert "no durable progress (no parity gain, no precision win, no baseline flip)"
+                (false, "no durable progress")
+            else
                 Beads.closeSuccess bead msg; printfn $"  OK: {msg}"
-                // Sync port_status if the project uses a source-index DB (opt-in)
                 if hasPortStatus then PortStatus.sync next
                 // Knowledge capture — runs BEFORE push so its changes get included
                 let capturePrompt = String.concat "\n" [
-                    $"Sprint {next} succeeded."
+                    $"Sprint {next} landed durable progress ({msg})."
                     $"EXACT SCOPE: git diff {baseCommit}..HEAD"
-                    $"Log: git log --oneline {baseCommit}..HEAD"
-                    "Review only these commits. Capture non-trivial learnings if any."
-                    "If you create/edit files, commit them. Say 'No learnings.' if none." ]
+                    "Capture only non-trivial, reusable learnings (say 'No learnings.' if none). Commit any files you create." ]
                 Agent.run capturePrompt $"Knowledge-S{next}" None |> ignore
-                // Push ALL commits (impl + knowledge capture) on success
-                let pushResult = try (cli { Exec "git"; Arguments [|"push"|] } |> Command.execute).ExitCode with _ -> 1
-                if pushResult <> 0 then printfn "  ⚠ git push failed"
-                else printfn "  Pushed."
+                let pushResult = try (cli { Exec "git"; Arguments [| "push" |] } |> Command.execute).ExitCode with _ -> 1
+                if pushResult <> 0 then printfn "  ⚠ git push failed" else printfn "  Pushed."
                 (true, msg)
-            else
-                Beads.closeFailed bead msg; printfn $"  Fail: {msg}"; (false, lastFail)
 
     let run maxRetries =
         let config = ensureInit ()
@@ -696,18 +750,30 @@ module ConvergenceLoop =
                     let (reviewOutput, _) = Agent.run reviewPrompt "review-expert" None
                     let reviewFeedback = trunc reviewOutput 4000
                     Beads.remember $"Codebase review: {trunc reviewOutput 500}"
-                    // Feed review as a refactoring sprint — must not regress tests
+                    // Refactoring sprint. Capture base + pre-metrics BEFORE the agent runs.
+                    // (Ghost-refactor bug: base was captured AFTER the agent, so verifiers saw
+                    // an empty diff and the result was pushed unconditionally.)
+                    let readMetrics () =
+                        let cc = initSchema (currentDbPath (key()))
+                        let (p, _) = passRate cc
+                        let (m, _, s) = parityTotals cc
+                        cc.Close()
+                        (p, m, s)
+                    let baseCommit =
+                        try (cli { Exec "git"; Arguments [| "rev-parse"; "HEAD" |] } |> Command.execute).Text |> Option.defaultValue "HEAD" |> fun s -> s.Trim()
+                        with _ -> "HEAD"
+                    printfn "  📊 pre-refactor harvest..."
+                    harvestTests config 0
+                    let (rfp0, rMatch0, rSup0) = readMetrics ()
                     let refactorPrompt = String.concat "\n" [
-                        "REFACTORING SPRINT. No new features. Test count and pass rate must not decrease."
+                        "REFACTORING SPRINT. No new features. Test count / pass rate / parity MUST NOT decrease."
+                        "Do NOT edit reference baselines, the source index DB, the harvest script, or project.json."
                         "An expert review found these improvement opportunities:"
                         reviewFeedback
                         "Pick the highest-impact improvements. Refactor, commit." ]
                     printfn "── Refactoring sprint ──"
                     let (_, refactorSid) = Agent.run refactorPrompt "Refactor" None
-                    // Run verifiers on the refactoring too
-                    let baseCommit =
-                        try (cli { Exec "git"; Arguments [|"rev-parse"; "HEAD"|] } |> Command.execute).Text |> Option.defaultValue "HEAD" |> fun s -> s.Trim()
-                        with _ -> "HEAD"
+                    // Run verifiers against the pre-refactor base (real diff, not empty).
                     let results = Verifiers.listAll() |> List.map (fun v -> async {
                         let (vp,vo,vsid) = Verifiers.runVerifier v baseCommit
                         return (v,vp,vo,vsid) }) |> Async.Parallel |> Async.RunSynchronously |> Array.toList
@@ -715,12 +781,35 @@ module ConvergenceLoop =
                     if not failed.IsEmpty then
                         let fb = failed |> List.map (fun (v,_,vo,_) -> $"=== {v} ===\n{trunc vo 2000}") |> String.concat "\n\n"
                         Agent.resume refactorSid fb "Fix-Refactor" |> ignore
-                    try cli { Exec "git"; Arguments [|"push"|] } |> Command.execute |> ignore with _ -> ()
-                    printfn "── Refactoring done ──"
+                    let verifiersFailed =
+                        results
+                        |> List.map (fun (v,vp,_,vsid) -> if vp then true else (let (r,_) = Verifiers.resumeVerifier vsid v in r))
+                        |> List.forall id |> not
+                    // Re-measure and gate: revert unless verifiers pass AND nothing regressed.
+                    printfn "  📊 post-refactor harvest..."
+                    harvestTests config 0
+                    let (rfp1, rMatch1, rSup1) = readMetrics ()
+                    let regressed =
+                        verifiersFailed || rfp1 < rfp0 || (rMatch0 - rMatch1) > 250 || (rSup1 - rSup0) > 250
+                    if regressed then
+                        (try cli { Exec "git"; Arguments [| "reset"; "--hard"; baseCommit |] } |> Command.execute |> ignore with _ -> ())
+                        (try cli { Exec "git"; Arguments [| "clean"; "-fd" |] } |> Command.execute |> ignore with _ -> ())
+                        printfn "  ⟲ Refactor reverted (verifier failure or regression)."
+                    else
+                        (try cli { Exec "git"; Arguments [| "push" |] } |> Command.execute |> ignore with _ -> ())
+                        printfn "── Refactoring done (pushed) ──"
                 else
                     let (ok, s) = step maxRetries prev
                     consecutiveErrors <- 0
-                    if s = "ALL_PASS" then go <- false
+                    if s = "ALL_PASS" then
+                        // Do NOT terminate (Goal 8: must not stop). Every harvested test +
+                        // all real-world parity passing is a milestone, not the end — the
+                        // whole product is still not ported. Idle briefly, then continue;
+                        // the next harvest will surface cold-coverage / precision work.
+                        printfn "  ✅ All tracked buckets pass — continuing (cold coverage / precision / corpus). Idle 10 min."
+                        prev <- None
+                        consecutiveFails <- 0
+                        System.Threading.Thread.Sleep(10 * 60 * 1000)
                     elif ok then
                         prev <- None
                         consecutiveFails <- 0
