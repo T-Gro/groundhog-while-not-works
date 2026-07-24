@@ -408,6 +408,24 @@ module ConvergenceLoop =
     let private key () = projectKey (targetDir())
     let private trunc (s: string) n = if s.Length <= n then s else s.[..n/2] + "..." + s.[(s.Length-n/2)..]
 
+    /// The branch the loop pushes to, captured at run start (when HEAD is attached).
+    let mutable private activeBranch = ""
+
+    /// Push robustly even if an implementor/verifier agent left HEAD DETACHED (agents
+    /// have full git access and sometimes `git checkout <sha>`, which makes plain
+    /// `git push` fail with "not currently on a branch" — silently stranding all
+    /// committed work locally). When detached, fast-forward the active branch to HEAD
+    /// and reattach, then push. Returns the push exit code.
+    let private safePush () : int =
+        try
+            let attached = (cli { Exec "git"; Arguments [| "symbolic-ref"; "-q"; "HEAD" |] } |> Command.execute).ExitCode = 0
+            if not attached && activeBranch <> "" then
+                cli { Exec "git"; Arguments [| "branch"; "-f"; activeBranch; "HEAD" |] } |> Command.execute |> ignore
+                cli { Exec "git"; Arguments [| "checkout"; activeBranch |] } |> Command.execute |> ignore
+                printfn $"  🔧 reattached HEAD to {activeBranch} (an agent had detached it)"
+            (cli { Exec "git"; Arguments [| "push" |] } |> Command.execute).ExitCode
+        with _ -> 1
+
     /// Harvest test results by running the project's harvest script directly.
     /// Falls back to agent if script doesn't exist.
     let private harvestTests (config: ProjectConfig) (sprintNum: int) =
@@ -638,7 +656,7 @@ module ConvergenceLoop =
             Beads.claim bead
             let sc = initSchema db in initSprint sc next "bootstrap" 0 0; sc.Close()
             let (_, _) = Agent.run prompt $"Impl-S{next}" None
-            let pushResult = try (cli { Exec "git"; Arguments [|"push"|] } |> Command.execute).ExitCode with _ -> 1
+            let pushResult = safePush ()
             if pushResult = 0 then printfn "  Pushed." else printfn "  ⚠ push failed"
             Beads.closeSuccess bead "Bootstrap done"
             printfn "  Bootstrap done. Continuing to first improvement sprint..."
@@ -900,13 +918,19 @@ module ConvergenceLoop =
                     $"EXACT SCOPE: git diff {baseCommit}..HEAD"
                     "Capture only non-trivial, reusable learnings (say 'No learnings.' if none). Commit any files you create." ]
                 Agent.run capturePrompt $"Knowledge-S{next}" None |> ignore
-                let pushResult = try (cli { Exec "git"; Arguments [| "push" |] } |> Command.execute).ExitCode with _ -> 1
+                let pushResult = safePush ()
                 if pushResult <> 0 then printfn "  ⚠ git push failed" else printfn "  Pushed."
                 (true, msg)
 
     let run maxRetries =
         let config = ensureInit ()
         printfn $"=== {config.ProjectName}: {config.SourceLang} -> {config.TargetLang} ==="
+        // Capture the branch to push to (agents may later detach HEAD; safePush reattaches).
+        activeBranch <-
+            try (cli { Exec "git"; Arguments [| "symbolic-ref"; "-q"; "--short"; "HEAD" |] } |> Command.execute).Text
+                |> Option.defaultValue "" |> fun s -> s.Trim()
+            with _ -> ""
+        if activeBranch <> "" then printfn $"  push target branch: {activeBranch}"
         let mutable go = true
         let mutable prev: string option = None
         let mutable consecutiveErrors = 0
@@ -981,7 +1005,7 @@ module ConvergenceLoop =
                         (try cli { Exec "git"; Arguments [| "clean"; "-fd" |] } |> Command.execute |> ignore with _ -> ())
                         printfn "  ⟲ Refactor reverted (verifier failure or regression)."
                     else
-                        (try cli { Exec "git"; Arguments [| "push" |] } |> Command.execute |> ignore with _ -> ())
+                        safePush () |> ignore
                         printfn "── Refactoring done (pushed) ──"
                 else
                     let (ok, s) = step maxRetries prev
