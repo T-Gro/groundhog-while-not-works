@@ -120,6 +120,10 @@ module Verifiers =
         $"  Diff: git diff {baseCommit}..HEAD"
         $"  Log: git log --oneline {baseCommit}..HEAD"
         "Do NOT review code that existed before this sprint. Do NOT comment on pre-existing issues."
+        "THIS IS A PORT: every diagnostic-producing change must REPRODUCE the cited source logic, not"
+        "invent / gate / suppress / guess. Open the `// Ported from:` anchors and check them yourself."
+        "TEETH: 'advisory / non-blocking' is NOT allowed for a hard-fail criterion. If any hard-fail"
+        "condition in your checklist is met, you MUST output VERIFY_FAILED — never pass it with a note."
         "Read: adr/INDEX.md, porting-plan.md"
         "Output VERIFY_PASSED or VERIFY_FAILED on its own line at the end."
         "If FAILED, write specific actionable fix instructions for the implementor." ]
@@ -551,18 +555,23 @@ module ConvergenceLoop =
     /// against the cited source anchors, and the proposer revises until approved (bounded).
     /// Returns the approved (or best) design text to hand to the implementor. Cheap
     /// (usually 2 agent calls) and catches unfaithful ports before any code is written.
-    let private designReview config sprintNum (baseBrief: string) bead : string =
+    let private designReview config sprintNum (baseBrief: string) bead : string * bool =
         let maxRounds = 2
         let proposePrompt = String.concat "\n" [
             $"You are the PROPOSER for sprint {sprintNum} of a {config.SourceLang} -> {config.TargetLang} PORT."
             "Do NOT write code and do NOT change files. Produce a concise DESIGN for the slice you will port."
-            "First READ the relevant SOURCE file(s) at the anchors and the TARGET file(s) you would change."
+            $"THIS IS A PORT: the complete source is at {config.SourceDir}. You TRANSLATE it, you do not invent."
+            "FIRST actually OPEN and READ the source anchors (and the target files you would change) — do not"
+            "design from memory. Quote the specific source lines you will reproduce."
             "Your design MUST state:"
-            "  1. The exact source symbol(s)/logic to port, with file:line anchors."
-            "  2. The target file(s)/functions to change, and how."
-            "  3. Why this is FAITHFUL to the source (a port, not an invention/gate/patch)."
-            "  4. The specific failing diagnostics/tests it will flip, and the regression risks."
-            "Keep it under ~40 lines. Wrap the final plan in <DESIGN> ... </DESIGN>."
+            "  1. The exact source symbol(s)/logic to port, with file:line anchors you HAVE READ (quote 2-3 key lines)."
+            "  2. The target file(s)/functions to change, and how the source logic maps onto them."
+            "  3. Why this is FAITHFUL to the source (a port, not an invention/gate/suppression/patch)."
+            "  4. The EXPECTED NET matching delta PER affected project (matches gained minus new false positives)."
+            "     If your honest estimate is ~0 net new matching diagnostics, this design is PARITY-NEUTRAL:"
+            "     DO NOT propose it — pick the biggest-leverage keystone slice instead (parity-strategy.instructions.md)."
+            "  5. Regression risks and how the build+test gate will catch them."
+            "Prefer the biggest coherent structural slice you can land, not a one-liner. Wrap the final plan in <DESIGN> ... </DESIGN>."
             ""
             baseBrief ]
         let (design0, proposerSid) = Agent.run proposePrompt $"Propose-S{sprintNum}" None
@@ -574,36 +583,39 @@ module ConvergenceLoop =
             let criticPrompt = String.concat "\n" [
                 $"You are the CRITIC — an adversarial DESIGN reviewer for a {config.SourceLang} -> {config.TargetLang} PORT."
                 "You review a DESIGN, not code. You WRITE NO CODE and change NO files."
-                "Open the cited source file:line anchors and verify the design is a FAITHFUL port:"
-                "  - Does it reproduce the source logic, or invent / gate / patch around it?"
-                "  - Are the anchors real and correct?"
+                "OPEN the cited source file:line anchors yourself and verify the design is a FAITHFUL, high-leverage port:"
+                "  - Does it REPRODUCE the source logic, or invent / gate / suppress / patch around it? (invention => REJECT)"
+                "  - Are the anchors real, correct, and actually READ (are the quoted lines genuine)? (fabricated anchors => REJECT)"
+                "  - Is the expected NET matching delta clearly POSITIVE? A parity-neutral / coverage-only slice => REJECT."
+                "  - Is this the biggest-leverage slice available, or nibbling while a KEYSTONE is open? (nibbling => REJECT)"
                 "  - Will it regress existing matching diagnostics? Is the slice coherent and shippable?"
-                "  - Is it the biggest-leverage slice available, or busywork?"
-                "If the design is a sound, faithful port, reply with the exact token DESIGN_APPROVED."
-                "Otherwise reply DESIGN_REVISE and give 2-5 specific, actionable fixes."
+                "Give 2-5 specific, actionable fixes if you reject."
+                "YOUR LAST LINE MUST BE EXACTLY ONE TOKEN: DESIGN_APPROVED  or  DESIGN_REJECTED  (nothing else on that line)."
+                "Approve ONLY a faithful, source-grounded, net-parity-positive port. When in doubt, REJECT."
                 ""
                 "=== DESIGN UNDER REVIEW ==="
                 design ]
             let (criticOut, _) = Agent.run criticPrompt $"Critic-S{sprintNum}" None
-            if criticOut.Contains "DESIGN_APPROVED" && not (criticOut.Contains "DESIGN_REVISE") then
+            if criticOut.Contains "DESIGN_APPROVED" && not (criticOut.Contains "DESIGN_REJECTED") then
                 approved <- true
                 Beads.note bead $"PHASE:design approved round={round+1}"
             else
-                Beads.note bead $"PHASE:design revise round={round+1}"
+                Beads.note bead $"PHASE:design rejected round={round+1}"
                 let revisePrompt = String.concat "\n" [
                     "The CRITIC rejected your design. Revise it to address EVERY point. Still NO code, NO file changes."
-                    "Re-read the source anchors if needed. Wrap the revised plan in <DESIGN> ... </DESIGN>."
+                    "Re-OPEN and re-READ the source anchors. If the slice is parity-neutral or a nibble, switch to the"
+                    "biggest-leverage KEYSTONE slice instead. Wrap the revised plan in <DESIGN> ... </DESIGN>."
                     ""
                     "=== CRITIC FEEDBACK ==="
                     trunc criticOut 3000 ]
                 design <- Agent.resume proposerSid revisePrompt $"Revise-S{sprintNum}"
                 round <- round + 1
         if not approved then
-            Beads.note bead "PHASE:design UNAPPROVED — proceeding with best design"
-            printfn $"  ⚠ Design not approved after {maxRounds} rounds; proceeding with best design."
+            Beads.note bead "PHASE:design UNAPPROVED — escalating to keystone campaign"
+            printfn $"  ⚠ Design not approved after {maxRounds} rounds; escalating this sprint to a KEYSTONE CAMPAIGN."
         else
             printfn "  ✔ Design approved."
-        design
+        (design, approved)
 
     let step maxRetries prevFailure : bool * string =
         let config = ensureInit ()
@@ -620,6 +632,7 @@ module ConvergenceLoop =
         let next = sNum + 1
         let (pp, pt) = passRate conn2
         let (pMatch0, _pMiss0, pSup0) = parityTotals conn2
+        let pby0 = parityByProject conn2   // per-project snapshot BEFORE the implementor (for the ratchet)
         let ranked = bucketsRanked conn2
         match ranked with
         | [] when pt = 0 ->
@@ -700,56 +713,94 @@ module ConvergenceLoop =
             conn2.Close()
             printfn $"S{next} | {pp}/{pt} | {ranked.Length} failing buckets"
 
-            // Focus selection with per-project FAIRNESS: mostly work the biggest bucket,
-            // but every 5th sprint pick the biggest bucket of a DIFFERENT project so django
-            // (~9k missing) cannot starve pydantic/requests. No rotation toward SMALLER
-            // buckets (the old rotateBy contradicted the keystone stall notice).
+            // Focus selection. Most sprints attack the biggest real-world parity bucket,
+            // but leaf-by-leaf nibbling never cracks the KEYSTONES (foundational ports that
+            // each unblock hundreds-to-thousands of diagnostics), so we DEDICATE sprints to
+            // them: every 3rd sprint, AND whenever the implementor has stalled (a stall is
+            // almost always a keystone wall). Every 5th (non-keystone) sprint works a
+            // DIFFERENT project so one big noisy project cannot starve the others.
+            // NOTE: the old coverage-<file> lane is gone — porting a no-diagnostic file
+            // (e.g. a localizer) burned whole sprints for zero parity (coverage != parity).
             let streak = getNoCommitStreak (key())
             let projOf (b: string) =
                 if b.StartsWith("parity-") then b.Substring(7).Replace("-fp", "") else ""
             let headBucket = ranked |> List.head |> fun (b, _, _, _) -> b
+            let keystoneCampaign = (next % 3 = 0) || streak >= 2
             let topBucket =
-                if next % 3 = 0 then
-                    // Coverage-driven sprint: systematically port the WHOLE product in
-                    // source order (G2), not just what the 6 sample projects exercise.
-                    match ranked |> List.tryFind (fun (b, _, _, _) -> b.StartsWith("coverage-")) with
-                    | Some (b, _, _, _) -> b
-                    | None -> headBucket
+                if keystoneCampaign then "keystone-campaign"
                 elif next % 5 = 0 then
                     let headProj = projOf headBucket
                     match ranked |> List.tryFind (fun (b, _, _, _) -> b.StartsWith("parity-") && projOf b <> "" && projOf b <> headProj) with
                     | Some (b, _, _, _) -> b
                     | None -> headBucket
                 else headBucket
-            let focusNotice = $"\n<focus_bucket>\nTHIS SPRINT focus on the bucket: {topBucket}. Work the biggest lever inside it; port the responsible source logic.\n</focus_bucket>"
-            let stallNotice =
-                if streak >= 3 then
-                    $"\n<stall_warning>\nImplementor produced ZERO commits for {streak} consecutive sprints on this bucket.\nIt is almost certainly blocked on a KEYSTONE — a foundational port (field population, flow narrowing, overload resolution, builtin symbol tables) that many diagnostics sit behind.\nDo NOT abandon it for a smaller unrelated bucket, and do NOT ship a cosmetic one-line fix.\nRead .github/instructions/parity-strategy.instructions.md, identify the KEYSTONE this bucket depends on, and port the smallest coherent STRUCTURAL slice of that keystone from the source (cite source file:line). Land that; the bucket unblocks itself.\n</stall_warning>"
-                else ""
 
-            let baseBrief = (buildBriefing config next brief allBuckets prevFailure) + focusNotice + stallNotice
+            // THE PORT MANDATE — repeated at every hand-off. This is a PORT: the whole
+            // source exists and must be TRANSLATED, never invented / gated / guessed.
+            let portMandate = String.concat "\n" [
+                ""
+                "<PORT_MANDATE>"
+                $"THIS IS A PORT, NOT A REWRITE. The COMPLETE source lives at {config.SourceDir}."
+                "Every behaviour you need already exists there, battle-tested for years. TRANSLATE it —"
+                "never invent, gate, suppress, or guess. If you cannot point at the source lines behind a"
+                "change, you are INVENTING: stop and go read the source."
+                "BEFORE writing ANY target code, OPEN and READ the exact source file:line ranges you will"
+                "port, and quote the key lines you reproduce. Read the ENTIRE relevant source file, not one"
+                "function — you have ~1M tokens; use them. Every ported block carries a real"
+                "  // Ported from: <file>:<lines>  that a reviewer can open in the source."
+                "</PORT_MANDATE>" ]
+
+            // Keystone campaign directive: attack a foundational port, not a leaf.
+            let keystoneDirective = String.concat "\n" [
+                ""
+                "<keystone_campaign>"
+                "THIS SPRINT IS A KEYSTONE CAMPAIGN — do NOT nibble a leaf bucket."
+                "Open .github/instructions/parity-strategy.instructions.md and pick the HIGHEST-LEVERAGE"
+                "open keystone (work top-down; each unblocks hundreds-to-thousands of missing diagnostics)."
+                "Open its SOURCE anchor AND its target anchor side by side and READ THE ENTIRE source region."
+                "Port the smallest COHERENT STRUCTURAL slice that compiles, keeps every test green, and moves"
+                "the keystone — spanning MULTIPLE files if that is what the source does. Expect a BIG diff; do"
+                "not fear width, the build+test HARD GATE guards you and reverts only real regressions. A"
+                "landed keystone slice is worth 10-100x any leaf fix. Do NOT downgrade it into a one-function"
+                "patch and do NOT substitute a gate/suppression for the real ported logic."
+                "</keystone_campaign>" ]
+
+            let focusNotice =
+                if keystoneCampaign then keystoneDirective
+                else $"\n<focus_bucket>\nTHIS SPRINT focus on the bucket: {topBucket}. Work the biggest lever inside it; PORT the responsible source logic (read the source, cite file:line). Do not nibble — if the bucket is keystone-blocked, port the keystone slice from the source.\n</focus_bucket>"
+
+            let baseBrief = (buildBriefing config next brief allBuckets prevFailure) + focusNotice
             let bead = Beads.createSprint next topBucket $"Pre:{pp}/{pt}"
             Beads.claim bead
             let sc = initSchema db in initSprint sc next topBucket pp pt; sc.Close()
 
-            // Design-review BEFORE implementation: proposer drafts a port design,
-            // adversarial critic checks faithfulness to the source, proposer revises
-            // until approved (bounded). Catches unfaithful ports before code is written.
+            // Design-review BEFORE implementation: a PROPOSER drafts a FAITHFUL port design,
+            // an adversarial CRITIC verifies it against the cited source and MUST emit a verdict
+            // token. A design that cannot earn DESIGN_APPROVED in the bounded rounds is NOT
+            // implemented as-is — the sprint escalates to a KEYSTONE CAMPAIGN (a rejected leaf
+            // is exactly the "nibbling while a keystone is open" the critics keep flagging).
             Beads.note bead "PHASE:design"
-            let approvedDesign = designReview config next baseBrief bead
+            let (approvedDesign, designApproved) = designReview config next baseBrief bead
+            let runKeystone = keystoneCampaign || not designApproved
             let prompt =
-                baseBrief
-                + "\n\n<approved_design>\nA proposer/critic review approved this port design. IMPLEMENT IT."
-                + " Deviate only if the source code proves it wrong (and say why).\n"
-                + approvedDesign
-                + "\n</approved_design>"
+                baseBrief + portMandate
+                + (if runKeystone && not keystoneCampaign then
+                       "\n\n<design_rejected>\nThe proposed leaf design did NOT earn DESIGN_APPROVED — do NOT implement it as-is."
+                       + " Instead run the KEYSTONE CAMPAIGN below: attack the foundational port it was nibbling around.\n"
+                       + keystoneDirective + "\n</design_rejected>"
+                   else "")
+                + (if designApproved then
+                       "\n\n<approved_design>\nA proposer/critic review APPROVED this port design. IMPLEMENT IT faithfully from the source."
+                       + " Deviate only if the source code proves it wrong (and say why).\n" + approvedDesign + "\n</approved_design>"
+                   else
+                       "\n\n<best_design_notes>\nUnapproved proposer notes — use ONLY what you can verify is faithful to the source:\n" + trunc approvedDesign 2000 + "\n</best_design_notes>")
 
             // Record base commit BEFORE implementor runs — this defines the sprint's diff scope
             let baseCommit =
                 try (cli { Exec "git"; Arguments [|"rev-parse"; "HEAD"|] } |> Command.execute).Text |> Option.defaultValue "HEAD" |> fun s -> s.Trim()
                 with _ -> "HEAD"
 
-            Beads.note bead $"PHASE:impl baseCommit={baseCommit.[..7]} streak={streak} focus={topBucket}"
+            Beads.note bead $"PHASE:impl baseCommit={baseCommit.[..7]} streak={streak} keystone={runKeystone} focus={topBucket}"
             let (implOut, sid) = Agent.run prompt $"Impl-S{next}" None
 
             // Capture implementor stdout — diagnostic gold for debugging no-commit sprints.
@@ -805,6 +856,7 @@ module ConvergenceLoop =
             let (fp, ft) = passRate fc
             let d = fp - pp
             let (pMatch1, _pMiss1, pSup1) = parityTotals fc
+            let pby1 = parityByProject fc   // per-project snapshot AFTER the implementor
             let pProj1 = parityProjectCount fc
             finalizeSprint fc fp ft
             fc.Close()
@@ -814,14 +866,29 @@ module ConvergenceLoop =
             // buckets carry no pass rows, so parity progress is invisible to d — the
             // credit gate MUST read parityTotals. (This was the credit-assignment
             // inversion: real porting showed d<=0 and was discarded.)
-            let noiseBand = 250          // django ±250 flap (keystone K6); drop to 0 once K6 lands
             // Fail-closed: if fewer than 6 parity project buckets were harvested, the
             // checker build/run failed and the objective silently vanished (F2).
             let parityHarvestBroken = pMatch0 > 0 && pProj1 < 6
-            let matchGain = pMatch1 - pMatch0
-            let supDelta = pSup1 - pSup0
-            let matchingRegressed = (not parityHarvestBroken) && (pMatch0 - pMatch1) > noiseBand
-            let superfluousIncreased = (not parityHarvestBroken) && supDelta > noiseBand
+            let matchGain = pMatch1 - pMatch0        // global, for the report line only
+            // PER-PROJECT credit (agnostic — no project names). Each project's measurement
+            // noise scales with its reference size (offset-cache nondeterminism flaps roughly
+            // in proportion to file volume), so we judge each project against ITS OWN band.
+            // A real win = net matches (matches gained minus new false positives) beyond that
+            // band in ANY project — so a genuine +50 in a small quiet project is credited
+            // instead of being drowned by a large noisy project's global flap, while a real
+            // per-project matching loss or false-positive flood still hard-reverts.
+            let band refc = max 20 (refc / 150)
+            let m0 = pby0 |> List.map (fun (p,m,_,_) -> p, m) |> Map.ofList
+            let s0 = pby0 |> List.map (fun (p,_,s,_) -> p, s) |> Map.ofList
+            let perProj =
+                pby1 |> List.map (fun (p, m1, s1, refc) ->
+                    let mg = m1 - (Map.tryFind p m0 |> Option.defaultValue m1)
+                    let sd = s1 - (Map.tryFind p s0 |> Option.defaultValue s1)
+                    let net = mg - (max 0 sd)          // pay one match per new false positive
+                    (p, mg, sd, net, band refc))
+            let realGain = perProj |> List.sumBy (fun (_,_,_,net,b) -> if net > b then net else 0)
+            let realMatchLoss = (not parityHarvestBroken) && (perProj |> List.exists (fun (_,mg,_,_,b) -> -mg > b))
+            let fpFlood = (not parityHarvestBroken) && (perProj |> List.exists (fun (_,_,sd,net,b) -> sd > b && net < 0))
             let precisionWin = (not parityHarvestBroken) && pSup1 < pSup0
             let gainStr = (if matchGain >= 0 then "+" else "") + string matchGain
             let msg = $"parity match {pMatch0}->{pMatch1} ({gainStr}) fp {pSup0}->{pSup1} | tests {fp}/{ft} d={d}"
@@ -870,15 +937,18 @@ module ConvergenceLoop =
 
             let hardRegression =
                 parityHarvestBroken || (not passed) || not protectedTouched.IsEmpty || d < 0
-                || matchingRegressed || superfluousIncreased || markerRegression
-            // Coverage credit must not paper over a real parity bleed (Opus #4):
-            // a marker-only sprint that quietly drops matches or adds false positives
-            // is not durable progress. covNoiseFloor tolerates small ±noise only.
-            let covNoiseFloor = 50
-            let coverageCredit = covGain > 0 && matchGain > -covNoiseFloor && supDelta <= 0
+                || realMatchLoss || fpFlood || markerRegression
+            // Coverage credit: a faithful structural port that adds validated `// Ported
+            // from:` markers is durable progress even before it flips a diagnostic (this is
+            // what lets keystone work accrete) — but NOT if it caused a real per-project
+            // matching loss or false-positive flood (those hard-revert above), and the new
+            // false positives it introduces must not EXCEED the ported logic it added (bound
+            // slow FP creep: coverage-only credit requires supDelta <= markers added).
+            let supDelta = pSup1 - pSup0
+            let coverageCredit = covGain > 0 && not realMatchLoss && not fpFlood && supDelta <= covGain
             let durableProgress =
                 (not parityHarvestBroken)
-                && (coverageCredit || (d > 0) || (matchGain > noiseBand) || precisionWin)
+                && (coverageCredit || (d > 0) || (realGain > 0) || precisionWin)
 
             let revert (reason: string) =
                 (try cli { Exec "git"; Arguments [| "reset"; "--hard"; baseCommit |] } |> Command.execute |> ignore with _ -> ())
@@ -894,13 +964,13 @@ module ConvergenceLoop =
                     elif not passed then "verifiers failed"
                     elif not protectedTouched.IsEmpty then $"edited protected files: {pf}"
                     elif d < 0 then $"unit/baseline regression d={d}"
-                    elif matchingRegressed then $"parity matching lost {pMatch0 - pMatch1} (> noise {noiseBand})"
-                    elif superfluousIncreased then $"superfluous +{supDelta} (> noise {noiseBand})"
+                    elif realMatchLoss then $"per-project parity matching lost beyond its noise band (global {pMatch0}->{pMatch1})"
+                    elif fpFlood then $"per-project false-positive flood not paid for by matches (global fp {pSup0}->{pSup1})"
                     else "coverage markers removed"
                 revert reason
                 (false, reason)
             elif not durableProgress then
-                revert "no durable progress (no parity gain, no precision win, no baseline flip)"
+                revert "no durable progress (no real per-project net matching gain, no precision win, no coverage credit)"
                 (false, "no durable progress")
             else
                 Beads.closeSuccess bead msg; printfn $"  OK: {msg}"

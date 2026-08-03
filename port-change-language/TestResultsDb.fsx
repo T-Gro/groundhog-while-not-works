@@ -215,6 +215,22 @@ module TestResultsDb =
         cmd.CommandText <- "SELECT COUNT(*) FROM buckets WHERE id LIKE 'parity-%' AND id NOT LIKE '%-fp'"
         cmd.ExecuteScalar() :?> int64 |> int
 
+    /// Per-project parity: (project, matching, superfluous, referenceCount).
+    /// The credit gate uses this to detect a REAL per-project net win above that
+    /// project's OWN size-proportional measurement noise, instead of one global
+    /// count where a large, noisy project (its offset-cache nondeterminism flapping
+    /// hundreds) masks a genuine gain in a small, quiet project. Agnostic: the noise
+    /// band is derived from referenceCount, never from a hard-coded project name.
+    let parityByProject (conn: SqliteConnection) : (string * int * int * int) list =
+        use cmd = conn.CreateCommand()
+        cmd.CommandText <-
+            "SELECT substr(m.id,8), m.passing, COALESCE(fp.total_tests,0), m.total_tests " +
+            "FROM buckets m LEFT JOIN buckets fp ON fp.id = m.id || '-fp' " +
+            "WHERE m.id LIKE 'parity-%' AND m.id NOT LIKE '%-fp'"
+        use reader = cmd.ExecuteReader()
+        [ while reader.Read() do
+            yield (reader.GetString(0), reader.GetInt32(1), reader.GetInt32(2), reader.GetInt32(3)) ]
+
     /// Get buckets sorted by most non-passing (highest-impact first).
     let bucketsRanked (conn: SqliteConnection) : (string * string * int * int) list =
         use cmd = conn.CreateCommand()
