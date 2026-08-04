@@ -85,17 +85,43 @@ module Agent =
         let isResume = resumeId.IsSome
         let sid = resumeId |> Option.defaultWith (fun () -> Guid.NewGuid().ToString())
         let sessionFlag = if isResume then "--resume" else "--name"
+        // A prompt passed via -p becomes a COMMAND-LINE ARGUMENT; a full briefing (all
+        // failing buckets + PORT mandate + approved design) can exceed the OS command-line
+        // limit (~32KB on Windows -> "The filename or extension is too long", and the whole
+        // sprint fails to launch). For long prompts, write the prompt to a temp FILE and give
+        // copilot a short pointer that forces reading the file first. Short prompts (resume
+        // feedback) pass through directly.
+        let promptFile =
+            if prompt.Length > 12000 then
+                let f = Path.Combine(Path.GetTempPath(), $"ralph-prompt-{sid}.md")
+                File.WriteAllText(f, prompt)
+                Some f
+            else None
+        let effectivePrompt =
+            match promptFile with
+            | Some f ->
+                String.concat "\n" [
+                    "Your COMPLETE instructions for this task are in the file below."
+                    "FIRST ACTION, before anything else: open and READ THE ENTIRE FILE with your file-reading"
+                    "tool — it is authoritative and complete. Then do EXACTLY what it says, in full."
+                    "Reminder: this is a PORT — the source is authoritative; read and quote it, never invent."
+                    ""
+                    f ]
+            | None -> prompt
         try
-            let result =
-                cli { Exec "copilot"; Arguments [| "-p"; prompt; sessionFlag; sid; "--allow-all"; "--no-ask-user"; "-s"; "--no-color"; "--plain-diff"; "--model"; Model; "--effort"; Effort; "--stream"; "off" |] }
-                |> Command.execute
-            let stdout = result.Text |> Option.defaultValue ""
-            if stdout = "" then
-                let err = result.Error |> Option.defaultValue ""
-                if err <> "" then
-                    eprintfn $"Agent '{title}' empty stdout, stderr: {err.[..min 400 (err.Length-1)]}"
-            (stdout, sid)
-        with ex -> eprintfn $"Agent '{title}': {ex.Message}"; ("", sid)
+            try
+                let result =
+                    cli { Exec "copilot"; Arguments [| "-p"; effectivePrompt; sessionFlag; sid; "--allow-all"; "--no-ask-user"; "-s"; "--no-color"; "--plain-diff"; "--model"; Model; "--effort"; Effort; "--stream"; "off" |] }
+                    |> Command.execute
+                let stdout = result.Text |> Option.defaultValue ""
+                if stdout = "" then
+                    let err = result.Error |> Option.defaultValue ""
+                    if err <> "" then
+                        eprintfn $"Agent '{title}' empty stdout, stderr: {err.[..min 400 (err.Length-1)]}"
+                (stdout, sid)
+            with ex -> eprintfn $"Agent '{title}': {ex.Message}"; ("", sid)
+        finally
+            match promptFile with Some f -> (try File.Delete f with _ -> ()) | None -> ()
 
     let resume sid feedback title =
         let (out, _) = run feedback title (Some sid)
@@ -707,8 +733,9 @@ module ConvergenceLoop =
         | _ ->
             // Normal sprint: there are failing buckets to fix.
             let allBuckets =
-                ranked |> List.map (fun (b, l, f, t) -> $"  {b} ({l}): {f}/{t} failing")
+                ranked |> List.truncate 50 |> List.map (fun (b, l, f, t) -> $"  {b} ({l}): {f}/{t} failing")
                 |> String.concat "\n"
+                |> fun s -> if ranked.Length > 50 then s + $"\n  … (+{ranked.Length - 50} more failing buckets)" else s
             let brief = briefing conn2
             conn2.Close()
             printfn $"S{next} | {pp}/{pt} | {ranked.Length} failing buckets"
