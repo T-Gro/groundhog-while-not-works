@@ -14,6 +14,35 @@ open Fli
 open ProjectConfig.ProjectConfig
 open TestResultsDb.TestResultsDb
 
+/// Run an external process with a hard wall-clock TIMEOUT and process-TREE kill.
+/// The loop is one sequential thread; without this a hung child — a stuck `copilot`
+/// agent, or a freshly-ported binary that infinite-loops during the parity run —
+/// blocks forever and the loop sits DEAD (it lost a whole 62h weekend this way). The
+/// outer run-loop only catches EXCEPTIONS, so on timeout we kill the whole tree and
+/// RAISE, turning a silent hang into a recoverable error. Returns (stdout, stderr, exit).
+let execWithTimeout (exe: string) (args: string list) (workDir: string) (timeoutMin: int) : string * string * int =
+    let psi = System.Diagnostics.ProcessStartInfo(exe)
+    args |> List.iter psi.ArgumentList.Add
+    psi.RedirectStandardOutput <- true
+    psi.RedirectStandardError <- true
+    psi.UseShellExecute <- false
+    psi.CreateNoWindow <- true
+    if workDir <> "" then psi.WorkingDirectory <- workDir
+    use p = new System.Diagnostics.Process(StartInfo = psi)
+    let sb = System.Text.StringBuilder()
+    let eb = System.Text.StringBuilder()
+    p.OutputDataReceived.Add(fun e -> if not (isNull e.Data) then sb.AppendLine e.Data |> ignore)
+    p.ErrorDataReceived.Add(fun e -> if not (isNull e.Data) then eb.AppendLine e.Data |> ignore)
+    p.Start() |> ignore
+    p.BeginOutputReadLine()
+    p.BeginErrorReadLine()
+    if p.WaitForExit(timeoutMin * 60 * 1000) then
+        p.WaitForExit()                                   // flush async readers
+        (sb.ToString(), eb.ToString(), p.ExitCode)
+    else
+        (try p.Kill(true) with _ -> ())                   // kill copilot/python + node/MCP children
+        failwithf "TIMEOUT after %dmin (killed process tree): %s" timeoutMin exe
+
 module Beads =
     let private bd () =
         let known = @"Q:\.tools\beads\bd.exe"
@@ -110,12 +139,15 @@ module Agent =
             | None -> prompt
         try
             try
-                let result =
-                    cli { Exec "copilot"; Arguments [| "-p"; effectivePrompt; sessionFlag; sid; "--allow-all"; "--no-ask-user"; "-s"; "--no-color"; "--plain-diff"; "--model"; Model; "--effort"; Effort; "--stream"; "off" |] }
-                    |> Command.execute
-                let stdout = result.Text |> Option.defaultValue ""
+                // Hard timeout: a hung `copilot` (network stall, model hang, a subagent
+                // waiting despite --no-ask-user) must NOT block the sequential loop forever.
+                // 4h is well above the ~2.5h a legit heavy impl takes, so it only trips on a
+                // true hang; on timeout the tree is killed and this raises -> caught below.
+                let (stdout, err, _exit) =
+                    execWithTimeout "copilot"
+                        [ "-p"; effectivePrompt; sessionFlag; sid; "--allow-all"; "--no-ask-user"; "-s"; "--no-color"; "--plain-diff"; "--model"; Model; "--effort"; Effort; "--stream"; "off" ]
+                        "" 240
                 if stdout = "" then
-                    let err = result.Error |> Option.defaultValue ""
                     if err <> "" then
                         eprintfn $"Agent '{title}' empty stdout, stderr: {err.[..min 400 (err.Length-1)]}"
                 (stdout, sid)
@@ -465,14 +497,12 @@ module ConvergenceLoop =
         if File.Exists harvestScript then
             printfn "  🧪 Harvesting via script..."
             try
-                let result =
-                    cli { Exec "python"; WorkingDirectory (targetDir()); Arguments [| harvestScript; db; string sprintNum |] }
-                    |> Command.execute
+                let (_out, err, _exit) =
+                    execWithTimeout "python" [ harvestScript; db; string sprintNum ] (targetDir()) 75
                 // Print stderr (where the script logs)
-                result.Error |> Option.iter (fun e ->
-                    for line in e.Split('\n') do
-                        let t = line.Trim()
-                        if t.Length > 0 then printfn "  %s" t)
+                for line in err.Split('\n') do
+                    let t = line.Trim()
+                    if t.Length > 0 then printfn "  %s" t
             with ex -> eprintfn $"  ⚠ Harvest script failed: {ex.Message}"
         else
             printfn "  🧪 Harvesting via agent (no _tools/harvest_tests.py)..."
