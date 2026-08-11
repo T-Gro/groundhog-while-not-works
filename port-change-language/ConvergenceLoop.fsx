@@ -812,14 +812,22 @@ module ConvergenceLoop =
                 ""
                 "<keystone_campaign>"
                 "THIS SPRINT IS A KEYSTONE CAMPAIGN — do NOT nibble a leaf bucket."
-                "Open .github/instructions/parity-strategy.instructions.md and pick the HIGHEST-LEVERAGE"
-                "open keystone (work top-down; each unblocks hundreds-to-thousands of missing diagnostics)."
+                "DETERMINISM FIRST: if a project's parity numbers are NONDETERMINISTIC (they flap run-to-run,"
+                "or your careful set-diff of a fix disagrees with the harvest's re-measured counts), then the"
+                "single HIGHEST-LEVERAGE keystone is making the measurement REPRODUCIBLE — port the source's"
+                "per-file cache/state reset faithfully. Noisy measurement makes EVERY other gain uncreditable"
+                "(a faithful fix looks like noise and gets reverted), so fix it before anything else. This is"
+                "not parity-neutral busywork — it unblocks crediting the whole biggest bucket."
+                "Otherwise: open .github/instructions/parity-strategy.instructions.md and pick the HIGHEST-"
+                "LEVERAGE open keystone (work top-down; each unblocks hundreds-to-thousands of diagnostics)."
                 "Open its SOURCE anchor AND its target anchor side by side and READ THE ENTIRE source region."
                 "Port the smallest COHERENT STRUCTURAL slice that compiles, keeps every test green, and moves"
                 "the keystone — spanning MULTIPLE files if that is what the source does. Expect a BIG diff; do"
                 "not fear width, the build+test HARD GATE guards you and reverts only real regressions. A"
                 "landed keystone slice is worth 10-100x any leaf fix. Do NOT downgrade it into a one-function"
                 "patch and do NOT substitute a gate/suppression for the real ported logic."
+                "Cite // Ported from: on the ported logic so faithful structural work is credited even before"
+                "it flips a (noisy) count."
                 "</keystone_campaign>" ]
 
             let focusNotice =
@@ -996,13 +1004,16 @@ module ConvergenceLoop =
                 parityHarvestBroken || (not passed) || not protectedTouched.IsEmpty || d < 0
                 || realMatchLoss || fpFlood || markerRegression
             // Coverage credit: a faithful structural port that adds validated `// Ported
-            // from:` markers is durable progress even before it flips a diagnostic (this is
-            // what lets keystone work accrete) — but NOT if it caused a real per-project
-            // matching loss or false-positive flood (those hard-revert above), and the new
-            // false positives it introduces must not EXCEED the ported logic it added (bound
-            // slow FP creep: coverage-only credit requires supDelta <= markers added).
-            let supDelta = pSup1 - pSup0
-            let coverageCredit = covGain > 0 && not realMatchLoss && not fpFlood && supDelta <= covGain
+            // from:` markers is durable progress even before it flips a diagnostic — this is
+            // what lets keystone / de-noising / infrastructure work ACCRETE. We must NOT gate
+            // this on a global superfluous-count delta: the biggest project's parity is
+            // NONDETERMINISTIC (its count flaps hundreds run-to-run), so a global-FP bound
+            // silently reverts perfectly faithful, measured-zero-regression ports (a real
+            // django reportUnbound fix was thrown away because the harvest re-rolled +3 FP
+            // noise). The FP guard is the PER-PROJECT `fpFlood` (a project's FPs exceeding its
+            // OWN noise band without compensating matches) — that catches real floods while
+            // ignoring count noise. So: faithful markers + no real per-project loss/flood.
+            let coverageCredit = covGain > 0 && not realMatchLoss && not fpFlood
             let durableProgress =
                 (not parityHarvestBroken)
                 && (coverageCredit || (d > 0) || (realGain > 0) || precisionWin)
