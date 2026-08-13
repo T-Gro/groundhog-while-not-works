@@ -482,9 +482,20 @@ module ConvergenceLoop =
         try
             let attached = (cli { Exec "git"; Arguments [| "symbolic-ref"; "-q"; "HEAD" |] } |> Command.execute).ExitCode = 0
             if not attached && activeBranch <> "" then
-                cli { Exec "git"; Arguments [| "branch"; "-f"; activeBranch; "HEAD" |] } |> Command.execute |> ignore
+                // FAST-FORWARD ONLY. Move the branch to the detached HEAD *only* if HEAD is
+                // a descendant of the branch (the agent's commits are ahead). NEVER move the
+                // branch backward/sideways onto a detached side-commit — doing so orphaned
+                // large landed sprints (django +70/+67/+25 lost while a +4 side-commit
+                // overwrote the branch). If HEAD is behind/diverged, reattach WITHOUT moving
+                // the branch, preserving the branch's committed work.
+                let branchIsAncestorOfHead =
+                    (cli { Exec "git"; Arguments [| "merge-base"; "--is-ancestor"; activeBranch; "HEAD" |] } |> Command.execute).ExitCode = 0
+                if branchIsAncestorOfHead then
+                    cli { Exec "git"; Arguments [| "branch"; "-f"; activeBranch; "HEAD" |] } |> Command.execute |> ignore
+                    printfn $"  🔧 fast-forwarded {activeBranch} to detached HEAD (captured its commits)"
+                else
+                    printfn $"  🔧 detached HEAD is behind/diverged from {activeBranch} — reattaching WITHOUT moving the branch (preserving landed work)"
                 cli { Exec "git"; Arguments [| "checkout"; activeBranch |] } |> Command.execute |> ignore
-                printfn $"  🔧 reattached HEAD to {activeBranch} (an agent had detached it)"
             (cli { Exec "git"; Arguments [| "push" |] } |> Command.execute).ExitCode
         with _ -> 1
 
@@ -859,6 +870,17 @@ module ConvergenceLoop =
                        + " Deviate only if the source code proves it wrong (and say why).\n" + approvedDesign + "\n</approved_design>"
                    else
                        "\n\n<best_design_notes>\nUnapproved proposer notes — use ONLY what you can verify is faithful to the source:\n" + trunc approvedDesign 2000 + "\n</best_design_notes>")
+
+            // Reattach HEAD to the active branch BEFORE capturing baseCommit, so the sprint
+            // works ON the branch tip: the implementor's commits then advance the branch
+            // linearly and safePush fast-forwards them. (A prior sprint's agent may have left
+            // HEAD detached; without this, baseCommit is a detached commit and the branch can
+            // diverge, which is how large landed sprints got orphaned.)
+            if activeBranch <> "" then
+                let attached = (cli { Exec "git"; Arguments [| "symbolic-ref"; "-q"; "HEAD" |] } |> Command.execute).ExitCode = 0
+                if not attached then
+                    (try cli { Exec "git"; Arguments [| "checkout"; activeBranch |] } |> Command.execute |> ignore with _ -> ())
+                    printfn $"  🔧 reattached HEAD to {activeBranch} before sprint (was detached)"
 
             // Record base commit BEFORE implementor runs — this defines the sprint's diff scope
             let baseCommit =
