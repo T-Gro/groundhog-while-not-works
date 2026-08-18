@@ -1,4 +1,4 @@
-Invoke the review-expert agent as a subtask for domain-expert review.
+Perform the domain-expert review yourself. Do NOT invoke or delegate to a subagent.
 
 CRITICAL ANTI-GAMING CHECKS:
 

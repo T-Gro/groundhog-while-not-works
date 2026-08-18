@@ -198,7 +198,7 @@ module Verifiers =
     let private title (name: string) = if name.Contains "EXPERT-REVIEW" then "review-expert" else $"Verify-{name}"
 
     let runVerifier (name: string) (baseCommit: string) : bool * string * string =
-        let prompt = if name.Contains "EXPERT-REVIEW" then getPrompt name else (preamble baseCommit) + "\n\n" + getPrompt name
+        let prompt = (preamble baseCommit) + "\n\n" + getPrompt name
         let (out, sid) = Agent.run prompt (title name) None
         let (passed, fullOut) = parseVerdict out sid name
         (passed, fullOut, sid)
@@ -1106,7 +1106,7 @@ module ConvergenceLoop =
                     sprintsSinceReview <- 0
                     printfn "── Periodic codebase review ──"
                     let reviewPrompt = String.concat "\n" [
-                        "Invoke the review-expert agent as a subtask."
+                        "Perform the domain-expert review directly. Do NOT invoke or delegate to a subagent."
                         $"Goal: assess overall quality of the FULL codebase in {targetDir()}."
                         "You are NOT reviewing a diff. You are reviewing the entire implementation."
                         $"Source reference: {config.SourceDir}"
