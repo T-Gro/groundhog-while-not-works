@@ -528,6 +528,46 @@ module ConvergenceLoop =
             conn.Close()
         with _ -> eprintfn "  ⚠ Could not read harvest results"
 
+    let private protectedFilesTouched (baseCommit: string) =
+        let changedFiles =
+            try
+                // Compare the base commit to the complete working tree, not merely HEAD.
+                // This catches protected edits that an agent staged or left uncommitted.
+                (cli { Exec "git"; Arguments [| "diff"; "--name-only"; baseCommit |] } |> Command.execute).Text
+                |> Option.defaultValue ""
+            with _ -> ""
+        changedFiles.Split('\n')
+        |> Array.map (fun s -> s.Trim().Replace('\\', '/'))
+        |> Array.filter (fun f -> f <> "" && (
+                f.StartsWith("testdata/baselines/reference/") ||
+                f.EndsWith("pyright-source-index.db") ||
+                f.EndsWith("_tools/harvest_tests.py") ||
+                f = "project.json"))
+        |> Array.toList
+
+    let private repairProtectedFiles baseCommit sid bead sprintNum maxAttempts =
+        let mutable touched = protectedFilesTouched baseCommit
+        let mutable attempt = 0
+        while not touched.IsEmpty && attempt < maxAttempts do
+            let files = String.concat "\n" (touched |> List.map (fun f -> $"  - {f}"))
+            let touchedCsv = String.concat "," touched
+            Beads.note bead $"PHASE:protected-fix attempt={attempt+1} files={touchedCsv}"
+            let prompt = String.concat "\n" [
+                "PROTECTED ORACLE VIOLATION. Do not abandon the implementation and do not change the oracle."
+                "Restore every protected file below byte-for-byte to the sprint base commit:"
+                files
+                ""
+                "Then correct the TARGET IMPLEMENTATION so it passes the existing oracle."
+                "Reference baselines come from the authoritative source and must never be edited to make new code pass."
+                "If your implementation emits a diagnostic absent from the existing baseline, your port is not faithful yet:"
+                "read the source path again and fix the target behavior rather than changing expected output."
+                "Run the affected build/tests and COMMIT the repair. Preserve valid parity gains."
+                $"Sprint base commit: {baseCommit}" ]
+            Agent.resume sid prompt $"Protect-S{sprintNum}" |> ignore
+            attempt <- attempt + 1
+            touched <- protectedFilesTouched baseCommit
+        touched
+
     let private ensureInit () =
         let config = require()
         let db = currentDbPath (key())
@@ -911,7 +951,14 @@ module ConvergenceLoop =
                 resetNoCommitStreak (key())
                 Beads.note bead $"PHASE:impl:done commits={headAfterImpl.[..7]}"
 
-            // Harvest test results AFTER agent finishes — orchestrator-owned measurement
+            // Protected files are immutable oracles. Push back immediately and let the
+            // implementor repair its code before spending a full harvest/verifier cycle.
+            // Previously this was detected only at the final gate, so valuable candidates
+            // were discarded wholesale without one correction turn.
+            let mutable protectedTouched = repairProtectedFiles baseCommit sid bead next maxRetries
+
+            // Harvest test results AFTER every implementor revision — orchestrator-owned
+            // measurement. Verifier-requested fixes must be re-harvested before credit.
             Beads.note bead "PHASE:harvest"
             harvestTests config next
 
@@ -919,7 +966,7 @@ module ConvergenceLoop =
             let mutable passed = false
             let mutable lastFail = ""
 
-            while retries < maxRetries && not passed do
+            while retries <= maxRetries && not passed do
                 Beads.note bead $"PHASE:verify attempt={retries+1}"
                 let results = Verifiers.listAll() |> List.map (fun v -> async {
                     let (vp,vo,vsid) = Verifiers.runVerifier v baseCommit
@@ -933,10 +980,11 @@ module ConvergenceLoop =
                     lastFail <- fb
                     let failedNames = failed |> List.map (fun (v,_,_,_) -> v) |> String.concat ","
                     Beads.note bead $"PHASE:fix attempt={retries+1} fixing={failedNames}"
-                    Agent.resume sid fb $"Fix-S{next}" |> ignore
-                    Beads.note bead $"PHASE:recheck attempt={retries+1}"
-                    let rechecks = failed |> List.map (fun (v,_,_,vsid) -> async { let (r,_) = Verifiers.resumeVerifier vsid v in return (v,r) }) |> Async.Parallel |> Async.RunSynchronously
-                    if rechecks |> Array.forall snd then passed <- true
+                    if retries < maxRetries then
+                        Agent.resume sid fb $"Fix-S{next}" |> ignore
+                        protectedTouched <- repairProtectedFiles baseCommit sid bead next maxRetries
+                        Beads.note bead $"PHASE:reharvest attempt={retries+1}"
+                        harvestTests config next
                     retries <- retries + 1
 
             let fc = initSchema db
@@ -981,21 +1029,9 @@ module ConvergenceLoop =
             let msg = $"parity match {pMatch0}->{pMatch1} ({gainStr}) fp {pSup0}->{pSup1} | tests {fp}/{ft} d={d}"
             Beads.note bead msg
 
-            // Protected files: the objective/oracle (reference baselines, source-index,
-            // harvest, project config) must never be edited by a sprint — else the loop
-            // can cheat its own metric.
-            let changedFiles =
-                try (cli { Exec "git"; Arguments [| "diff"; "--name-only"; baseCommit + "..HEAD" |] } |> Command.execute).Text |> Option.defaultValue ""
-                with _ -> ""
-            let protectedTouched =
-                changedFiles.Split('\n')
-                |> Array.map (fun s -> s.Trim().Replace('\\', '/'))
-                |> Array.filter (fun f -> f <> "" && (
-                        f.StartsWith("testdata/baselines/reference/") ||
-                        f.EndsWith("pyright-source-index.db") ||
-                        f.EndsWith("_tools/harvest_tests.py") ||
-                        f = "project.json"))
-                |> Array.toList
+            // Recheck after all verifier-requested revisions. This includes committed,
+            // staged, and unstaged differences from the sprint base.
+            protectedTouched <- protectedFilesTouched baseCommit
 
             // Marker-removal gate (F1 fix): removing a `// Ported from:` marker is only a
             // regression if NOT accompanied by a precision win — deleting over-broad ported
