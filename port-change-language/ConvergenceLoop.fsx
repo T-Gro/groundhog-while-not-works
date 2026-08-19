@@ -1005,25 +1005,22 @@ module ConvergenceLoop =
             // checker build/run failed and the objective silently vanished (F2).
             let parityHarvestBroken = pMatch0 > 0 && pProj1 < 6
             let matchGain = pMatch1 - pMatch0        // global, for the report line only
-            // PER-PROJECT credit (agnostic — no project names). Each project's measurement
-            // noise scales with its reference size (offset-cache nondeterminism flaps roughly
-            // in proportion to file volume), so we judge each project against ITS OWN band.
-            // A real win = net matches (matches gained minus new false positives) beyond that
-            // band in ANY project — so a genuine +50 in a small quiet project is credited
-            // instead of being drowned by a large noisy project's global flap, while a real
-            // per-project matching loss or false-positive flood still hard-reverts.
-            let band refc = max 20 (refc / 150)
+            // PER-PROJECT exact credit. K6 removed the shared offset-cache collisions and
+            // nondeterministic map iteration that previously made parity counts flap, so the
+            // old size-proportional noise bands (django: 203, pydantic: 29) now discard real,
+            // repeatable wins. Pay one match for every new false positive and accrue every
+            // positive net diagnostic; reject every exact matching loss or unpaid FP increase.
             let m0 = pby0 |> List.map (fun (p,m,_,_) -> p, m) |> Map.ofList
             let s0 = pby0 |> List.map (fun (p,_,s,_) -> p, s) |> Map.ofList
             let perProj =
-                pby1 |> List.map (fun (p, m1, s1, refc) ->
+                pby1 |> List.map (fun (p, m1, s1, _) ->
                     let mg = m1 - (Map.tryFind p m0 |> Option.defaultValue m1)
                     let sd = s1 - (Map.tryFind p s0 |> Option.defaultValue s1)
                     let net = mg - (max 0 sd)          // pay one match per new false positive
-                    (p, mg, sd, net, band refc))
-            let realGain = perProj |> List.sumBy (fun (_,_,_,net,b) -> if net > b then net else 0)
-            let realMatchLoss = (not parityHarvestBroken) && (perProj |> List.exists (fun (_,mg,_,_,b) -> -mg > b))
-            let fpFlood = (not parityHarvestBroken) && (perProj |> List.exists (fun (_,_,sd,net,b) -> sd > b && net < 0))
+                    (p, mg, sd, net))
+            let realGain = perProj |> List.sumBy (fun (_,_,_,net) -> max 0 net)
+            let realMatchLoss = (not parityHarvestBroken) && (perProj |> List.exists (fun (_,mg,_,_) -> mg < 0))
+            let fpFlood = (not parityHarvestBroken) && (perProj |> List.exists (fun (_,_,sd,net) -> sd > 0 && net < 0))
             let precisionWin = (not parityHarvestBroken) && pSup1 < pSup0
             let gainStr = (if matchGain >= 0 then "+" else "") + string matchGain
             let msg = $"parity match {pMatch0}->{pMatch1} ({gainStr}) fp {pSup0}->{pSup1} | tests {fp}/{ft} d={d}"
@@ -1065,12 +1062,9 @@ module ConvergenceLoop =
             // from:` markers is durable progress even before it flips a diagnostic — this is
             // what lets keystone / de-noising / infrastructure work ACCRETE. We must NOT gate
             // this on a global superfluous-count delta: the biggest project's parity is
-            // NONDETERMINISTIC (its count flaps hundreds run-to-run), so a global-FP bound
-            // silently reverts perfectly faithful, measured-zero-regression ports (a real
-            // django reportUnbound fix was thrown away because the harvest re-rolled +3 FP
-            // noise). The FP guard is the PER-PROJECT `fpFlood` (a project's FPs exceeding its
-            // OWN noise band without compensating matches) — that catches real floods while
-            // ignoring count noise. So: faithful markers + no real per-project loss/flood.
+            // now deterministic after K6. The FP guard is the exact PER-PROJECT `fpFlood`:
+            // every new FP must be paid for by at least one new matching diagnostic in the
+            // same project. So: faithful markers + no per-project loss or unpaid FP increase.
             let coverageCredit = covGain > 0 && not realMatchLoss && not fpFlood
             let durableProgress =
                 (not parityHarvestBroken)
