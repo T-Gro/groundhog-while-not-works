@@ -508,34 +508,40 @@ module PortStatus =
             result.Text |> Option.defaultValue "" |> fun s -> s.Trim()
         with _ -> ""
 
-    /// Compact machine-rendered work packet. Agents consistently ignored prose that
-    /// told them to query the DB, so hand them exact incomplete rows up front: recent
-    /// partial mappings plus adjacent not-started concepts in the same source files.
+    /// Compact machine-rendered work packet. A target may provide a language-agnostic
+    /// `_tools/port-campaigns.json` containing ranked exact source concepts. Render
+    /// those rows first; fall back to recently touched partial mappings when absent.
     let workPacket () =
         let dbPath = sourceIndexPath ()
         if not (File.Exists dbPath) then "" else
         try
             let py = String.concat "\n" [
-                "import sqlite3,sys"
+                "import sqlite3,sys,os,json"
                 "c=sqlite3.connect(sys.argv[1])"
-                "partial=c.execute(\"SELECT ts_file,ts_lines,concept,status,COALESCE(go_file,''),COALESCE(sprint,0) FROM port_status WHERE status='partial' ORDER BY sprint DESC,updated_at DESC,ts_file,ts_lines LIMIT 16\").fetchall()"
-                "files=[]"
-                "for r in partial:"
-                "    if r[0] not in files: files.append(r[0])"
-                "adj=[]"
-                "for f in files[:6]:"
-                "    rows=c.execute(\"SELECT ts_file,ts_lines,concept,status,COALESCE(go_file,''),COALESCE(sprint,0) FROM port_status WHERE ts_file=? AND status='not_started' ORDER BY CAST(substr(ts_lines,1,instr(ts_lines,'-')-1) AS INT) LIMIT 4\",(f,)).fetchall()"
-                "    adj.extend(rows)"
+                "cfg=sys.argv[2]"
                 "seen=set()"
-                "for r in partial+adj:"
+                "rendered=0"
+                "if os.path.exists(cfg):"
+                "    data=json.load(open(cfg,encoding='utf-8'))"
+                "    for camp in sorted(data.get('campaigns',[]),key=lambda x:x.get('rank',999)):"
+                "        for target in camp.get('targets',[]):"
+                "            r=c.execute(\"SELECT ts_file,ts_lines,concept,status,COALESCE(go_file,''),COALESCE(sprint,0) FROM port_status WHERE ts_file=? AND concept=?\",(target.get('ts_file',''),target.get('concept',''))).fetchone()"
+                "            if not r or r[3]=='complete': continue"
+                "            k=(r[0],r[2])"
+                "            if k in seen: continue"
+                "            seen.add(k); rendered+=1"
+                "            print('P%02d | %s | %s | %s:%s | %s | go=%s | sprint=%s'%(camp.get('rank',99),camp.get('name','campaign'),r[3],r[0],r[1],r[2],r[4] or '-',r[5] or '-'))"
+                "partial=c.execute(\"SELECT ts_file,ts_lines,concept,status,COALESCE(go_file,''),COALESCE(sprint,0) FROM port_status WHERE status='partial' ORDER BY sprint DESC,updated_at DESC,ts_file,ts_lines LIMIT ?\",(16 if rendered==0 else 6,)).fetchall()"
+                "for r in partial:"
                 "    k=(r[0],r[2])"
                 "    if k in seen: continue"
                 "    seen.add(k)"
-                "    print('%s | %s:%s | %s | go=%s | sprint=%s'%(r[3],r[0],r[1],r[2],r[4] or '-',r[5] or '-'))"
+                "    print('RECENT | %s | %s:%s | %s | go=%s | sprint=%s'%(r[3],r[0],r[1],r[2],r[4] or '-',r[5] or '-'))"
                 "c.close()" ]
             let pyFile = Path.GetTempFileName() + ".py"
             File.WriteAllText(pyFile, py)
-            let result = cli { Exec "python"; Arguments [| pyFile; dbPath |] } |> Command.execute
+            let campaignPath = Path.Combine(targetDir(), "_tools", "port-campaigns.json")
+            let result = cli { Exec "python"; Arguments [| pyFile; dbPath; campaignPath |] } |> Command.execute
             File.Delete pyFile
             result.Text |> Option.defaultValue "" |> fun s -> s.Trim()
         with _ -> ""
