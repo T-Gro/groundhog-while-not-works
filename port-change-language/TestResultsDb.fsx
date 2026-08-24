@@ -60,7 +60,13 @@ module TestResultsDb =
         Directory.CreateDirectory dir |> ignore
         Path.Combine(dir, $"sprint_{sprintNum:D4}.log")
     let writeImplLog (key: string) (sprintNum: int) (text: string) =
-        let p = implLogPath key sprintNum
+        let canonical = implLogPath key sprintNum
+        let p =
+            if File.Exists canonical then
+                let dir = Path.GetDirectoryName canonical
+                let stamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss")
+                Path.Combine(dir, $"sprint_{sprintNum:D4}_{stamp}.log")
+            else canonical
         let trimmed = if text.Length > 200_000 then text.Substring(text.Length - 200_000) else text
         File.WriteAllText(p, trimmed)
         p

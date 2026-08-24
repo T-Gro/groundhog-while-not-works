@@ -66,6 +66,9 @@ module Beads =
 
     let mutable private warned = false
     let mutable private epicId = ""
+    let private idFromJson (output: string) =
+        let m = System.Text.RegularExpressions.Regex.Match(output, "\"id\":\\s*\"([^\"]+)\"")
+        if m.Success then m.Groups.[1].Value else output.Trim()
 
     let run (args: string list) : string =
         try
@@ -90,7 +93,9 @@ module Beads =
                 let m = System.Text.RegularExpressions.Regex.Match(existing, "\"id\":\\s*\"([^\"]+)\"")
                 if m.Success then epicId <- m.Groups.[1].Value
             if epicId = "" then
-                epicId <- (run ["create"; $"--title={projectName}"; "--type=epic"; "--description=Porting campaign"]).Trim()
+                epicId <-
+                    run ["create"; $"--title={projectName}"; "--type=epic"; "--description=Porting campaign"; "--json"]
+                    |> idFromJson
         epicId
 
     /// Create a sprint task under the campaign epic.
@@ -103,8 +108,9 @@ module Beads =
             "--type=task"
             $"--labels=sprint:{sprintNum},bucket:{bucket}"
             if parent <> "" then $"--parent={parent}"
+            "--json"
         ]
-        (run args).Trim()
+        run args |> idFromJson
 
     let claim id = run ["update"; id; "--claim"] |> ignore
     let note id text = run ["comments"; "add"; id; text] |> ignore
@@ -115,13 +121,30 @@ module Beads =
         note id $"VERIFIER:{verifier}:{verdict}:attempt{attempt}"
 
     let closeSuccess id reason = run ["close"; id; $"--reason={reason}"] |> ignore
-    let closeFailed id reason = run ["close"; id; $"--reason=FAILED: {reason}"; "--add-label"; "failed"] |> ignore
+    let closeFailed id reason =
+        run ["update"; id; "--add-label"; "failed"] |> ignore
+        run ["close"; id; $"--reason=FAILED: {reason}"] |> ignore
     let remember text = run ["remember"; text] |> ignore
 
 module Agent =
 
     let Model = "claude-opus-4.8"
     let Effort = "xhigh"  // reasoning effort: none|low|medium|high|xhigh|max
+    let private promptDirLock = obj ()
+
+    let private promptDirectory () =
+        let dir = Path.Combine(targetDir(), ".ralph-prompts")
+        Directory.CreateDirectory(dir) |> ignore
+        // Keep long-prompt handoffs inside the trusted target tree (agents could not
+        // read %TEMP% in sprints 424/425), but hide the transient directory from git.
+        lock promptDirLock (fun () ->
+            let exclude = Path.Combine(targetDir(), ".git", "info", "exclude")
+            if File.Exists exclude then
+                let rule = "/.ralph-prompts/"
+                let text = File.ReadAllText exclude
+                if not (text.Split('\n') |> Array.exists (fun l -> l.Trim() = rule)) then
+                    File.AppendAllText(exclude, Environment.NewLine + rule + Environment.NewLine))
+        dir
 
     let run (prompt: string) (title: string) (resumeId: string option) : string * string =
         // Copilot CLI distinguishes new sessions (--name) from resumes (--resume).
@@ -138,7 +161,7 @@ module Agent =
         // feedback) pass through directly.
         let promptFile =
             if prompt.Length > 12000 then
-                let f = Path.Combine(Path.GetTempPath(), $"ralph-prompt-{sid}.md")
+                let f = Path.Combine(promptDirectory (), $"ralph-prompt-{sid}.md")
                 File.WriteAllText(f, prompt)
                 Some f
             else None
@@ -236,9 +259,8 @@ module Verifiers =
         (passed, fullOut)
 
 module PortStatus =
-    /// Canonical source-index DB path. The 908-row port_status table lives under
-    /// _tools/ (the repo root copy is an empty stray file) — pointing at the root
-    /// made sync/coverage a silent no-op.
+    /// Canonical function-level source-index DB path. It is persistent runtime state
+    /// under _tools/; pointing at the repo root previously made sync a silent no-op.
     let sourceIndexPath () = Path.Combine(targetDir(), "_tools", "pyright-source-index.db")
 
     /// Scan Go files for "// Ported from:" comments and update port_status in the source index DB.
@@ -252,23 +274,22 @@ module PortStatus =
                       |> Array.filter (fun f -> not (f.EndsWith("_test.go")))
         let pattern =
             System.Text.RegularExpressions.Regex(
-                @"//\s*Ported from:\s*(\S+?\.ts)(?::([A-Za-z_$][\w$]*|\d+(?:[\-–]\d+)?))?(?:[.\s]|$)",
+                @"//\s*Ported from:\s*([^\r\n]+)",
                 System.Text.RegularExpressions.RegexOptions.Multiline)
         let entries = [
             for goFile in goFiles do
                 let content = File.ReadAllText goFile
                 let ms = pattern.Matches content
                 for m in ms do
-                    let tsFile = m.Groups.[1].Value
-                    let tsAnchor = if m.Groups.[2].Success then m.Groups.[2].Value else ""
+                    let marker = m.Groups.[1].Value.Trim()
                     let sep = string Path.DirectorySeparatorChar
                     let goRel = goFile.Replace(targetDir() + sep, "").Replace('\\', '/')
-                    yield (tsFile, tsAnchor, goRel) ]
+                    yield (marker, goRel) ]
         if entries.IsEmpty then () else
         try
             // Write entries to a temp JSON file, then run Python to upsert
             let tmpJson = Path.GetTempFileName()
-            let jsonData = System.Text.Json.JsonSerializer.Serialize(entries |> List.map (fun (t,l,g) -> {| ts=t; lines=l; go=g |}))
+            let jsonData = System.Text.Json.JsonSerializer.Serialize(entries |> List.map (fun (m,g) -> {| marker=m; go=g |}))
             File.WriteAllText(tmpJson, jsonData)
             let pyScript = String.concat "\n" [
                 "import sqlite3, json, sys, os"
@@ -300,16 +321,32 @@ module PortStatus =
                 "    if f in files: return f"
                 "    hits=by_base.get(os.path.basename(f),[])"
                 "    return hits[0] if len(hits)==1 else None"
-                "def resolve(raw, anchor):"
+                "MARKER=re.compile(r'(?P<file>\\S+?\\.ts)(?P<rest>.*)',re.I)"
+                "def parse_marker(raw):"
+                "    m=MARKER.search(raw)"
+                "    if not m: return None,None,None"
+                "    f=m.group('file'); rest=m.group('rest').strip()"
+                "    anchor=None; line_hint=None"
+                "    cm=re.match(r'^:\\s*([A-Za-z_$][\\w$]*|\\d+(?:[-\\u2013]\\d+)?)',rest)"
+                "    if cm: anchor=cm.group(1)"
+                "    else:"
+                "        sm=re.match(r'^([A-Za-z_$][\\w$]*(?:\\.[A-Za-z_$][\\w$]*)?)\\b',rest)"
+                "        if sm and sm.group(1).lower() not in ('line','lines','ts'): anchor=sm.group(1)"
+                "        lm=re.search(r'\\blines?\\s+(\\d+(?:[-\\u2013]\\d+)?)',rest,re.I)"
+                "        if lm: line_hint=lm.group(1)"
+                "    return f,anchor,line_hint"
+                "def resolve(raw, anchor, line_hint=None):"
                 "    f=canonical_file(raw)"
-                "    if not f or not anchor: return None"
-                "    a=anchor.rstrip('.')"
-                "    if a[0].isdigit():"
-                "        try: start=int(a.replace('\\u2013','-').split('-')[0])"
+                "    if not f: return None"
+                "    hits=[]"
+                "    a=(anchor or '').rstrip('.')"
+                "    if a:"
+                "        if a[0].isdigit(): line_hint=a"
+                "        else: hits=symbols.get(f,{}).get(a.lower(),[])"
+                "    if not hits and line_hint:"
+                "        try: start=int(line_hint.replace('\\u2013','-').split('-')[0])"
                 "        except: return None"
                 "        hits=[x for x in ranges.get(f,[]) if x[0] <= start <= x[1]]"
-                "    else:"
-                "        hits=symbols.get(f,{}).get(a.lower(),[])"
                 "    if not hits: return None"
                 "    start,end,concept=min(hits,key=lambda x:(x[1]-x[0],x[0]))"
                 "    return f,concept"
@@ -319,11 +356,12 @@ module PortStatus =
                 "mapped = {}"
                 "unmapped = 0"
                 "for e in entries:"
-                "    hit=resolve(e['ts'],e['lines'])"
+                "    raw,anchor,line_hint=parse_marker(e['marker'])"
+                "    hit=resolve(raw,anchor,line_hint) if raw else None"
                 "    if hit: mapped[hit]=e['go']"
                 "    else: unmapped += 1"
                 "for (f,concept),go in mapped.items():"
-                "    c.execute(\"UPDATE port_status SET go_file=?, status='partial', sprint=?, updated_at=datetime('now') WHERE ts_file=? AND concept=? AND status!='complete'\",(go,sprint,f,concept))"
+                "    c.execute(\"UPDATE port_status SET go_file=?, status='partial', sprint=CASE WHEN status='not_started' THEN ? ELSE sprint END, updated_at=CASE WHEN status='not_started' THEN datetime('now') ELSE updated_at END WHERE ts_file=? AND concept=? AND status!='complete'\",(go,sprint,f,concept))"
                 "conn.commit()"
                 "stats = dict(c.execute('SELECT status, COUNT(*) FROM port_status GROUP BY status').fetchall())"
                 "print('port_status: %d unique concepts mapped, %d markers unmapped | ' % (len(mapped), unmapped) + ' '.join('%s=%d'%(s,n) for s,n in stats.items()))"
@@ -415,9 +453,9 @@ module PortStatus =
                 "import sqlite3,sys,os,re"
                 "db,sprint,root=sys.argv[1],int(sys.argv[2]),sys.argv[3]"
                 "conn=sqlite3.connect(db); c=conn.cursor()"
-                "rows=c.execute(\"SELECT ts_file,ts_lines,concept,go_file FROM port_status WHERE status='partial' AND go_file IS NOT NULL AND go_file!='' AND ts_lines LIKE '%-%' AND concept NOT LIKE 'phantom:%' AND ts_file IN (SELECT path FROM files)\").fetchall()"
+                "rows=c.execute(\"SELECT ts_file,ts_lines,concept,go_file FROM port_status WHERE status='partial' AND sprint=? AND go_file IS NOT NULL AND go_file!='' AND ts_lines LIKE '%-%' AND concept NOT LIKE 'phantom:%' AND ts_file IN (SELECT path FROM files)\",(sprint,)).fetchall()"
                 "STUB=re.compile(r'panic\\(|TODO\\(port\\)|not[ _]?implemented|unimplemented',re.I)"
-                "MARK=re.compile(r'Ported from:\\s*(\\S+?\\.ts)(?::([A-Za-z_$][\\w$]*|\\d+(?:[-\\u2013]\\d+)?))?',re.I)"
+                "MARK=re.compile(r'Ported from:\\s*(?P<file>\\S+?\\.ts)(?P<rest>[^\\r\\n]*)',re.I)"
                 "promoted=0"
                 "for ts_file,ts_lines,concept,go_file in rows:"
                 "    gp=os.path.join(root,go_file)"
@@ -432,15 +470,26 @@ module PortStatus =
                 "    for i,l in enumerate(lines):"
                 "        m=MARK.search(l)"
                 "        if m:"
-                "            raw=m.group(1).replace('\\\\','/').lstrip('./')"
+                "            raw=m.group('file').replace('\\\\','/').lstrip('./')"
                 "            if ('/' in raw and not ts_file.endswith(raw)) or ('/' not in raw and os.path.basename(raw)!=bn): continue"
-                "            anchor=(m.group(2) or '').rstrip('.')"
+                "            rest=m.group('rest').strip(); anchor=''; line_hint=''"
+                "            cm=re.match(r'^:\\s*([A-Za-z_$][\\w$]*|\\d+(?:[-\\u2013]\\d+)?)',rest)"
+                "            if cm: anchor=cm.group(1)"
+                "            else:"
+                "                sm=re.match(r'^([A-Za-z_$][\\w$]*(?:\\.[A-Za-z_$][\\w$]*)?)\\b',rest)"
+                "                if sm and sm.group(1).lower() not in ('line','lines','ts'): anchor=sm.group(1)"
+                "                lm=re.search(r'\\blines?\\s+(\\d+(?:[-\\u2013]\\d+)?)',rest,re.I)"
+                "                if lm: line_hint=lm.group(1)"
+                "            anchor=anchor.rstrip('.')"
                 "            anchor_ok=False"
                 "            if anchor and anchor[0].isdigit():"
                 "                try: anchor_ok = a <= int(anchor.replace('\\u2013','-').split('-')[0]) <= b"
                 "                except: pass"
                 "            elif anchor:"
                 "                anchor_ok = anchor.lower() in (concept.lower(),concept.rsplit('.',1)[-1].lower())"
+                "            if not anchor_ok and line_hint:"
+                "                try: anchor_ok = a <= int(line_hint.replace('\\u2013','-').split('-')[0]) <= b"
+                "                except: pass"
                 "            if not anchor_ok: continue"
                 "            j=i"
                 "            while j>=0 and not lines[j].lstrip().startswith('func '): j-=1"
@@ -515,6 +564,38 @@ module PortStatus =
             result.Text |> Option.defaultValue "" |> fun s -> s.Trim()
         with _ -> ""
 
+    /// Compact machine-rendered work packet. Agents consistently ignored prose that
+    /// told them to query the DB, so hand them exact incomplete rows up front: recent
+    /// partial mappings plus adjacent not-started concepts in the same source files.
+    let workPacket () =
+        let dbPath = sourceIndexPath ()
+        if not (File.Exists dbPath) then "" else
+        try
+            let py = String.concat "\n" [
+                "import sqlite3,sys"
+                "c=sqlite3.connect(sys.argv[1])"
+                "partial=c.execute(\"SELECT ts_file,ts_lines,concept,status,COALESCE(go_file,''),COALESCE(sprint,0) FROM port_status WHERE status='partial' ORDER BY sprint DESC,updated_at DESC,ts_file,ts_lines LIMIT 16\").fetchall()"
+                "files=[]"
+                "for r in partial:"
+                "    if r[0] not in files: files.append(r[0])"
+                "adj=[]"
+                "for f in files[:6]:"
+                "    rows=c.execute(\"SELECT ts_file,ts_lines,concept,status,COALESCE(go_file,''),COALESCE(sprint,0) FROM port_status WHERE ts_file=? AND status='not_started' ORDER BY CAST(substr(ts_lines,1,instr(ts_lines,'-')-1) AS INT) LIMIT 4\",(f,)).fetchall()"
+                "    adj.extend(rows)"
+                "seen=set()"
+                "for r in partial+adj:"
+                "    k=(r[0],r[2])"
+                "    if k in seen: continue"
+                "    seen.add(k)"
+                "    print('%s | %s:%s | %s | go=%s | sprint=%s'%(r[3],r[0],r[1],r[2],r[4] or '-',r[5] or '-'))"
+                "c.close()" ]
+            let pyFile = Path.GetTempFileName() + ".py"
+            File.WriteAllText(pyFile, py)
+            let result = cli { Exec "python"; Arguments [| pyFile; dbPath |] } |> Command.execute
+            File.Delete pyFile
+            result.Text |> Option.defaultValue "" |> fun s -> s.Trim()
+        with _ -> ""
+
 module ConvergenceLoop =
     let private key () = projectKey (targetDir())
     let private trunc (s: string) n = if s.Length <= n then s else s.[..n/2] + "..." + s.[(s.Length-n/2)..]
@@ -545,7 +626,17 @@ module ConvergenceLoop =
                 else
                     printfn $"  🔧 detached HEAD is behind/diverged from {activeBranch} — reattaching WITHOUT moving the branch (preserving landed work)"
                 cli { Exec "git"; Arguments [| "checkout"; activeBranch |] } |> Command.execute |> ignore
-            (cli { Exec "git"; Arguments [| "push" |] } |> Command.execute).ExitCode
+            let mutable pushExit = 1
+            let mutable attempt = 1
+            while pushExit <> 0 && attempt <= 3 do
+                let (_, err, code) = execWithTimeout "git" [ "push" ] (targetDir()) 5
+                pushExit <- code
+                if code <> 0 then
+                    let detail = if err.Length > 500 then err.[..499] else err
+                    eprintfn $"  ⚠ git push attempt {attempt}/3 failed: {detail.Trim()}"
+                    if attempt < 3 then System.Threading.Thread.Sleep(15000 * attempt)
+                attempt <- attempt + 1
+            pushExit
         with _ -> 1
 
     /// Harvest test results by running the project's harvest script directly.
@@ -637,6 +728,7 @@ module ConvergenceLoop =
         let prevBlock = match prevFailure with Some ctx -> $"\n<previous_failure>\n{trunc ctx 3000}\n</previous_failure>" | None -> ""
         let srcDir = config.SourceDir
         let sourceCoverage = PortStatus.summary ()
+        let sourceTargets = PortStatus.workPacket ()
         let sourceIndex = Path.Combine(targetDir(), "_tools", "pyright-source-index.db")
         // Load project-specific briefing template if it exists; otherwise use generic porting briefing.
         // The template can use {{sprint}}, {{source_lang}}, {{target_lang}}, {{source_dir}} placeholders.
@@ -669,8 +761,13 @@ module ConvergenceLoop =
             "</sprint_scope>"
             ""
             "<parity_rules>"
-            "EVERY COMMIT MUST MAKE AT LEAST ONE TEST FLIP FROM FAIL TO PASS."
-            "Measure before. Port. Measure after. Delta must be positive."
+            "EVERY COMMIT MUST HAVE DURABLE, MACHINE-MEASURED EVIDENCE:"
+            "  - a positive real-world parity set-diff, OR"
+            "  - a newly mapped faithful source-index concept needed by the approved keystone,"
+            "and the build/unit/baseline suites must not regress."
+            "Reference baselines are immutable source oracles. NEVER edit expected-output files"
+            "to manufacture a test flip; fix the target implementation against the existing oracle."
+            "Measure before. Port. Measure after. The final net diagnostic delta must be positive."
             "Commit message format: 'area: description (NNN/MMM → NNN+K/MMM)'"
             ""
             "BANNED (these waste cycles without parity gains):"
@@ -684,7 +781,7 @@ module ConvergenceLoop =
             "  2. Pick a failing bucket. Read the ENTIRE source file for that area."
             "     Not a function. The ENTIRE FILE. You have 1M tokens."
             "  3. Port EVERY unported function in that file. Build + test after each one."
-            "  4. Each commit must increase the pass count. Keep porting until it does."
+            "  4. Each commit must add measured parity or faithful source coverage with zero regression."
             "  5. When the file is done, pick the NEXT failing area and repeat."
             "  6. STOP ONLY when you have genuinely run out of productive porting work to do."
             "</parity_rules>"
@@ -702,6 +799,13 @@ module ConvergenceLoop =
             "Do not trust stale row counts in Markdown. `complete` means already covered; `partial` means"
             "inspect the existing Go mapping and finish the missing semantics; `not_started` is an open port."
             "Choose a coherent cluster of adjacent incomplete rows, not a local symptom patch."
+            "After choosing rows, search `.github/instructions/port-debt.instructions.md` only for those"
+            "specific ts_file/concept names; do not load the entire debt ledger into context."
+            ""
+            "<port_targets>"
+            "Orchestrator-rendered exact incomplete rows (start here; verify against the current failure):"
+            sourceTargets
+            "</port_targets>"
             "</source_index>"
             "You MUST commit your changes. Do NOT push."
             ""
@@ -1092,7 +1196,12 @@ module ConvergenceLoop =
             let fpFlood = (not parityHarvestBroken) && (perProj |> List.exists (fun (_,_,sd,net) -> sd > 0 && net < 0))
             let precisionWin = (not parityHarvestBroken) && pSup1 < pSup0
             let gainStr = (if matchGain >= 0 then "+" else "") + string matchGain
-            let msg = $"parity match {pMatch0}->{pMatch1} ({gainStr}) fp {pSup0}->{pSup1} | tests {fp}/{ft} d={d}"
+            let signed n = if n > 0 then "+" + string n else string n
+            let perProjDetail =
+                perProj
+                |> List.map (fun (p,mg,sd,net) -> $"{p}:match={signed mg},fp={signed sd},net={signed net}")
+                |> String.concat "; "
+            let msg = $"parity match {pMatch0}->{pMatch1} ({gainStr}) fp {pSup0}->{pSup1} | tests {fp}/{ft} d={d} | {perProjDetail}"
             Beads.note bead msg
 
             // Recheck after all verifier-requested revisions. This includes committed,
@@ -1153,8 +1262,8 @@ module ConvergenceLoop =
                     elif not passed then "verifiers failed"
                     elif not protectedTouched.IsEmpty then $"edited protected files: {pf}"
                     elif d < 0 then $"unit/baseline regression d={d}"
-                    elif realMatchLoss then $"per-project parity matching lost beyond its noise band (global {pMatch0}->{pMatch1})"
-                    elif fpFlood then $"per-project false-positive flood not paid for by matches (global fp {pSup0}->{pSup1})"
+                    elif realMatchLoss then $"per-project parity matching lost: {perProjDetail}"
+                    elif fpFlood then $"per-project false-positive flood not paid for by matches: {perProjDetail}"
                     else "coverage markers removed"
                 revert reason
                 (false, reason)
@@ -1171,12 +1280,19 @@ module ConvergenceLoop =
                     Beads.note bead $"convergence: {conv}"
                     if conv = "FULL_PRODUCT_DONE" then
                         printfn "  🏁 FULL PRODUCT PORTED — every source concept faithfully complete. Dropping to verify-only watch."
-                // Knowledge capture — runs BEFORE push so its changes get included
-                let capturePrompt = String.concat "\n" [
-                    $"Sprint {next} landed durable progress ({msg})."
-                    $"EXACT SCOPE: git diff {baseCommit}..HEAD"
-                    "Capture only non-trivial, reusable learnings (say 'No learnings.' if none). Commit any files you create." ]
-                Agent.run capturePrompt $"Knowledge-S{next}" None |> ignore
+                // Knowledge capture is valuable, but a full Opus/xhigh session after EVERY
+                // sprint produced a stream of docs-only commits and consumed roughly half the
+                // model calls. Capture periodically, on a major parity jump, or when structural
+                // coverage lands; otherwise the implementor's committed code + bead note is the handoff.
+                let shouldCaptureKnowledge = next % 5 = 0 || realGain >= 100 || coverageCredit
+                if shouldCaptureKnowledge then
+                    let capturePrompt = String.concat "\n" [
+                        $"Sprint {next} landed durable progress ({msg})."
+                        $"EXACT SCOPE: git diff {baseCommit}..HEAD"
+                        "Capture only non-trivial, reusable learnings (say 'No learnings.' if none). Commit any files you create." ]
+                    Agent.run capturePrompt $"Knowledge-S{next}" None |> ignore
+                else
+                    Beads.remember $"Sprint {next}: {msg}"
                 let pushResult = safePush ()
                 if pushResult <> 0 then printfn "  ⚠ git push failed" else printfn "  Pushed."
                 (true, msg)
@@ -1195,7 +1311,7 @@ module ConvergenceLoop =
         let mutable consecutiveErrors = 0
         let mutable consecutiveFails = 0
         let mutable sprintsSinceReview = 0
-        let reviewInterval = 7
+        let reviewInterval = 20
         Console.CancelKeyPress.Add(fun a -> a.Cancel <- true; go <- false; printfn "\nStopping...")
         while go do
             try
@@ -1375,7 +1491,6 @@ match fsi.CommandLineArgs |> Array.toList |> List.tail with
 | ["timing"] -> ConvergenceLoop.timing ()
 | ["refresh-index"] ->
     PortStatus.sync 0
-    PortStatus.promote 0
     printfn $"  coverage: {PortStatus.summary ()}"
 | "watch" :: r ->
     let interval = r |> List.tryHead |> Option.map int |> Option.defaultValue 30
