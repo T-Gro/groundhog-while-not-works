@@ -531,7 +531,7 @@ module PortStatus =
                 "            if k in seen: continue"
                 "            seen.add(k); rendered+=1"
                 "            print('P%02d | %s | %s | %s:%s | %s | go=%s | sprint=%s'%(camp.get('rank',99),camp.get('name','campaign'),r[3],r[0],r[1],r[2],r[4] or '-',r[5] or '-'))"
-                "partial=c.execute(\"SELECT ts_file,ts_lines,concept,status,COALESCE(go_file,''),COALESCE(sprint,0) FROM port_status WHERE status='partial' ORDER BY sprint DESC,updated_at DESC,ts_file,ts_lines LIMIT ?\",(16 if rendered==0 else 6,)).fetchall()"
+                "partial=c.execute(\"SELECT ts_file,ts_lines,concept,status,COALESCE(go_file,''),COALESCE(sprint,0) FROM port_status WHERE status='partial' ORDER BY sprint DESC,updated_at DESC,ts_file,ts_lines LIMIT ?\",(16 if rendered==0 else 0,)).fetchall()"
                 "for r in partial:"
                 "    k=(r[0],r[2])"
                 "    if k in seen: continue"
