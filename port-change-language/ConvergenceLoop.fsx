@@ -292,7 +292,7 @@ module PortStatus =
             let jsonData = System.Text.Json.JsonSerializer.Serialize(entries |> List.map (fun (m,g) -> {| marker=m; go=g |}))
             File.WriteAllText(tmpJson, jsonData)
             let pyScript = String.concat "\n" [
-                "import sqlite3, json, sys, os"
+                "import sqlite3, json, sys, os, re"
                 "db, jf, sprint = sys.argv[1], sys.argv[2], int(sys.argv[3])"
                 "conn = sqlite3.connect(db)"
                 "c = conn.cursor()"
@@ -352,7 +352,11 @@ module PortStatus =
                 "    return f,concept"
                 ""
                 "if sprint == 0:"
-                "    c.execute(\"UPDATE port_status SET status='not_started', go_file=NULL WHERE status='partial'\")"
+                "    # Rebuild marker-derived state from scratch. `complete` is reserved"
+                "    # for explicit source audits recorded with an AUDITED: note; body"
+                "    # size and marker presence are evidence of a mapping, not semantic"
+                "    # completion."
+                "    c.execute(\"UPDATE port_status SET status='not_started', go_file=NULL, sprint=NULL WHERE NOT (status='complete' AND COALESCE(notes,'') LIKE 'AUDITED:%')\")"
                 "mapped = {}"
                 "unmapped = 0"
                 "for e in entries:"
@@ -361,7 +365,7 @@ module PortStatus =
                 "    if hit: mapped[hit]=e['go']"
                 "    else: unmapped += 1"
                 "for (f,concept),go in mapped.items():"
-                "    c.execute(\"UPDATE port_status SET go_file=?, status='partial', sprint=CASE WHEN status='not_started' THEN ? ELSE sprint END, updated_at=CASE WHEN status='not_started' THEN datetime('now') ELSE updated_at END WHERE ts_file=? AND concept=? AND status!='complete'\",(go,sprint,f,concept))"
+                "    c.execute(\"UPDATE port_status SET go_file=?, status='partial', sprint=CASE WHEN status='not_started' THEN ? ELSE sprint END, updated_at=CASE WHEN status='not_started' THEN datetime('now') ELSE updated_at END WHERE ts_file=? AND concept=? AND NOT (status='complete' AND COALESCE(notes,'') LIKE 'AUDITED:%')\",(go,sprint,f,concept))"
                 "conn.commit()"
                 "stats = dict(c.execute('SELECT status, COUNT(*) FROM port_status GROUP BY status').fetchall())"
                 "print('port_status: %d unique concepts mapped, %d markers unmapped | ' % (len(mapped), unmapped) + ' '.join('%s=%d'%(s,n) for s,n in stats.items()))"
@@ -370,7 +374,12 @@ module PortStatus =
             File.WriteAllText(pyFile, pyScript)
             let sn = string sprintNum
             let result = cli { Exec "python"; Arguments [| pyFile; dbPath; tmpJson; sn |] } |> Command.execute
-            result.Text |> Option.iter (fun t -> printfn "  📊 %s" (t.Trim()))
+            if result.ExitCode <> 0 then
+                let err = result.Error |> Option.defaultValue "unknown Python failure"
+                failwith $"source-index refresh failed: {err.Trim()}"
+            result.Text
+            |> Option.filter (fun t -> not (String.IsNullOrWhiteSpace t))
+            |> Option.iter (fun t -> printfn "  📊 %s" (t.Trim()))
             File.Delete tmpJson
             File.Delete pyFile
         with ex -> eprintfn "  ⚠ port_status sync failed: %s" ex.Message
@@ -439,77 +448,12 @@ module PortStatus =
             | _ -> 0
         with _ -> 0
 
-    /// Faithfulness promoter (partial -> complete). Orchestrator-owned, DETERMINISTIC
-    /// (no agent): a 'partial' concept (a marker exists) is promoted to 'complete' only
-    /// when the Go function carrying its marker is not a stub — no panic()/TODO(port)/
-    /// unimplemented sentinel AND its body is proportional to the TS range (>= 25%, min
-    /// 5 lines). This makes 'complete' an honest, non-forgeable terminus signal and stops
-    /// marker-on-stub farming from ever reaching "done".
-    let promote (sprintNum: int) =
-        try
-            let dbPath = sourceIndexPath ()
-            if not (File.Exists dbPath) then () else
-            let py = String.concat "\n" [
-                "import sqlite3,sys,os,re"
-                "db,sprint,root=sys.argv[1],int(sys.argv[2]),sys.argv[3]"
-                "conn=sqlite3.connect(db); c=conn.cursor()"
-                "rows=c.execute(\"SELECT ts_file,ts_lines,concept,go_file FROM port_status WHERE status='partial' AND sprint=? AND go_file IS NOT NULL AND go_file!='' AND ts_lines LIKE '%-%' AND concept NOT LIKE 'phantom:%' AND ts_file IN (SELECT path FROM files)\",(sprint,)).fetchall()"
-                "STUB=re.compile(r'panic\\(|TODO\\(port\\)|not[ _]?implemented|unimplemented',re.I)"
-                "MARK=re.compile(r'Ported from:\\s*(?P<file>\\S+?\\.ts)(?P<rest>[^\\r\\n]*)',re.I)"
-                "promoted=0"
-                "for ts_file,ts_lines,concept,go_file in rows:"
-                "    gp=os.path.join(root,go_file)"
-                "    if not os.path.exists(gp): continue"
-                "    try: lines=open(gp,encoding='utf-8').read().split('\\n')"
-                "    except: continue"
-                "    bn=os.path.basename(ts_file)"
-                "    try:"
-                "        a,b=map(int,ts_lines.replace('\\u2013','-').split('-')); tsn=b-a+1"
-                "    except: a=b=tsn=0"
-                "    ok=False"
-                "    for i,l in enumerate(lines):"
-                "        m=MARK.search(l)"
-                "        if m:"
-                "            raw=m.group('file').replace('\\\\','/').lstrip('./')"
-                "            if ('/' in raw and not ts_file.endswith(raw)) or ('/' not in raw and os.path.basename(raw)!=bn): continue"
-                "            rest=m.group('rest').strip(); anchor=''; line_hint=''"
-                "            cm=re.match(r'^:\\s*([A-Za-z_$][\\w$]*|\\d+(?:[-\\u2013]\\d+)?)',rest)"
-                "            if cm: anchor=cm.group(1)"
-                "            else:"
-                "                sm=re.match(r'^([A-Za-z_$][\\w$]*(?:\\.[A-Za-z_$][\\w$]*)?)\\b',rest)"
-                "                if sm and sm.group(1).lower() not in ('line','lines','ts'): anchor=sm.group(1)"
-                "                lm=re.search(r'\\blines?\\s+(\\d+(?:[-\\u2013]\\d+)?)',rest,re.I)"
-                "                if lm: line_hint=lm.group(1)"
-                "            anchor=anchor.rstrip('.')"
-                "            anchor_ok=False"
-                "            if anchor and anchor[0].isdigit():"
-                "                try: anchor_ok = a <= int(anchor.replace('\\u2013','-').split('-')[0]) <= b"
-                "                except: pass"
-                "            elif anchor:"
-                "                anchor_ok = anchor.lower() in (concept.lower(),concept.rsplit('.',1)[-1].lower())"
-                "            if not anchor_ok and line_hint:"
-                "                try: anchor_ok = a <= int(line_hint.replace('\\u2013','-').split('-')[0]) <= b"
-                "                except: pass"
-                "            if not anchor_ok: continue"
-                "            j=i"
-                "            while j>=0 and not lines[j].lstrip().startswith('func '): j-=1"
-                "            if j<0: continue"
-                "            depth=0; started=False; body=[]"
-                "            for k in range(j,len(lines)):"
-                "                body.append(lines[k]); depth+=lines[k].count('{')-lines[k].count('}')"
-                "                if '{' in lines[k]: started=True"
-                "                if started and depth<=0: break"
-                "            fn='\\n'.join(body); gon=len([x for x in body if x.strip()])"
-                "            if not STUB.search(fn) and gon>=max(5,int(tsn*0.25)): ok=True; break"
-                "    if ok:"
-                "        c.execute(\"UPDATE port_status SET status='complete', sprint=?, updated_at=datetime('now') WHERE ts_file=? AND concept=?\",(sprint,ts_file,concept)); promoted+=1"
-                "conn.commit(); print('promoted %d partial->complete'%promoted); conn.close()" ]
-            let pyFile = Path.GetTempFileName() + ".py"
-            File.WriteAllText(pyFile, py)
-            let r = cli { Exec "python"; Arguments [| pyFile; dbPath; string sprintNum; targetDir () |] } |> Command.execute
-            (try File.Delete pyFile with _ -> ())
-            r.Text |> Option.iter (fun t -> if t.Trim() <> "" then printfn "  🎓 %s" (t.Trim()))
-        with ex -> eprintfn "  ⚠ promote failed: %s" ex.Message
+    /// Marker presence proves that a source concept has a Go mapping, not that
+    /// every branch and invariant was ported. Automatic body-size promotion
+    /// created false `complete` rows for known semantic gaps. Completion is now
+    /// reserved for an explicit source audit recorded with an `AUDITED:` note.
+    let promote (_sprintNum: int) =
+        printfn "  source coverage remains partial until an explicit AUDITED: source review"
 
     /// Honest convergence terminus. Returns a status string. DONE requires every real
     /// indexed concept 'complete' AND every non-test source file present in the index
@@ -796,8 +740,9 @@ module ConvergenceLoop =
             $"Current status: {sourceCoverage}"
             "MANDATORY: before selecting or implementing a source symbol, query table `port_status` for"
             "its exact ts_file / ts_lines / concept row. Quote that row in the design and final summary."
-            "Do not trust stale row counts in Markdown. `complete` means already covered; `partial` means"
-            "inspect the existing Go mapping and finish the missing semantics; `not_started` is an open port."
+            "Do not trust stale row counts in Markdown. `complete` means an explicit `AUDITED:` source review"
+            "found the concept semantically covered; `partial` means a marker maps existing Go code but missing"
+            "branches may remain; `not_started` means no current marker mapping was found."
             "Choose a coherent cluster of adjacent incomplete rows, not a local symptom patch."
             "After choosing rows, search `.github/instructions/port-debt.instructions.md` only for those"
             "specific ts_file/concept names; do not load the entire debt ledger into context."
@@ -1031,7 +976,7 @@ module ConvergenceLoop =
                 "  // Ported from: <file>:<lines>  that a reviewer can open in the source."
                 "Before touching code, query `_tools/pyright-source-index.db` table `port_status` for every"
                 "selected source symbol. Work from its exact range and existing go_file mapping. Do not"
-                "re-port a `complete` row or ignore a `partial` implementation that must be finished."
+                "re-port an `AUDITED:` complete row or ignore a `partial` implementation that must be finished."
                 "</PORT_MANDATE>" ]
 
             // Keystone campaign directive: attack a foundational port, not a leaf.
