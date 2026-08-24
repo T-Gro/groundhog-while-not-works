@@ -31,16 +31,32 @@ let execWithTimeout (exe: string) (args: string list) (workDir: string) (timeout
     use p = new System.Diagnostics.Process(StartInfo = psi)
     let sb = System.Text.StringBuilder()
     let eb = System.Text.StringBuilder()
-    p.OutputDataReceived.Add(fun e -> if not (isNull e.Data) then sb.AppendLine e.Data |> ignore)
-    p.ErrorDataReceived.Add(fun e -> if not (isNull e.Data) then eb.AppendLine e.Data |> ignore)
+    let stdoutClosed = System.Threading.Tasks.TaskCompletionSource<bool>(System.Threading.Tasks.TaskCreationOptions.RunContinuationsAsynchronously)
+    let stderrClosed = System.Threading.Tasks.TaskCompletionSource<bool>(System.Threading.Tasks.TaskCreationOptions.RunContinuationsAsynchronously)
+    p.OutputDataReceived.Add(fun e ->
+        if isNull e.Data then stdoutClosed.TrySetResult(true) |> ignore
+        else sb.AppendLine e.Data |> ignore)
+    p.ErrorDataReceived.Add(fun e ->
+        if isNull e.Data then stderrClosed.TrySetResult(true) |> ignore
+        else eb.AppendLine e.Data |> ignore)
     p.Start() |> ignore
     p.BeginOutputReadLine()
     p.BeginErrorReadLine()
     if p.WaitForExit(timeoutMin * 60 * 1000) then
-        p.WaitForExit()                                   // flush async readers
+        // Never call parameterless WaitForExit here. A child can exit while a grandchild
+        // still holds an inherited stdout/stderr handle; WaitForExit() then blocks forever
+        // while "flushing" async readers, bypassing the wall-clock timeout entirely. This
+        // caused sprint 437 to spend ~52 hours between its implementation log and archive.
+        // Drain briefly, then return the captured output even if a leaked descendant keeps
+        // the pipe open.
+        let readers = [| stdoutClosed.Task :> System.Threading.Tasks.Task; stderrClosed.Task :> System.Threading.Tasks.Task |]
+        if not (System.Threading.Tasks.Task.WaitAll(readers, 5000)) then
+            (try p.CancelOutputRead() with _ -> ())
+            (try p.CancelErrorRead() with _ -> ())
         (sb.ToString(), eb.ToString(), p.ExitCode)
     else
         (try p.Kill(true) with _ -> ())                   // kill copilot/python + node/MCP children
+        (try p.WaitForExit(10000) |> ignore with _ -> ())
         failwithf "TIMEOUT after %dmin (killed process tree): %s" timeoutMin exe
 
 module Beads =
@@ -145,7 +161,18 @@ module Agent =
                 // true hang; on timeout the tree is killed and this raises -> caught below.
                 let (stdout, err, _exit) =
                     execWithTimeout "copilot"
-                        [ "-p"; effectivePrompt; sessionFlag; sid; "--allow-all"; "--no-ask-user"; "-s"; "--no-color"; "--plain-diff"; "--model"; Model; "--effort"; Effort; "--stream"; "off" ]
+                        [ "-p"; effectivePrompt; sessionFlag; sid; "--allow-all"; "--no-ask-user"; "-s"; "--no-color"; "--plain-diff"
+                          "--model"; Model; "--effort"; Effort; "--context"; "long_context"; "--stream"; "off"
+                          // Local source-port agents need filesystem, shell, git, tests, and subagents.
+                          // Starting every unrelated configured MCP server for each of five parallel
+                          // verifiers spawned ~70 chrome/Helix/Maestro/binlog processes per battery.
+                          "--excluded-tools=chrome-devtools-*"
+                          "--excluded-tools=binlog-*"
+                          "--excluded-tools=hlx-*"
+                          "--excluded-tools=maestro-*"
+                          "--excluded-tools=cowork-*"
+                          "--excluded-tools=github-mcp-server-*"
+                          "--excluded-tools=mihubot-*" ]
                         "" 240
                 if stdout = "" then
                     if err <> "" then
@@ -223,17 +250,20 @@ module PortStatus =
         if not (Directory.Exists internalDir) then () else
         let goFiles = Directory.GetFiles(internalDir, "*.go", SearchOption.AllDirectories)
                       |> Array.filter (fun f -> not (f.EndsWith("_test.go")))
-        let pattern = System.Text.RegularExpressions.Regex(@"//\s*Ported from:\s*(\S+?)(?::(\d+[\-–]\d+))?\s*$", System.Text.RegularExpressions.RegexOptions.Multiline)
+        let pattern =
+            System.Text.RegularExpressions.Regex(
+                @"//\s*Ported from:\s*(\S+?\.ts)(?::([A-Za-z_$][\w$]*|\d+(?:[\-–]\d+)?))?(?:[.\s]|$)",
+                System.Text.RegularExpressions.RegexOptions.Multiline)
         let entries = [
             for goFile in goFiles do
                 let content = File.ReadAllText goFile
                 let ms = pattern.Matches content
                 for m in ms do
                     let tsFile = m.Groups.[1].Value
-                    let tsLines = if m.Groups.[2].Success then m.Groups.[2].Value else ""
+                    let tsAnchor = if m.Groups.[2].Success then m.Groups.[2].Value else ""
                     let sep = string Path.DirectorySeparatorChar
                     let goRel = goFile.Replace(targetDir() + sep, "").Replace('\\', '/')
-                    yield (tsFile, tsLines, goRel) ]
+                    yield (tsFile, tsAnchor, goRel) ]
         if entries.IsEmpty then () else
         try
             // Write entries to a temp JSON file, then run Python to upsert
@@ -247,49 +277,56 @@ module PortStatus =
                 "c = conn.cursor()"
                 "entries = json.load(open(jf))"
                 ""
-                "# Load function-level ranges, keyed by BASENAME so bare-name markers"
-                "# (e.g. 'typeEvaluator.ts') canonicalize to the prefixed index path"
-                "# ('analyzer/typeEvaluator.ts'). Store the real ts_file for the UPDATE."
-                "func_ranges = {}"
-                "for row in c.execute(\"SELECT ps.ts_file, ps.ts_lines, ps.concept FROM port_status ps WHERE ps.ts_lines IS NOT NULL AND ps.ts_lines != '' AND ps.ts_file LIKE '%.ts' AND ps.concept NOT LIKE 'phantom:%' AND ps.ts_file IN (SELECT path FROM files)\"):"
-                "    f, lr, concept = row"
+                "# Canonical source paths + nested function ranges. A marker inside"
+                "# createTypeEvaluator/Binder must map to the SMALLEST enclosing function,"
+                "# not the first broad parent range returned by SQLite."
+                "files = set(r[0] for r in c.execute(\"SELECT path FROM files WHERE path LIKE '%.ts'\"))"
+                "by_base = {}"
+                "for f in files: by_base.setdefault(os.path.basename(f), []).append(f)"
+                "ranges = {}"
+                "symbols = {}"
+                "for f, lr, concept in c.execute(\"SELECT ts_file, ts_lines, concept FROM port_status WHERE ts_lines IS NOT NULL AND ts_lines != '' AND ts_file LIKE '%.ts' AND concept NOT LIKE 'phantom:%' AND ts_file IN (SELECT path FROM files)\"):"
                 "    if '-' in lr:"
-                "        parts = lr.replace('\\u2013', '-').split('-')"
-                "        try: func_ranges.setdefault(os.path.basename(f), []).append((int(parts[0]), int(parts[1]), concept, f))"
-                "        except: pass"
-                "# Refuse to guess when a basename is owned by >1 real file (cross-dir collision)."
-                "ambig = set(b for b,v in func_ranges.items() if len(set(x[3] for x in v))>1)"
-                ""
-                "updated = 0"
-                "phantom = 0"
-                "for e in entries:"
-                "    ts, lines, go = e['ts'], e['lines'], e['go']"
-                "    matched_concept = None"
-                "    real_file = None"
-                "    bn = os.path.basename(ts)"
-                "    if lines and '-' in lines and bn not in ambig:"
-                "        parts = lines.replace('\\u2013', '-').split('-')"
                 "        try:"
-                "            start = int(parts[0])"
-                "            for (fs, fe, fc, rf) in func_ranges.get(bn, []):"
-                "                if fs <= start <= fe:"
-                "                    matched_concept = fc; real_file = rf"
-                "                    break"
+                "            a,b = map(int, lr.replace('\\u2013','-').split('-'))"
+                "            ranges.setdefault(f, []).append((a,b,concept))"
+                "            symbols.setdefault(f, {}).setdefault(concept.lower(), []).append((a,b,concept))"
+                "            symbols[f].setdefault(concept.rsplit('.',1)[-1].lower(), []).append((a,b,concept))"
                 "        except: pass"
-                "    if matched_concept:"
-                "        # Marker maps to a real TS function range -> honest coverage."
-                "        # 'partial' = ported (a marker present); promotion to 'complete'"
-                "        # is earned by the faithfulness verifier, not by typing a comment."
-                "        c.execute('UPDATE port_status SET go_file=?, status=\"partial\", sprint=?, updated_at=datetime(\"now\") WHERE ts_file=? AND concept=? AND status!=\"complete\"', (go, sprint, real_file, matched_concept))"
-                "        updated += 1"
+                "def canonical_file(raw):"
+                "    f=raw.replace('\\\\','/').lstrip('./')"
+                "    prefix='packages/pyright-internal/src/'"
+                "    if prefix in f: f=f.split(prefix,1)[1]"
+                "    if f in files: return f"
+                "    hits=by_base.get(os.path.basename(f),[])"
+                "    return hits[0] if len(hits)==1 else None"
+                "def resolve(raw, anchor):"
+                "    f=canonical_file(raw)"
+                "    if not f or not anchor: return None"
+                "    a=anchor.rstrip('.')"
+                "    if a[0].isdigit():"
+                "        try: start=int(a.replace('\\u2013','-').split('-')[0])"
+                "        except: return None"
+                "        hits=[x for x in ranges.get(f,[]) if x[0] <= start <= x[1]]"
                 "    else:"
-                "        # PHANTOM marker: cites a TS file/range with no known function"
-                "        # range. Do NOT write it (it would not advance coverage and the"
-                "        # schema CHECK forbids a 'phantom' status) — just count for audit."
-                "        phantom += 1"
+                "        hits=symbols.get(f,{}).get(a.lower(),[])"
+                "    if not hits: return None"
+                "    start,end,concept=min(hits,key=lambda x:(x[1]-x[0],x[0]))"
+                "    return f,concept"
+                ""
+                "if sprint == 0:"
+                "    c.execute(\"UPDATE port_status SET status='not_started', go_file=NULL WHERE status='partial'\")"
+                "mapped = {}"
+                "unmapped = 0"
+                "for e in entries:"
+                "    hit=resolve(e['ts'],e['lines'])"
+                "    if hit: mapped[hit]=e['go']"
+                "    else: unmapped += 1"
+                "for (f,concept),go in mapped.items():"
+                "    c.execute(\"UPDATE port_status SET go_file=?, status='partial', sprint=?, updated_at=datetime('now') WHERE ts_file=? AND concept=? AND status!='complete'\",(go,sprint,f,concept))"
                 "conn.commit()"
                 "stats = dict(c.execute('SELECT status, COUNT(*) FROM port_status GROUP BY status').fetchall())"
-                "print('port_status: %d markers matched, %d PHANTOM (unmatched TS range) | ' % (updated, phantom) + ' '.join('%s=%d'%(s,n) for s,n in stats.items()))"
+                "print('port_status: %d unique concepts mapped, %d markers unmapped | ' % (len(mapped), unmapped) + ' '.join('%s=%d'%(s,n) for s,n in stats.items()))"
                 "conn.close()" ]
             let pyFile = Path.GetTempFileName() + ".py"
             File.WriteAllText(pyFile, pyScript)
@@ -378,8 +415,9 @@ module PortStatus =
                 "import sqlite3,sys,os,re"
                 "db,sprint,root=sys.argv[1],int(sys.argv[2]),sys.argv[3]"
                 "conn=sqlite3.connect(db); c=conn.cursor()"
-                "rows=c.execute(\"SELECT ts_file,ts_lines,concept,go_file FROM port_status WHERE status='partial' AND go_file IS NOT NULL AND go_file!='' AND ts_lines LIKE '%-%' AND concept NOT LIKE 'phantom:%' AND ts_file IN (SELECT path FROM files) LIMIT 60\").fetchall()"
+                "rows=c.execute(\"SELECT ts_file,ts_lines,concept,go_file FROM port_status WHERE status='partial' AND go_file IS NOT NULL AND go_file!='' AND ts_lines LIKE '%-%' AND concept NOT LIKE 'phantom:%' AND ts_file IN (SELECT path FROM files)\").fetchall()"
                 "STUB=re.compile(r'panic\\(|TODO\\(port\\)|not[ _]?implemented|unimplemented',re.I)"
+                "MARK=re.compile(r'Ported from:\\s*(\\S+?\\.ts)(?::([A-Za-z_$][\\w$]*|\\d+(?:[-\\u2013]\\d+)?))?',re.I)"
                 "promoted=0"
                 "for ts_file,ts_lines,concept,go_file in rows:"
                 "    gp=os.path.join(root,go_file)"
@@ -388,11 +426,22 @@ module PortStatus =
                 "    except: continue"
                 "    bn=os.path.basename(ts_file)"
                 "    try:"
-                "        a,b=ts_lines.replace('\\u2013','-').split('-'); tsn=int(b)-int(a)+1"
-                "    except: tsn=0"
+                "        a,b=map(int,ts_lines.replace('\\u2013','-').split('-')); tsn=b-a+1"
+                "    except: a=b=tsn=0"
                 "    ok=False"
                 "    for i,l in enumerate(lines):"
-                "        if 'Ported from' in l and bn in l:"
+                "        m=MARK.search(l)"
+                "        if m:"
+                "            raw=m.group(1).replace('\\\\','/').lstrip('./')"
+                "            if ('/' in raw and not ts_file.endswith(raw)) or ('/' not in raw and os.path.basename(raw)!=bn): continue"
+                "            anchor=(m.group(2) or '').rstrip('.')"
+                "            anchor_ok=False"
+                "            if anchor and anchor[0].isdigit():"
+                "                try: anchor_ok = a <= int(anchor.replace('\\u2013','-').split('-')[0]) <= b"
+                "                except: pass"
+                "            elif anchor:"
+                "                anchor_ok = anchor.lower() in (concept.lower(),concept.rsplit('.',1)[-1].lower())"
+                "            if not anchor_ok: continue"
                 "            j=i"
                 "            while j>=0 and not lines[j].lstrip().startswith('func '): j-=1"
                 "            if j<0: continue"
@@ -587,6 +636,8 @@ module ConvergenceLoop =
     let private buildBriefing config sprintNum dbBriefing allBuckets prevFailure =
         let prevBlock = match prevFailure with Some ctx -> $"\n<previous_failure>\n{trunc ctx 3000}\n</previous_failure>" | None -> ""
         let srcDir = config.SourceDir
+        let sourceCoverage = PortStatus.summary ()
+        let sourceIndex = Path.Combine(targetDir(), "_tools", "pyright-source-index.db")
         // Load project-specific briefing template if it exists; otherwise use generic porting briefing.
         // The template can use {{sprint}}, {{source_lang}}, {{target_lang}}, {{source_dir}} placeholders.
         let templatePath = Path.Combine(targetDir(), ".github", "instructions", "sprint-briefing.md")
@@ -642,6 +693,16 @@ module ConvergenceLoop =
             if projectSpecific <> "" then $"<project_instructions>\n{projectSpecific}\n</project_instructions>"
             ""
             $"Source reference: {srcDir}"
+            ""
+            "<source_index>"
+            $"Canonical coverage DB: {sourceIndex}"
+            $"Current status: {sourceCoverage}"
+            "MANDATORY: before selecting or implementing a source symbol, query table `port_status` for"
+            "its exact ts_file / ts_lines / concept row. Quote that row in the design and final summary."
+            "Do not trust stale row counts in Markdown. `complete` means already covered; `partial` means"
+            "inspect the existing Go mapping and finish the missing semantics; `not_started` is an open port."
+            "Choose a coherent cluster of adjacent incomplete rows, not a local symptom patch."
+            "</source_index>"
             "You MUST commit your changes. Do NOT push."
             ""
             $"<test_status>\n{dbBriefing}\n</test_status>"
@@ -678,6 +739,9 @@ module ConvergenceLoop =
             "     If your honest estimate is ~0 net new matching diagnostics, this design is PARITY-NEUTRAL:"
             "     DO NOT propose it — pick the biggest-leverage keystone slice instead (parity-strategy.instructions.md)."
             "  5. Regression risks and how the build+test gate will catch them."
+            "  6. The exact `_tools/pyright-source-index.db` `port_status` row(s) for every selected source"
+            "     symbol (ts_file, ts_lines, concept, status, go_file). You MUST actually query the DB."
+            "     A design without these rows has not established what is already ported and is invalid."
             "Prefer the biggest coherent structural slice you can land, not a one-liner. Wrap the final plan in <DESIGN> ... </DESIGN>."
             ""
             baseBrief ]
@@ -693,6 +757,8 @@ module ConvergenceLoop =
                 "OPEN the cited source file:line anchors yourself and verify the design is a FAITHFUL, high-leverage port:"
                 "  - Does it REPRODUCE the source logic, or invent / gate / suppress / patch around it? (invention => REJECT)"
                 "  - Are the anchors real, correct, and actually READ (are the quoted lines genuine)? (fabricated anchors => REJECT)"
+                "  - Did the proposer quote real `port_status` DB rows for every source symbol and use their"
+                "    status/mapping to avoid re-porting complete work? (missing DB evidence => REJECT)"
                 "  - Is the expected NET matching delta clearly POSITIVE? A parity-neutral / coverage-only slice => REJECT."
                 "  - Is this the biggest-leverage slice available, or nibbling while a KEYSTONE is open? (nibbling => REJECT)"
                 "  - Will it regress existing matching diagnostics? Is the slice coherent and shippable?"
@@ -738,7 +804,10 @@ module ConvergenceLoop =
         let conn2 = initSchema db
         let next = sNum + 1
         let (pp, pt) = passRate conn2
-        let (pMatch0, _pMiss0, pSup0) = parityTotals conn2
+        let (pMatch0, pMiss0, pSup0) = parityTotals conn2
+        let pRef0 = pMatch0 + pMiss0
+        let parityPct = if pRef0 = 0 then 0.0 else 100.0 * float pMatch0 / float pRef0
+        let parityPctText = parityPct.ToString("F2")
         let pby0 = parityByProject conn2   // per-project snapshot BEFORE the implementor (for the ratchet)
         let ranked = bucketsRanked conn2
         match ranked with
@@ -819,7 +888,7 @@ module ConvergenceLoop =
                 |> fun s -> if ranked.Length > 50 then s + $"\n  … (+{ranked.Length - 50} more failing buckets)" else s
             let brief = briefing conn2
             conn2.Close()
-            printfn $"S{next} | {pp}/{pt} | {ranked.Length} failing buckets"
+            printfn $"S{next} | tests {pp}/{pt} | parity {pMatch0}/{pRef0} ({parityPctText}%%) fp {pSup0} | {ranked.Length} buckets"
 
             // Focus selection. Most sprints attack the biggest real-world parity bucket,
             // but leaf-by-leaf nibbling never cracks the KEYSTONES (foundational ports that
@@ -856,6 +925,9 @@ module ConvergenceLoop =
                 "port, and quote the key lines you reproduce. Read the ENTIRE relevant source file, not one"
                 "function — you have ~1M tokens; use them. Every ported block carries a real"
                 "  // Ported from: <file>:<lines>  that a reviewer can open in the source."
+                "Before touching code, query `_tools/pyright-source-index.db` table `port_status` for every"
+                "selected source symbol. Work from its exact range and existing go_file mapping. Do not"
+                "re-port a `complete` row or ignore a `partial` implementation that must be finished."
                 "</PORT_MANDATE>" ]
 
             // Keystone campaign directive: attack a foundational port, not a leaf.
@@ -863,13 +935,10 @@ module ConvergenceLoop =
                 ""
                 "<keystone_campaign>"
                 "THIS SPRINT IS A KEYSTONE CAMPAIGN — do NOT nibble a leaf bucket."
-                "DETERMINISM FIRST: if a project's parity numbers are NONDETERMINISTIC (they flap run-to-run,"
-                "or your careful set-diff of a fix disagrees with the harvest's re-measured counts), then the"
-                "single HIGHEST-LEVERAGE keystone is making the measurement REPRODUCIBLE — port the source's"
-                "per-file cache/state reset faithfully. Noisy measurement makes EVERY other gain uncreditable"
-                "(a faithful fix looks like noise and gets reverted), so fix it before anything else. This is"
-                "not parity-neutral busywork — it unblocks crediting the whole biggest bucket."
-                "Otherwise: open .github/instructions/parity-strategy.instructions.md and pick the HIGHEST-"
+                "K6 determinism is complete: parity is exact, and every net-positive diagnostic is creditable."
+                "Do NOT spend another sprint re-investigating measurement noise unless two identical binaries"
+                "produce a proven non-empty set diff. Open .github/instructions/parity-strategy.instructions.md"
+                "and query `_tools/pyright-source-index.db`; pick the HIGHEST-"
                 "LEVERAGE open keystone (work top-down; each unblocks hundreds-to-thousands of diagnostics)."
                 "Open its SOURCE anchor AND its target anchor side by side and READ THE ENTIRE source region."
                 "Port the smallest COHERENT STRUCTURAL slice that compiles, keeps every test green, and moves"
@@ -1304,6 +1373,10 @@ match fsi.CommandLineArgs |> Array.toList |> List.tail with
 | "step" :: r -> ConvergenceLoop.step (retries r) None |> ignore
 | ["status"] -> ConvergenceLoop.status ()
 | ["timing"] -> ConvergenceLoop.timing ()
+| ["refresh-index"] ->
+    PortStatus.sync 0
+    PortStatus.promote 0
+    printfn $"  coverage: {PortStatus.summary ()}"
 | "watch" :: r ->
     let interval = r |> List.tryHead |> Option.map int |> Option.defaultValue 30
     ConvergenceLoop.watch interval
@@ -1313,4 +1386,5 @@ match fsi.CommandLineArgs |> Array.toList |> List.tail with
     printfn "  step  [--retries=N]  One sprint."
     printfn "  status               Current state + progress chart."
     printfn "  timing               Phase timing breakdown from beads."
+    printfn "  refresh-index        Rebuild marker-derived source coverage state."
     printfn "  watch [seconds]      Live dashboard (default: 30s refresh)."
