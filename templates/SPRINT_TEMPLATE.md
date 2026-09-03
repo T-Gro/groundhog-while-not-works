@@ -3,8 +3,8 @@
 <!-- 
   SPRINT FILE FORMAT
   ==================
-  The --- markers above are optional YAML frontmatter (currently unused but reserved for future metadata).
-  You can omit them, but keeping them ensures consistency.
+  The --- markers above are optional YAML frontmatter. They are currently unused and reserved for future metadata.
+  You can omit them, but keeping them is recommended for consistency.
   
   REQUIRED SECTIONS:
   1. # Sprint: [title]
@@ -12,16 +12,16 @@
   3. ## Description  
   4. ## Definition of Done
   
-  CRITICAL: This file is ALL the implementor agent sees. Include EVERY detail needed.
+  The implementor agent sees only this file. Include every detail needed to implement the sprint.
 -->
 
 # Sprint: [Replace with sprint title]
 
 ## Context
-[Why this sprint exists. What problem it solves. What user need it addresses.]
+[State why this sprint exists, what problem it solves, and what user need it addresses.]
 
 ## Description
-[DETAILED implementation guidance for the implementor agent:]
+[Give the implementor agent complete implementation guidance:]
 
 ### Files to Modify
 - `path/to/file.fs` - what to change and why

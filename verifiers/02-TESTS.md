@@ -14,9 +14,8 @@ Check ALL test code for this sprint. Do NOT review production code architecture 
 
 <part_2_quality>
 1. Search tests/FSharp.Test.Utilities/ for existing helpers: CompilerAssert, IL checking helpers, baseline comparison utilities. Verify that new test code uses these instead of reimplementing them.
-2. Check for duplicated test logic: if two or more test methods share the same structure with different inputs, they should be a parameterized test (Theory/InlineData or equivalent).
+2. Check for duplicated test logic, including the "different but same structure" pattern. When test methods share a structure but use different inputs, require a parameterized test (Theory/InlineData or equivalent) or a higher-order helper.
 3. Check for duplicated test data: if similar source snippets appear in multiple tests, extract them or parameterize.
-4. Check for the "different but same structure" pattern in test code — the fix is a higher-order helper or parameterization.
 </part_2_quality>
 
 <compiler_test_context>
@@ -44,6 +43,5 @@ Check ALL test code for this sprint. Do NOT review production code architecture 
 </fail_criteria>
 
 <decision_rule>
-If all behavioral changes have tests, tests cover success/failure/edge cases, and test code is well-structured, output VERIFY_PASSED.
-Only output VERIFY_FAILED for missing test coverage of behavioral changes, or concrete test code duplication. Cite the specific untested change or the specific duplicated code. Do not fail for naming preferences, minor style, or coverage of pre-existing untested code outside the diff.
+Output VERIFY_FAILED only when a behavioral change lacks required test coverage or concrete duplicated test code should be consolidated. Cite the specific untested change or duplicated code. Otherwise, output VERIFY_PASSED. Do not fail for naming preferences, minor style, or coverage of pre-existing untested code outside the diff.
 </decision_rule>
