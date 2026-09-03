@@ -117,7 +117,7 @@ module XmlPrompt =
     let private roleElement (role: Role) =
         match role with
         | Implementor ->
-            xt "Implementor" "YOU ARE AN IMPLEMENTOR for F# compiler. Write code fulfilling sprint requirements. Follow DoD. Minimize breaking changes. Reuse existing helpers. Minimize allocations. Build and tests MUST pass."
+            xt "Implementor" "YOU ARE THE IMPLEMENTOR for the F# compiler. Implement only the current sprint's requirements. Follow DoD. Minimize breaking changes. Reuse existing helpers. Minimize allocations. Build and tests MUST pass."
         | Arbiter ->
             xt "Arbiter" "YOU ARE THE ARBITER. A sprint has failed despite multiple attempts. Analyze WHY, then restructure the plan to fix the root cause."
     

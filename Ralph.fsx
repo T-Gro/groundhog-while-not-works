@@ -136,7 +136,7 @@ let resolveVerifierAmbiguity (sessionId: string) (originalSummary: string) (veri
 /// When implementor output is ambiguous about SUBTASK_COMPLETE, resume session to clarify.
 let resolveSubtaskAmbiguity (sessionId: string) (sprintName: string) =
     disambiguateSignal sessionId $"Subtask-{sprintName}"
-        "Your previous response was unclear about completion status. Did you complete ALL work for this sprint? Output ONLY either SUBTASK_COMPLETE or SUBTASK_INCOMPLETE, nothing else."
+        "If you completed ALL work for this sprint, output only SUBTASK_COMPLETE. Otherwise, output only SUBTASK_INCOMPLETE."
         "SUBTASK_COMPLETE" "SUBTASK_INCOMPLETE"
 
 /// Interpret verifier output and automatically disambiguate if inconclusive.
