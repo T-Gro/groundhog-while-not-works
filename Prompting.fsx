@@ -35,8 +35,8 @@ module Verifiers =
         | Some fileName ->
             let path = Path.Combine(Config.verifiersDir, fileName + ".md")
             if File.Exists path then File.ReadAllText path
-            else $"Verifier {name}: No file found."
-        | None -> $"Verifier {name}: No file found."
+            else $"Verifier {name}: File not found."
+        | None -> $"Verifier {name}: File not found."
     
     let getFilePath name =
         match getFileNameRaw name with

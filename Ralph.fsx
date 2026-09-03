@@ -456,13 +456,13 @@ let createFixupSprint (failedVerifiers: string list) (fixupNumber: int) (summari
 
 ## Context
 The following verifiers **FAILED** on the complete feature: {failedNames}.
-Review their feedback below and make targeted fixes WITHOUT breaking existing functionality.
+Review the feedback below and make targeted fixes without breaking existing functionality.
 
 ## Verifier Feedback
 {summarySection}
 
 ## Description
-Fix the issues identified by the failed verifiers above. Each verifier's feedback describes exactly what went wrong.
+Fix each issue identified by the failed verifiers. Each verifier's feedback describes exactly what went wrong.
 
 ## Definition of Done
 - All previously passing tests still pass
@@ -479,7 +479,7 @@ Fix the issues identified by the failed verifiers above. Each verifier's feedbac
         FilePath = fixupPath
         Order = nextOrder
         Name = $"Fixup #{fixupNumber}"
-        Description = $"Fix issues identified by final verification. The following verifiers FAILED on the complete feature: {failedNames}. Review their feedback and make targeted fixes WITHOUT breaking existing functionality."
+        Description = $"Fix each issue identified by final verification. The following verifiers FAILED on the complete feature: {failedNames}. Review their feedback and make targeted fixes without breaking existing functionality."
         DoD = [
             "All previously passing tests still pass"
             "Fixes address the specific issues flagged by verifiers"
