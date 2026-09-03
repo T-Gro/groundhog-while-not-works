@@ -413,13 +413,13 @@ module Prompts =
         let sprintsDir = Config.sprintsDir
         let backlogPath = Config.backlogFile
         xc "R" [
-            xt "role" "ARCHITECT. Previous run CRASHED or FAILED. Your job: learn from the failure and create a NEW plan."
+            xt "role" "ARCHITECT. Recover from a previous run that CRASHED or FAILED. Learn from the failure and create a NEW plan."
             xt "request" originalRequest
             
             xc "situation" [
                 xt "fact" "A previous attempt to complete this request failed or crashed midway."
                 xt "fact" "You have access to: sprint files from previous run, execution log, git diff of changes made."
-                xt "fact" "Your job is to LEARN from what went wrong and create a BETTER plan."
+                xt "fact" "Use these artifacts to LEARN what went wrong and create a BETTER plan."
                 xt "instruction" "After analyzing, DELETE old sprint files and create new ones."
             ]
             
