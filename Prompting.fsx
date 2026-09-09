@@ -119,7 +119,7 @@ module XmlPrompt =
         | Implementor ->
             xt "Implementor" "YOU ARE THE IMPLEMENTOR for the F# compiler. Implement only the current sprint's requirements. Follow DoD. Minimize breaking changes. Reuse existing helpers. Minimize allocations. Build and tests MUST pass."
         | Arbiter ->
-            xt "Arbiter" "YOU ARE THE ARBITER. A sprint has failed despite multiple attempts. Analyze WHY, then restructure the plan to fix the root cause."
+            xt "Arbiter" "You are the arbiter. A sprint has failed despite multiple attempts. Determine why, then restructure the plan to fix the root cause."
     
     let private dodElement (dod: DoDResult list) =
         let criteria = dod |> List.map (fun d ->
@@ -236,15 +236,15 @@ module XmlPrompt =
         xc "R" [
             // THE ORIGINAL REQUEST IS THE #1 PRIORITY - placed first and emphasized
             xc "ORIGINAL_TASK_THIS_IS_THE_GOAL" [
-                xt "CRITICAL" "THIS IS THE MOST IMPORTANT CONTEXT. Everything below serves THIS goal. Never lose sight of what the user originally asked for. All sprint restructuring MUST serve this original request."
+                xt "CRITICAL" "The original user request is the most important context and the end goal. Everything below must serve it; never lose sight of it."
                 xt "user_request" originalRequest
             ]
             
             roleElement Arbiter
             
             xc "FIRST_READ_THESE" [
-                xat "backlog" [("path", Config.backlogFile)] "READ THIS FIRST - contains original plan, analysis, and approach"
-                xat "failed_sprint" [("path", match failedSprint with Some s -> s.SprintFilePath | None -> "N/A")] "The sprint that failed - understand what was attempted"
+                xat "backlog" [("path", Config.backlogFile)] "Read this first. It contains the original plan, analysis, and approach."
+                xat "failed_sprint" [("path", match failedSprint with Some s -> s.SprintFilePath | None -> "N/A")] "Read the failed sprint to understand what was attempted."
             ]
             
             xc "system_context" [
@@ -260,26 +260,26 @@ module XmlPrompt =
             xc "failure_context" failureContextEl
             
             xc "your_analysis_steps" [
-                xt "step" "RE-READ the ORIGINAL_TASK above. That is the end goal. Keep it front and center."
-                xt "step" "READ BACKLOG.md to understand the ORIGINAL PLAN and approach"
-                xt "step" "READ the failed sprint file to see what was attempted"
-                xt "step" "ANALYZE the iteration history - what did the agent try? What did verifiers reject?"
+                xt "step" "Re-read the ORIGINAL_TASK above and use it as the criterion for every decision."
+                xt "step" "Read BACKLOG.md to understand the original plan and approach."
+                xt "step" "Read the failed sprint file to see what was attempted."
+                xt "step" "Analyze the iteration history: what did the agent try, and what did the verifiers reject?"
                 xt "step" "IDENTIFY the root cause - is the sprint too ambitious? Missing context? Wrong approach? Original plan flawed?"
                 xt "step" "DECIDE: split into smaller sprints? Add missing context? Change approach? Update BACKLOG.md if plan was wrong?"
             ]
             
             xc "your_powers" [
-                xt "power" "DELETE any remaining sprint file"
-                xt "power" "CREATE new sprint files (use higher numbers: 10_, 11_, etc.)"
-                xt "power" "MODIFY remaining sprint files to add missing context or simplify"
-                xt "power" "Update BACKLOG.md notes"
+                xt "power" "Delete any remaining sprint file."
+                xt "power" "Create new sprint files (use higher numbers: 10_, 11_, etc.)."
+                xt "power" "Modify remaining sprint files to add missing context or simplify."
+                xt "power" "Update BACKLOG.md notes."
             ]
             
             xc "critical_rules" [
-                xt "rule" "Each new/modified sprint must be SELF-CONTAINED with ALL context"
-                xt "rule" "Include specific guidance based on what went wrong"
-                xt "rule" "If verifier X kept failing, address that specifically in the new sprint"
-                xt "rule" "DoD format: each item on its own line starting with '- '"
+                xt "rule" "Each new or modified sprint must be self-contained with all context."
+                xt "rule" "Include specific guidance based on what went wrong."
+                xt "rule" "When a verifier repeatedly failed, address that failure specifically in the new sprint."
+                xt "rule" "Format each DoD item on its own line starting with '- '."
             ]
             
             xt "when_done" "Output: ARBITER_COMPLETE"
@@ -297,17 +297,17 @@ module Prompts =
             xt "request" request
             
             xc "how_this_system_works" [
-                xt "fact" "You create sprint files. Each sprint file goes to a SEPARATE AGENT."
-                xt "fact" "Each agent ONLY sees its own sprint file. It cannot see BACKLOG.md or other sprints."
-                xt "fact" "Verifier agents check each sprint. They also only see that sprint file."
+                xt "fact" "You create sprint files. A separate agent receives each sprint file."
+                xt "fact" "Each agent sees only its own sprint file. It cannot see BACKLOG.md or other sprints."
+                xt "fact" "Verifier agents check each sprint. They also see only that sprint file."
                 xt "fact" "BACKLOG.md is only for YOU (planner) and FINAL verification at the very end."
-                xt "conclusion" "Sprint files must contain EVERYTHING an implementor needs. No assumptions."
+                xt "conclusion" "Each sprint file must contain all context that its implementer needs. Make no assumptions."
             ]
             
             xc "your_outputs" [
                 xc "file1_backlog" [
                     xt "path" backlogPath
-                    xt "purpose" "YOUR planning notes + context for final verification"
+                    xt "purpose" "Your planning notes and context for final verification"
                     xt "format" "# BACKLOG\n\n## Original Request\n[paste request verbatim]\n\n## Analysis\n[your analysis]\n\n## Approach\n[solution strategy]\n\n## Sprint Overview\n| # | Name | Purpose |"
                 ]
                 xc "files_sprints" [
@@ -332,11 +332,10 @@ module Prompts =
             ]
             
             xc "critical_rules" [
-                xt "rule" "Each sprint file is SELF-CONTAINED. Include ALL context in the file itself."
-                xt "rule" "Implementor has NO knowledge of the codebase except what YOU tell them in the sprint file."
-                xt "rule" "Include: file paths, function names, code patterns to follow, examples."
-                xt "rule" "Each sprint must be INDEPENDENTLY TESTABLE - include tests in same sprint, never separate."
-                xt "rule" "Definition of Done items must be CONCRETE: 'Tests pass' not 'Code is good'."
+                xt "rule" "Make each sprint file self-contained for an implementer who has no codebase knowledge beyond that file."
+                xt "rule" "Include file paths, function names, code patterns to follow, and examples."
+                xt "rule" "Each sprint must be independently testable. Include its tests in the same sprint, never in a separate sprint."
+                xt "rule" "Use concrete Definition of Done items, such as 'Tests pass', not subjective items such as 'Code is good'."
             ]
             
             xc "dod_format" [
@@ -354,7 +353,7 @@ module Prompts =
         let sprintsDir = Config.sprintsDir
         let backlogPath = Config.backlogFile
         xc "R" [
-            xt "role" "ARCHITECT. Previous implementation passed local verification but FAILED CI. Your job: fix the sprint plan."
+            xt "role" "ARCHITECT. The previous implementation passed local verification but failed CI. Fix the sprint plan."
             xt "request" request
             
             xc "situation" [
@@ -398,13 +397,13 @@ module Prompts =
             ]
             
             xc "critical_rules" [
-                xt "rule" "Each sprint file is SELF-CONTAINED. Include ALL context."
+                xt "rule" "Each sprint file is self-contained. Include ALL context."
                 xt "rule" "For CI fixes, reference the SPECIFIC errors in the sprint file."
                 xt "rule" "Implementor has NO knowledge of CI output unless you include it."
                 xt "rule" "Include: exact error messages, file paths, what to change."
             ]
             
-            xt "when_done" "Output: PLAN_COMPLETE"
+            xt "when_done" "When the plan is complete, output exactly: PLAN_COMPLETE"
         ] |> XmlPrompt.toPrompt
 
     /// Architect for restart - learn from previous failed run and clean up
@@ -506,7 +505,7 @@ module Prompts =
             ]
             xc "task" [
                 xt "instruction" "Some verifiers may be completely irrelevant to this sprint. For example, a sprint that only modifies documentation has no need for a PERF verifier. A sprint that creates no tests has no need for TEST-CODE-QUALITY."
-                xt "rule" "Be CONSERVATIVE. When in doubt, KEEP the verifier. Only eliminate verifiers that are UTTERLY IRRELEVANT — not just unlikely to fail, but checking something this sprint cannot possibly affect."
+                xt "rule" "Eliminate a verifier only when the sprint cannot possibly affect anything it checks. If there is any doubt, keep it; being unlikely to fail is not sufficient."
                 xt "rule" "NEVER eliminate FUNCTIONAL or HONEST-ASSESSMENT — they always apply."
             ]
             xc "output_format" [
@@ -521,10 +520,9 @@ module Prompts =
 let verifierPreamble = """
 === YOU ARE A VERIFIER AGENT ===
 An outer orchestration agent controls your work.
-- VERIFY_PASSED = process moves to next phase, NO changes made.
-- VERIFY_FAILED = your feedback is acted on, changes are made.
-- If you pass but mention issues, they are LOST. Only failures trigger fixes.
-- Do NOT write VERIFY_PASSED anywhere if you intend to fail.
+- VERIFY_PASSED moves the process to the next phase with no changes. Feedback in a passing response is lost.
+- VERIFY_FAILED triggers changes based on your feedback.
+- If an issue requires a fix, output VERIFY_FAILED. Do not write VERIFY_PASSED anywhere if you intend to fail.
 
 === DIFF SCOPE ===
 Review ONLY code added by this branch. Treat it as a PR targeting main.
@@ -561,7 +559,6 @@ Then on its own line, output EXACTLY one of:
   VERIFY_PASSED
   VERIFY_FAILED
 No other text on that line. The orchestrator parses this token.
-Reminder: VERIFY_PASSED = no changes. Any feedback you want acted on requires VERIFY_FAILED.
 """
 
 /// Parse ManagementSummary from verifier output
