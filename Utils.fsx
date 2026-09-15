@@ -9,9 +9,13 @@ open System.Collections.Generic
 open YamlDotNet.Serialization
 
 module Config =
-    let Model = Environment.GetEnvironmentVariable("DM_COPILOT_MODEL") |> Option.ofObj |> Option.defaultValue "gpt-5.6-sol"
+    let Model = Environment.GetEnvironmentVariable("DM_COPILOT_MODEL") |> Option.ofObj |> Option.defaultValue "gpt-6-astra"
     let Effort = Environment.GetEnvironmentVariable("DM_COPILOT_EFFORT") |> Option.ofObj |> Option.defaultValue "high"
     let Context = Environment.GetEnvironmentVariable("DM_COPILOT_CONTEXT") |> Option.ofObj |> Option.defaultValue "long_context"
+    do
+        let normalizedModel = Model.ToLowerInvariant()
+        if ["anthropic"; "claude"; "opus"; "sonnet"; "haiku"] |> List.exists normalizedModel.Contains then
+            failwith $"DM_COPILOT_MODEL must be non-Anthropic, but was '{Model}'"
     let MaxIterations = 15
     let ArbiterThreshold = 6  // Iterations per sprint before calling arbiter
     let MaxArbiterAttempts = 6  // Max arbiter invocations before giving up

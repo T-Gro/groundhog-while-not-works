@@ -16,7 +16,7 @@ Check ONLY production code in the full src/ tree, including src/Compiler/. The T
 </checks>
 
 <expert_reviewer>
-You MUST launch `expert-reviewer` as a sub-agent for the dimensions relevant to the changed files. Relevant dimensions include Code Structure and Technical Debt (always), Type System Correctness (if Checking/ is touched), IL Codegen Correctness (if CodeGen/ is touched), Binary Compatibility (if TypedTreePickle is touched), and FCS API Surface Control (if Service/ is touched).
+You MUST launch `expert-reviewer` as a sub-agent with `model: "gpt-6-astra"` for the dimensions relevant to the changed files. NEVER inherit the model and NEVER use an Anthropic model. Relevant dimensions include Code Structure and Technical Debt (always), Type System Correctness (if Checking/ is touched), IL Codegen Correctness (if CodeGen/ is touched), Binary Compatibility (if TypedTreePickle is touched), and FCS API Surface Control (if Service/ is touched).
 Use the sub-agent's findings as required input. Apply your own judgment: adopt material findings and discard nitpicks.
 If the sub-agent invocation fails technically, state that explicitly in your ManagementSummary and continue with manual checks.
 </expert_reviewer>
