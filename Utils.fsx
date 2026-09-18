@@ -4,6 +4,8 @@ open System
 open System.IO
 open System.Diagnostics
 open System.Text.RegularExpressions
+open System.Text
+open System.Security.Cryptography
 open System.Xml.Linq
 open System.Collections.Generic
 open YamlDotNet.Serialization
@@ -40,7 +42,20 @@ module Config =
                 let candidate = Path.Combine(d, "copilot.cmd")
                 if File.Exists(candidate) then Some candidate else None)
             |> Option.defaultValue "copilot"
-    let ralphDir = Path.Combine(workDir, ".tools", "ralph")
+    let ralphDir =
+        let workspaceKey =
+            Path.GetFullPath(workDir)
+            |> Encoding.UTF8.GetBytes
+            |> SHA256.HashData
+            |> Convert.ToHexString
+            |> fun value -> value.Substring(0, 16)
+        let defaultStateDir =
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "groundhog", "workspaces", workspaceKey)
+        Environment.GetEnvironmentVariable("RALPH_STATE_DIR")
+        |> Option.ofObj
+        |> Option.filter (String.IsNullOrWhiteSpace >> not)
+        |> Option.defaultValue defaultStateDir
+        |> Path.GetFullPath
     let sprintsDir = Path.Combine(ralphDir, "sprints")
     let backlogFile = Path.Combine(ralphDir, "BACKLOG.md")
     let verifiersDir = Path.Combine(scriptDir, "verifiers")

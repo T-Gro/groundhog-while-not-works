@@ -276,6 +276,7 @@ module XmlPrompt =
             ]
             
             xc "critical_rules" [
+                xt "rule" "BACKLOG.md and sprint files are private orchestration state. NEVER run git add, git commit, or git push."
                 xt "rule" "Each new or modified sprint must be self-contained with all context."
                 xt "rule" "Include specific guidance based on what went wrong."
                 xt "rule" "When a verifier repeatedly failed, address that failure specifically in the new sprint."
@@ -332,6 +333,7 @@ module Prompts =
             ]
             
             xc "critical_rules" [
+                xt "rule" "These planning files are private orchestration state, not repository deliverables. NEVER run git add, git commit, or git push. Only create or update the requested planning files, then output PLAN_COMPLETE."
                 xt "rule" "Make each sprint file self-contained for an implementer who has no codebase knowledge beyond that file."
                 xt "rule" "Include file paths, function names, code patterns to follow, and examples."
                 xt "rule" "Each sprint must be independently testable. Include its tests in the same sprint, never in a separate sprint."
@@ -397,6 +399,7 @@ module Prompts =
             ]
             
             xc "critical_rules" [
+                xt "rule" "These planning files are private orchestration state, not repository deliverables. NEVER run git add, git commit, or git push."
                 xt "rule" "Each sprint file is self-contained. Include ALL context."
                 xt "rule" "For CI fixes, reference the SPECIFIC errors in the sprint file."
                 xt "rule" "Implementor has NO knowledge of CI output unless you include it."
@@ -441,6 +444,7 @@ module Prompts =
                 xt "step" "DELETE all files in the sprints directory using rm command"
                 xt "step" "Create NEW sprint files with improved approach"
                 xt "step" "Update BACKLOG.md with lessons learned"
+                xt "step" "Do not stage or commit planning files. They are private orchestration state outside the target repository."
             ]
             
             xc "locations" [
@@ -619,6 +623,7 @@ let buildFinalVerificationContext (sprintFiles: string list) =
         "Verify the COMPLETE FEATURE works as a whole."
         "Check integration between all sprints."
         "Verify the original request in BACKLOG.md is fully satisfied."
+        "Planning files are private orchestration state, never product changes. Run `git diff --name-only` and fail verification if `.tools/ralph/` appears in the branch diff."
         ""
     ] |> String.concat "\n"
 
