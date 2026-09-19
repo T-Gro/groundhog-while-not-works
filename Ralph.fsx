@@ -353,7 +353,6 @@ let rec runBacklogItem (item: BacklogItem) iter totalIter feedback showWin = asy
             let reason = fb |> List.tryHead |> Option.defaultValue "Unknown"
             addIterationReason item.FilePath iter reason
             updateDoDResults item.FilePath dodResults
-            state <- { state with CompletedIterations = state.CompletedIterations + 1 }
             resumeCursor <- Some { SprintPath = item.FilePath; Iteration = iter + 1; Stage = "Implement" }
             updateStatus item.FilePath (Running(Implement, iter + 1)) reason
             persist ()
@@ -371,6 +370,7 @@ let rec runBacklogItem (item: BacklogItem) iter totalIter feedback showWin = asy
                 let! (out, sessionId) = runAgent prompt ($"Implement-{item.Order}") showWin None
                 let record: IterationRecord = { Iteration = iter; AgentOutput = out; VerifierResults = [] }
                 addIterationRecord item.FilePath record
+                state <- { state with CompletedIterations = state.CompletedIterations + 1 }
                 let hasCompleteSignal = hasSignalAny "SUBTASK_COMPLETE" out
                 let hasIncompleteSignal = hasSignalAny "SUBTASK_INCOMPLETE" out
                 if hasCompleteSignal && not hasIncompleteSignal then return true
@@ -379,8 +379,6 @@ let rec runBacklogItem (item: BacklogItem) iter totalIter feedback showWin = asy
         }
         
         if isComplete then
-            if not resumingVerification then
-                state <- { state with CompletedIterations = state.CompletedIterations + 1 }
             resumeCursor <- Some { SprintPath = item.FilePath; Iteration = iter; Stage = "Verify" }
             persist ()
             match! runAllVerifiers showWin item.FilePath item with 

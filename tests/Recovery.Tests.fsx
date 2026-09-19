@@ -24,16 +24,20 @@ let check condition message =
     if not condition then
         failwith message
 
-let test name action =
-    try
-        action ()
-        passed <- passed + 1
-        printfn "PASS %s" name
-    with ex ->
-        failed <- failed + 1
-        printfn "FAIL %s: %s" name ex.Message
+let test (name: string) action =
+    if
+        fsi.CommandLineArgs.Length = 1
+        || name.Contains(fsi.CommandLineArgs[1], StringComparison.Ordinal)
+    then
+        try
+            action ()
+            passed <- passed + 1
+            printfn "PASS %s" name
+        with ex ->
+            failed <- failed + 1
+            printfn "FAIL %s: %s" name ex.Message
 
-let runProcess (psi: ProcessStartInfo) =
+let runProcessExpect expectedExit (psi: ProcessStartInfo) =
     use child = Process.Start psi
     let stdout = child.StandardOutput.ReadToEndAsync()
     let stderr = child.StandardError.ReadToEndAsync()
@@ -43,9 +47,13 @@ let runProcess (psi: ProcessStartInfo) =
         child.WaitForExit()
         failwith "Fixture exceeded 60 second test budget"
 
-    check (child.ExitCode = 0) $"Fixture exit {child.ExitCode}: {stdout.Result}\n{stderr.Result}"
+    check
+        (child.ExitCode = expectedExit)
+        $"Fixture exit {child.ExitCode}, expected {expectedExit}: {stdout.Result}\n{stderr.Result}"
 
-let runWorker mode =
+let runProcess = runProcessExpect 0
+
+let runWorkerAt directory mode =
     let psi =
         ProcessStartInfo("dotnet", UseShellExecute = false, RedirectStandardOutput = true, RedirectStandardError = true)
 
@@ -53,24 +61,35 @@ let runWorker mode =
         [ "fsi"
           Path.Combine(__SOURCE_DIRECTORY__, "Recovery.Worker.fsx")
           mode
-          scratch ] do
+          directory ] do
         psi.ArgumentList.Add arg
 
     psi.Environment["RALPH_WORK_DIR"] <- root
-    psi.Environment["RALPH_STATE_DIR"] <- scratch
+    psi.Environment["RALPH_STATE_DIR"] <- directory
     runProcess psi
 
-let runRalph verifying interrupt =
-    let fakeDir = Path.Combine(scratch, ".tools", ".npm-global")
+let runWorker = runWorkerAt scratch
+
+let ralphProcess directory flags =
+    let fakeDir = Path.Combine(directory, ".tools", ".npm-global")
     Directory.CreateDirectory fakeDir |> ignore
-    let calls = Path.Combine(scratch, "fake-agent-calls.log")
+    let calls = Path.Combine(directory, "fake-agent-calls.log")
 
     if File.Exists calls then
         File.Delete calls
 
     File.WriteAllText(
         Path.Combine(fakeDir, "copilot.cmd"),
-        $"@echo off\r\necho %%*>>\"{calls}\"\r\nif defined RECOVERY_INTERRUPT echo %%* | findstr /c:\"Verify-FUNCTIONAL-\" >nul && (echo waiting>\"{calls}.waiting\" & pwsh -NoProfile -Command Start-Sleep -Seconds 120)\r\necho SUBTASK_COMPLETE\r\necho VERIFY_PASSED\r\n"
+        $"""@echo off
+echo %%*>>"{calls}"
+if defined RECOVERY_FAIL_ONCE echo %%* | findstr /c:"%%RECOVERY_FAIL_ONCE%%" >nul && (if not exist "{calls}.failed" (echo failed>"{calls}.failed" & echo ^<ManagementSummary^>retained failure evidence^</ManagementSummary^> & echo VERIFY_FAILED & exit /b 0))
+if defined RECOVERY_FAIL_FINAL echo %%* | findstr /c:"FinalVerify-FUNCTIONAL-" >nul && (echo ^<ManagementSummary^>retained failure evidence^</ManagementSummary^> & echo VERIFY_FAILED & exit /b 0)
+if defined RECOVERY_INCOMPLETE_ONCE echo %%* | findstr /c:"Implement-" >nul && (if not exist "{calls}.incomplete" (echo incomplete>"{calls}.incomplete" & echo SUBTASK_INCOMPLETE & exit /b 0))
+if defined RECOVERY_INTERRUPT echo %%* | findstr /c:"%%RECOVERY_INTERRUPT%%" >nul && (echo waiting>"{calls}.waiting" & pwsh -NoProfile -Command Start-Sleep -Seconds 120)
+if defined RECOVERY_REPLAN echo %%* | findstr /c:"Architect-" >nul && (dotnet fsi "{Path.Combine(__SOURCE_DIRECTORY__, "Recovery.Worker.fsx")}" replan "{directory}" & exit /b)
+echo SUBTASK_COMPLETE
+echo VERIFY_PASSED
+"""
     )
     // This backend only emits fixed test tokens. No agent or network client is invoked.
     let psi =
@@ -81,34 +100,52 @@ let runRalph verifying interrupt =
           Path.Combine(root, "Ralph.fsx")
           "Recovery test request"
           "--headless"
-          "--yes"
-          "--resume" ] do
+          "--yes" ]
+        @ flags do
         psi.ArgumentList.Add arg
 
     psi.Environment["RALPH_WORK_DIR"] <- root
-    psi.Environment["RALPH_STATE_DIR"] <- scratch
-    psi.Environment["DM_BASE_DIR"] <- scratch
+    psi.Environment["RALPH_STATE_DIR"] <- directory
+    psi.Environment["DM_BASE_DIR"] <- directory
+
+    for name in
+        [ "RECOVERY_FAIL_ONCE"
+          "RECOVERY_FAIL_FINAL"
+          "RECOVERY_INCOMPLETE_ONCE"
+          "RECOVERY_INTERRUPT"
+          "RECOVERY_REPLAN" ] do
+        psi.Environment.Remove name |> ignore
+
+    psi, calls
+
+let interruptRalph (psi: ProcessStartInfo) calls stage =
+    psi.Environment["RECOVERY_INTERRUPT"] <- stage
+    use child = Process.Start psi
+    let stdout = child.StandardOutput.ReadToEndAsync()
+    let stderr = child.StandardError.ReadToEndAsync()
+
+    try
+        let waiting =
+            SpinWait.SpinUntil((fun () -> File.Exists(calls + ".waiting") || child.HasExited), 60000)
+
+        check (waiting && not child.HasExited) "Verifier interruption point not reached"
+    finally
+        if not child.HasExited then
+            child.Kill(true)
+
+        child.WaitForExit()
+        stdout.Wait()
+        stderr.Wait()
+        psi.Environment.Remove "RECOVERY_INTERRUPT" |> ignore
+
+        if File.Exists(calls + ".waiting") then
+            File.Delete(calls + ".waiting")
+
+let runRalph verifying interrupt =
+    let psi, calls = ralphProcess scratch [ "--resume" ]
 
     if interrupt then
-        psi.Environment["RECOVERY_INTERRUPT"] <- "1"
-        use child = Process.Start psi
-        let stdout = child.StandardOutput.ReadToEndAsync()
-        let stderr = child.StandardError.ReadToEndAsync()
-
-        try
-            let waiting =
-                SpinWait.SpinUntil((fun () -> File.Exists(calls + ".waiting") || child.HasExited), 60000)
-
-            check (waiting && not child.HasExited) "Verifier interruption point not reached"
-        finally
-            if not child.HasExited then
-                child.Kill(true)
-
-            child.WaitForExit()
-            stdout.Wait()
-            stderr.Wait()
-
-        psi.Environment.Remove "RECOVERY_INTERRUPT" |> ignore
+        interruptRalph psi calls "Verify-FUNCTIONAL-"
 
         let checkpoint =
             JsonNode.Parse(File.ReadAllText(Path.Combine(scratch, "resume.json")))
@@ -221,12 +258,194 @@ test "new process resumes partial final verification" (fun () ->
         (not (File.ReadAllText(Path.Combine(scratch, "fake-agent-calls.log")).Contains("FinalVerify-FUNCTIONAL-")))
         "Completed final verifier reran")
 
+for final in [ false; true ] do
+    let phase = if final then "final" else "sprint"
+
+    test $"loop: fresh-process resume retains failed {phase} verification" (fun () ->
+        let directory = Path.Combine(scratch, $"failed-{final}")
+        Directory.CreateDirectory directory |> ignore
+        runWorkerAt directory (if final then "save-final-pending" else "save-completed")
+        let psi, calls = ralphProcess directory [ "--resume" ]
+        let prefix = if final then "FinalVerify-" else "Verify-"
+        psi.Environment["RECOVERY_FAIL_ONCE"] <- prefix + "FUNCTIONAL-"
+        interruptRalph psi calls (prefix + "TESTS-")
+        let checkpoint = Path.Combine(directory, "resume.json")
+        let before = JsonNode.Parse(File.ReadAllText checkpoint)
+
+        let results =
+            if final then
+                before.["FinalResults"]
+            else
+                before.["Sprints"].[1].["History"].[1].["Results"]
+
+        check
+            (not (results.[0].["Passed"].GetValue<bool>()))
+            "Failed result was not durable before process termination"
+
+        check
+            (results.[0].["Summary"].GetValue<string>().Contains("retained failure evidence"))
+            "Failure evidence missing"
+
+        File.Delete calls
+        runProcess psi
+        let afterText = File.ReadAllText checkpoint
+        let after = JsonNode.Parse afterText
+        let expected = before.["CompletedIterations"].GetValue<int>() + 1
+
+        check
+            (after.["CompletedIterations"].GetValue<int>() = expected)
+            "Failed verification counted an implementation twice"
+
+        check (after.["Phase"].GetValue<string>() = "Complete") "Recovery did not complete"
+        check (after.["Sprints"].[0].ToJsonString() = before.["Sprints"].[0].ToJsonString()) "Completed sprint changed"
+        let invocations = File.ReadAllLines calls
+
+        check
+            (invocations |> Array.filter (fun s -> s.Contains("Implement-")) |> Array.length = 1)
+            "Wrong implementation retry count"
+
+        check
+            (invocations
+             |> Array.filter (fun s -> s.Contains($"\"{prefix}FUNCTIONAL-"))
+             |> Array.length = 1)
+            "Recorded failed verifier reran before retry"
+
+        if final then
+            let fixup = after.["Sprints"].[2]
+
+            check
+                (fixup.["Targets"].ToJsonString() = "[\"FUNCTIONAL\"]")
+                "Failed final result did not create a targeted fixup"
+
+            check
+                (File.ReadAllText(fixup.["Path"].GetValue<string>()).Contains("retained failure evidence"))
+                "Fixup lost failure evidence"
+        else
+            let sprint = after.["Sprints"].[1]
+            check (sprint.["History"].AsArray().Count = 3) "Retry lost or duplicated iteration history"
+
+            check
+                (sprint.["History"].[1].["Results"].[0].ToJsonString() = results.[0].ToJsonString())
+                "Retry overwrote failed verifier evidence"
+
+            check (sprint.["History"].[2].["Iteration"].GetValue<int>() = 2) "Retry reset iteration number"
+            check (sprint.["Reasons"].AsArray().Count = 1) "Retry reason lost or duplicated"
+
+        runProcess psi
+        check (File.ReadAllText checkpoint = afterText) "Repeated successful resume changed checkpoint"
+        check (File.ReadAllLines calls = invocations) "Repeated successful resume invoked agents")
+
+test "loop: unsuccessful completion remains unsuccessful on repeated resume" (fun () ->
+    let directory = Path.Combine(scratch, "unsuccessful")
+    Directory.CreateDirectory directory |> ignore
+    runWorkerAt directory "save-final-pending"
+    let psi, calls = ralphProcess directory [ "--resume" ]
+    psi.Environment["RECOVERY_FAIL_FINAL"] <- "1"
+    runProcessExpect 1 psi
+    let checkpoint = Path.Combine(directory, "resume.json")
+    let before = JsonNode.Parse(File.ReadAllText checkpoint)
+    check (before.["Sprints"].AsArray().Count = 5) "Final failure did not exhaust exactly three fixups"
+    check (before.["CompletedIterations"].GetValue<int>() = 5) "Fixups lost iteration accounting"
+
+    check
+        (before.["FinalResults"].AsArray()
+         |> Seq.exists (fun r -> not (r.["Passed"].GetValue<bool>())))
+        "Unsuccessful completion lost failed verdict"
+
+    let invocations = File.ReadAllText calls
+
+    for _ in 1..2 do
+        runProcessExpect 1 psi
+        let after = JsonNode.Parse(File.ReadAllText checkpoint)
+        check (after.ToJsonString() = before.ToJsonString()) "Repeated unsuccessful resume changed durable outcome"
+        check (after.["Phase"].GetValue<string>() <> "Complete") "Failure converted to successful completion"
+        check (File.ReadAllText calls = invocations) "Exhausted failure invoked agents again")
+
+test "loop: incomplete implementation retry counts each invocation once" (fun () ->
+    let directory = Path.Combine(scratch, "incomplete")
+    Directory.CreateDirectory directory |> ignore
+    runWorkerAt directory "save-completed"
+    let psi, calls = ralphProcess directory [ "--resume" ]
+    psi.Environment["RECOVERY_INCOMPLETE_ONCE"] <- "1"
+    runProcess psi
+    let after = JsonNode.Parse(File.ReadAllText(Path.Combine(directory, "resume.json")))
+    check (after.["CompletedIterations"].GetValue<int>() = 4) "Incomplete implementation was not counted exactly once"
+    check (after.["Sprints"].[1].["History"].AsArray().Count = 3) "Incomplete retry lost history"
+
+    check
+        (after.["Sprints"].[1].["History"].[1].["Output"].GetValue<string>().Contains("SUBTASK_INCOMPLETE"))
+        "Incomplete outcome overwritten"
+
+    check (after.["Sprints"].[1].["Reasons"].AsArray().Count = 1) "Incomplete retry lost reason"
+
+    check
+        (File.ReadAllLines calls
+         |> Array.filter (fun s -> s.Contains("Implement-4"))
+         |> Array.length = 2)
+        "Incomplete retry invoked wrong implementations")
+
+for restart in [ false; true ] do
+    for archiveFails in [ false; true ] do
+        let phase = if restart then "restart" else "fresh planning"
+
+        test $"loop: {phase} archives before mutation (archive fails: {archiveFails})" (fun () ->
+            let directory = Path.Combine(scratch, $"archive-{restart}-{archiveFails}")
+            Directory.CreateDirectory directory |> ignore
+            runWorkerAt directory "save-verifying"
+            File.WriteAllText(Path.Combine(directory, "ralph.log"), "old evidence")
+            let expected = Path.Combine(directory, "expected")
+            Directory.CreateDirectory(Path.Combine(expected, "sprints")) |> ignore
+
+            let files =
+                [ "BACKLOG.md"
+                  "resume.json"
+                  "ralph.log"
+                  "sprints\\01_Saved.md"
+                  "sprints\\04_Saved.md" ]
+
+            for file in files do
+                File.Copy(Path.Combine(directory, file), Path.Combine(expected, file))
+
+            if archiveFails then
+                File.WriteAllText(Path.Combine(directory, "archives"), "archive blocked")
+
+            let psi, calls = ralphProcess directory (if restart then [ "--restart" ] else [])
+            psi.Environment["RECOVERY_REPLAN"] <- "1"
+            runProcessExpect (if archiveFails then 1 else 0) psi
+
+            if archiveFails then
+                check (not (File.Exists calls)) "Archive failure invoked an agent"
+
+                for file in files do
+                    check
+                        (File.ReadAllBytes(Path.Combine(directory, file)) = File.ReadAllBytes(
+                            Path.Combine(expected, file)
+                        ))
+                        $"Archive failure mutated {file}"
+            else
+                let archive = File.ReadAllText(Path.Combine(directory, "archive-checked"))
+
+                for file in files do
+                    check
+                        (File.ReadAllBytes(Path.Combine(archive, file)) = File.ReadAllBytes(
+                            Path.Combine(expected, file)
+                        ))
+                        $"Archived {file} changed"
+
+                check
+                    (not (File.Exists(Path.Combine(directory, "sprints", "01_Saved.md"))))
+                    "Replanning did not replace old plan"
+
+                let after = JsonNode.Parse(File.ReadAllText(Path.Combine(directory, "resume.json")))
+                check (after.["Phase"].GetValue<string>() = "Complete") "Replanned workflow did not execute"
+                check (after.["Sprints"].AsArray().Count = 1) "Replanned workflow retained stale sprints")
+
 test "explicit resume validates identity and preserves plans" (fun () -> runWorker "validate")
 
 for mode in [ "reject-multiple-running"; "reject-premature-final" ] do
     test mode (fun () -> runWorker mode)
 
-test "archive retains prior state before replanning" (fun () -> runWorker "archive")
+test "archive helper copies saved state" (fun () -> runWorker "archive")
 test "capture retains stdout stderr phase and exit" (fun () -> runWorker "capture-exit")
 test "noisy child is bounded by hard phase budget" (fun () -> runWorker "capture-noisy")
 test "idle child process tree is killed with stderr retained" (fun () -> runWorker "capture-idle")

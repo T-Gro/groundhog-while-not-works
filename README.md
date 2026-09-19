@@ -62,7 +62,11 @@ sprint files. Missing, changed, or inconsistent phase/cursor state fails closed
 without invoking an architect. Completed sprints, iteration history, and pending verification
 survive process restarts. A verifier interrupted before its result is recorded
 runs again; it is never inferred to have passed. Agent sessions themselves are
-not restored across processes.
+not restored across processes. Recorded failures remain failures: unfinished
+verification resumes before any retry, and exhausted final-verification fixups
+continue to exit unsuccessfully on repeated resume without rerunning agents.
+Each implementation invocation counts once, including incomplete work, not again
+when a verifier requests a retry.
 
 These options are mutually exclusive with `--restart` and `--push`. Fresh
 planning, explicit restart, and arbiter replanning first copy existing top-level
@@ -96,7 +100,8 @@ git diff --check
 
 The dependency-free test harness uses the real script load chain and existing
 runtime dependencies, an inert fixed-token backend for new-process Ralph tests
-(including process termination before a verifier result),
+(including interruption after failed verification, durable unsuccessful completion,
+and archive-before-mutation/fail-closed replanning),
 and bounded local PowerShell children for capture/termination tests. Scratch
 files stay beneath the ignored `.tools` directory and are removed afterward.
 

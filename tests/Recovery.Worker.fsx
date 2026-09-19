@@ -70,7 +70,8 @@ let sample verifying =
 match mode with
 | "save-completed" -> sample false
 | "save-verifying" -> sample true
-| "save-final" ->
+| "save-final"
+| "save-final-pending" ->
     sample false
     let state, _ = Resume.load checkpoint request
 
@@ -78,8 +79,16 @@ match mode with
         { state with
             Backlog = state.Backlog |> List.map (fun (item, _, timing) -> item, Done 3, timing)
             CurrentPhase = "Final Verification"
-            FinalVerifierResults = Map.ofList [ "FUNCTIONAL", Passed 1 ]
-            FinalVerifierSummaries = Map.ofList [ "FUNCTIONAL", "checked final" ] }
+            FinalVerifierResults =
+                if mode = "save-final" then
+                    Map.ofList [ "FUNCTIONAL", Passed 1 ]
+                else
+                    Map.empty
+            FinalVerifierSummaries =
+                if mode = "save-final" then
+                    Map.ofList [ "FUNCTIONAL", "checked final" ]
+                else
+                    Map.empty }
 
     Resume.save checkpoint request finalState None
 | "resume-final" ->
@@ -153,6 +162,22 @@ match mode with
     check (File.Exists(Path.Combine(archive, "resume.json"))) "Checkpoint not archived"
     check (File.Exists(Path.Combine(archive, "sprints", "01_Saved.md"))) "Plan not archived"
     check (File.Exists checkpoint) "Archiving deleted current checkpoint"
+| "replan" ->
+    let archives = Directory.GetDirectories(Path.Combine(root, "archives"))
+    check (archives.Length = 1) "Architect reached without one pre-mutation archive"
+    let expected = Path.Combine(root, "expected")
+
+    for file in Directory.GetFiles(expected, "*", SearchOption.AllDirectories) do
+        let relative = Path.GetRelativePath(expected, file)
+
+        check
+            (File.ReadAllBytes(Path.Combine(archives[0], relative)) = File.ReadAllBytes file)
+            $"Architect reached before archiving {relative}"
+
+    check (Directory.GetFiles(sprintDir, "*.md").Length = 0) "Architect reached before stale plans cleared"
+    File.WriteAllText(Path.Combine(root, "archive-checked"), archives[0])
+    File.WriteAllText(Path.Combine(root, "BACKLOG.md"), "Replacement plan")
+    makeSprint 9 |> ignore
 | "reject-multiple-running"
 | "reject-premature-final" ->
     sample true
