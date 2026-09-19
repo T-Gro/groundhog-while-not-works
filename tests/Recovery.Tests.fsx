@@ -19,6 +19,7 @@ let scratch =
 Directory.CreateDirectory scratch |> ignore
 let mutable passed = 0
 let mutable failed = 0
+let fixtureTimeoutMs = 180_000
 
 let check condition message =
     if not condition then
@@ -42,10 +43,10 @@ let runProcessExpect expectedExit (psi: ProcessStartInfo) =
     let stdout = child.StandardOutput.ReadToEndAsync()
     let stderr = child.StandardError.ReadToEndAsync()
 
-    if not (child.WaitForExit(60000)) then
+    if not (child.WaitForExit(fixtureTimeoutMs)) then
         child.Kill(true)
         child.WaitForExit()
-        failwith "Fixture exceeded 60 second test budget"
+        failwith $"Fixture exceeded {fixtureTimeoutMs / 1000} second test budget: {stdout.Result}\n{stderr.Result}"
 
     check
         (child.ExitCode = expectedExit)
@@ -126,7 +127,7 @@ let interruptRalph (psi: ProcessStartInfo) calls stage =
 
     try
         let waiting =
-            SpinWait.SpinUntil((fun () -> File.Exists(calls + ".waiting") || child.HasExited), 60000)
+            SpinWait.SpinUntil((fun () -> File.Exists(calls + ".waiting") || child.HasExited), fixtureTimeoutMs)
 
         check (waiting && not child.HasExited) "Verifier interruption point not reached"
     finally

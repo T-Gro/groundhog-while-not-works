@@ -98,6 +98,11 @@ dotnet fsi Ralph.fsx --check
 git diff --check
 ```
 
+Fixture processes have a three-minute startup/execution budget to include FSI
+dependency resolution and nested script loads. Timeout failures retain captured
+stdout/stderr. This does not change the shorter idle/deadline budgets exercised
+by the process-supervision tests or the launcher's production limits.
+
 The dependency-free test harness uses the real script load chain and existing
 runtime dependencies, an inert fixed-token backend for new-process Ralph tests
 (including interruption after failed verification, durable unsuccessful completion,
