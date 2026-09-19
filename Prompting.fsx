@@ -105,11 +105,14 @@ module BacklogFile =
 
 let validationContract (sprint: BacklogItem) =
     let lines = sprint.Description.Replace("\r\n", "\n").Split('\n')
-    match lines |> Array.tryFindIndex (fun line -> line.Trim().StartsWith("## Validation scope and completion contract", StringComparison.Ordinal)) with
+    let heading = Regex(@"^\s*(#{1,6})[ \t]+Validation scope and completion contract\b")
+    match lines |> Array.tryFindIndex heading.IsMatch with
     | Some index ->
+        let level = heading.Match(lines.[index]).Groups.[1].Length
+        let sectionEnd = Regex(@"^\s*#{1," + string level + @"}[ \t]+")
         lines
         |> Array.skip (index + 1)
-        |> Array.takeWhile (fun line -> not (line.TrimStart().StartsWith("## ")))
+        |> Array.takeWhile (fun line -> not (sectionEnd.IsMatch line))
         |> String.concat "\n"
         |> fun text -> text.Trim()
     | None ->

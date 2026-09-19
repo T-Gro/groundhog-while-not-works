@@ -78,7 +78,9 @@ supervisor, and must not start a duplicate executor.
 
 Both implementer and verifier prompts use the sprint's **Validation scope and
 completion contract** (falling back to its DoD and repository guidance for older
-plans). They do not inject an unconditional root build/test pair. Required real
+plans). The heading may use any Markdown ATX depth; nested subsections stay in
+the contract, which ends at the next heading of equal or shallower depth.
+They do not inject an unconditional root build/test pair. Required real
 smoke checks remain required; an unavailable SDK is not passing evidence.
 
 Each agent invocation captures stdout, stderr, PID, phase, exit status and stop

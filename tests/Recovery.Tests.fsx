@@ -177,19 +177,53 @@ let runRalph verifying interrupt =
 
 let cases =
     [ "Node",
+      "##",
       "node --test eng\\regression-bisect\\model.test.cjs\nnode --check eng\\regression-bisect\\model.cjs\ngit diff --check"
       "FSharp-helper",
+      "##",
       "dotnet fsi tests\\Recovery.Tests.fsx\ndotnet test tests\\Shared.Tests\\DailyMonitor.Shared.Tests.fsproj -c Debug --filter FullyQualifiedName~ExecutorStateTests"
       "Real-smoke",
-      "Run the controlled-history trial against pinned stable SDK and clean main.\nRecord exact SDK identity, failing endpoint, older passing endpoint, and confirmed culprit.\nAn unavailable SDK is not acceptance." ]
+      "##",
+      "Run the controlled-history trial against pinned stable SDK and clean main.\nRecord exact SDK identity, failing endpoint, older passing endpoint, and confirmed culprit.\nAn unavailable SDK is not acceptance."
+      "Recovery-sprint",
+      "###",
+      """Run in the restored dotnet/fsharp worktree, using PowerShell expansion rather than a literal wildcard:
 
-for name, contract in cases do
+```powershell
+$tests = @(Get-ChildItem 'eng\regression-bisect' -Filter '*.test.cjs' | ForEach-Object FullName)
+node --test @tests
+Get-ChildItem 'eng\regression-bisect' -Filter '*.cjs' -Recurse | ForEach-Object {
+    node --check $_.FullName
+    if ($LASTEXITCODE -ne 0) { throw "Syntax check failed: $($_.FullName)" }
+}
+git diff --check
+```
+
+Run from the task-local Daily Monitor checkout:
+
+```powershell
+dotnet test tests\Shared.Tests\DailyMonitor.Shared.Tests.fsproj -c Debug --filter 'FullyQualifiedName~ExecutorStateTests'
+```
+
+Run the task-local Groundhog tests without a live agent loop:
+
+```powershell
+dotnet fsi tests\Recovery.Tests.fsx
+```
+
+#### Completion evidence
+Record exact commands, exits, tested SHAs, and locally committed launcher/supervisor SHAs.
+No root dotnet/fsharp build/test is required. Unavailable SDK smoke remains unaccepted.""" ]
+
+for name, heading, contract in cases do
+    let contract = contract.Replace("\r\n", "\n")
+
     let source =
         { FilePath = Path.Combine(scratch, name + ".md")
           Order = 1
           Name = name
           Description =
-            $"# Sprint: {name}\n\n## Validation scope and completion contract\n{contract}\n\n## Notes\nUnrelated notes.\n\n## Definition of Done\n- All required checks pass; report actual evidence."
+            $"# Sprint: {name}\n\n{heading} Validation scope and completion contract\n{contract}\n\n{heading} Notes\nUnrelated notes.\n\n## Definition of Done\n- All required checks pass; report actual evidence."
           DoD = [ "All required checks pass; report actual evidence." ]
           TargetVerifiers = None
           EliminatedVerifiers = Set.empty }
@@ -230,8 +264,8 @@ for name, contract in cases do
             { sprint with
                 Description =
                     sprint.Description.Replace(
-                        "## Validation scope and completion contract",
-                        "## Validation scope and completion contract - exact scoped commands, evidence, and completion requirements"
+                        $"{heading} Validation scope and completion contract",
+                        $"{heading} Validation scope and completion contract - exact scoped commands, evidence, and completion requirements"
                     ) }
 
         check (validationContract decorated = contract) "Architect-required heading lost validation contract")

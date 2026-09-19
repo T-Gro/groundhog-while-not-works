@@ -6,6 +6,7 @@
 open System
 open System.IO
 open System.Diagnostics
+open System.Text.Json
 open TypeDefinitions
 open Prompting
 open Recovery
@@ -223,7 +224,11 @@ match mode with
     check (result.Phase = "test-phase") "Phase lost"
     check (result.Stderr.Contains "stderr-evidence") "Stderr lost"
     check (File.ReadAllText(result.StderrPath).Contains "stderr-evidence") "Durable stderr lost"
-    check (File.Exists result.ResultPath) "Durable exit record missing"
+
+    let receipt =
+        JsonSerializer.Deserialize<ProcessCapture.Result>(File.ReadAllText result.ResultPath)
+
+    check (receipt = result) "Durable capture receipt differs from the returned child result"
     check result.ExitCode.HasValue "Child exit status lost"
 
     match mode with
