@@ -72,7 +72,9 @@ let run root inherited =
         | None -> false
 
     let record name =
-        $"[IO.File]::WriteAllLines({quote (identity name)}, @([string]$PID, [string]([Diagnostics.Process]::GetCurrentProcess().StartTime.ToUniversalTime().Ticks)))"
+        let ready = identity name
+        let pending = quote (ready + ".new")
+        $"$ErrorActionPreference = 'Stop'; [IO.File]::WriteAllLines({pending}, @([string]$PID, [string]([Diagnostics.Process]::GetCurrentProcess().StartTime.ToUniversalTime().Ticks))); [IO.File]::Move({pending}, {quote ready})"
 
     File.WriteAllText(path "descendant.ps1", record "descendant" + "; Start-Sleep -Seconds 120")
     File.WriteAllText(path "control.ps1", record "control" + "; Start-Sleep -Seconds 120")
@@ -130,14 +132,13 @@ exit 7
         psi
 
     let mutable observed = ""
+    use control = Process.Start(startInfo "control.ps1")
 
     try
-        use control = Process.Start(startInfo "control.ps1")
-
         check
             (SpinWait.SpinUntil((fun () -> File.Exists(identity "control") || control.HasExited), 30000)
              && not control.HasExited)
-            "Control readiness timed out"
+            "Control did not publish readiness before exit or startup timeout"
 
         let budget: ProcessCapture.Budget =
             { Idle = TimeSpan.FromSeconds 40.
@@ -212,7 +213,14 @@ exit 7
     finally
         let errors = ResizeArray<string>()
 
-        for name in [ "parent"; "descendant"; "control" ] do
+        try
+            if not control.HasExited then
+                control.Kill()
+                check (control.WaitForExit(5000)) "Fixture cleanup timed out: control"
+        with ex ->
+            errors.Add $"control: {ex.Message}"
+
+        for name in [ "parent"; "descendant" ] do
             try
                 match ownedProcess name with
                 | Some p ->
