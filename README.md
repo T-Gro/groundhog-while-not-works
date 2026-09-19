@@ -86,11 +86,28 @@ smoke checks remain required; an unavailable SDK is not passing evidence.
 Each agent invocation captures stdout, stderr, PID, phase, exit status and stop
 reason under `RALPH_STATE_DIR\captures`. `RALPH_IDLE_SECONDS` defaults to 1200;
 `RALPH_PHASE_SECONDS` defaults to 7200. Each accepts an integer from 1 to 28800.
-Output renews only the idle lease, never the absolute phase budget. Expiry kills
-the specific child process tree; up to five seconds each are allowed for exit
-and stream draining. Genuine output activity is reflected in `ralph.log` at most
-every 30 seconds, not as an unconditional heartbeat. Budget exits are distinct
-from natural nonzero exits and preserve their capture files.
+Output renews only the idle lease, never the absolute phase budget. Capture
+requires 64-bit Windows 10 or later: a kill-on-close Job object is assigned
+atomically during native process creation, before target code executes. Only
+the intended standard handles are inherited. The entire owned job is terminated
+on budget expiry **or direct-parent exit**, including descendants with no captured
+pipes; unrelated processes are not enumerated or terminated. Unsupported
+containment fails before the target starts.
+
+After the parent exits or a budget expires, cleanup allows five seconds for the
+owned job to empty, then one shared five-second deadline for stdout, stderr and
+stdin completion. Input is UTF-8 without BOM plus `Environment.NewLine`; completion
+includes sending all bytes and closing stdin. Receipts are flushed and atomically
+replaced before returning a failure to the caller. They retain the actual parent
+`ExitCode` (null only if unavailable), partial output, `InputCompleted`,
+`StreamsDrained`, `OwnedProcessesStopped`, and a `Failures` array.
+Natural completion uses `Exited`; otherwise `CleanupFailed`, `DrainFailed` or
+`InputFailed` identifies the first completion failure. Existing `IdleLease` and
+`HardBudget` reasons take precedence when their budgets expired, with any
+additional errors retained in `Failures`; supervision exceptions use
+`CaptureFailed`. A non-`Exited` receipt is never agent success, even with exit 0.
+Genuine output activity is reflected in `ralph.log` at most every 30 seconds,
+not as an unconditional heartbeat.
 
 ### Local validation (no live agents or GitHub operations)
 
@@ -111,6 +128,15 @@ runtime dependencies, an inert fixed-token backend for new-process Ralph tests
 and archive-before-mutation/fail-closed replanning),
 and bounded local PowerShell children for capture/termination tests. Scratch
 files stay beneath the ignored `.tools` directory and are removed afterward.
+
+The `boundary stdin` cases load the real `runAgent` with an offline CLI that
+reads raw stdin to EOF and compares the entire generated prompt before returning
+a completion token. They cover fresh/resumed session arguments, multiline and
+quoted Unicode data beyond a pipe buffer, early-close failure, and dropped or
+truncated input mutations in isolated source copies. Set `RECOVERY_SPRINT_PATH`
+to an existing sprint to test its on-disk H3 validation section and commands;
+otherwise the tests create a small local sprint. Failed fixtures retain their
+scratch path and byte/receipt evidence instead of deleting it.
 
 ## License
 

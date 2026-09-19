@@ -2,6 +2,7 @@
 #load "..\\TypeDefinitions.fsx"
 #load "..\\Prompting.fsx"
 #load "..\\Recovery.fsx"
+#load "Capture.ParentFirst.fsx"
 
 open System
 open System.IO
@@ -69,6 +70,10 @@ let sample verifying =
     Resume.save checkpoint request state cursor
 
 match mode with
+| "capture-parent-first-stdout"
+| "capture-parent-first-stderr"
+| "capture-parent-first-both"
+| "capture-parent-first-neither" -> Capture.ParentFirst.run root (mode.Substring("capture-parent-first-".Length))
 | "save-completed" -> sample false
 | "save-verifying" -> sample true
 | "save-final"
@@ -194,6 +199,7 @@ match mode with
     File.WriteAllText(checkpoint, corrupt)
     assertReject (fun () -> Resume.load checkpoint request |> ignore)
 | "capture-exit"
+| "capture-drain-failure"
 | "capture-noisy"
 | "capture-idle" ->
     let childFile = Path.Combine(root, "child.ps1")
@@ -202,6 +208,22 @@ match mode with
         match mode with
         | "capture-exit" ->
             "[Console]::Out.WriteLine('stdout-evidence'); [Console]::Error.WriteLine('stderr-evidence'); exit 7"
+        | "capture-drain-failure" ->
+            let output = Path.Combine(root, mode + ".stdout.log").Replace("'", "''")
+
+            $"""
+[Console]::Out.WriteLine('stdout-evidence')
+[Console]::Error.WriteLine('stderr-evidence')
+$watch = [Diagnostics.Stopwatch]::StartNew()
+do {{
+    $stream = [IO.File]::Open('{output}', 'Open', 'Read', 'ReadWrite')
+    $reader = [IO.StreamReader]::new($stream)
+    try {{ $ready = $reader.ReadToEnd().Contains('stdout-evidence') }} finally {{ $reader.Dispose() }}
+    if ($watch.Elapsed.TotalSeconds -gt 3) {{ throw 'Capture readiness timed out' }}
+}} until ($ready)
+[Console]::OpenStandardOutput().WriteByte(255)
+exit 7
+"""
         | "capture-noisy" ->
             "[Console]::Error.WriteLine('stderr-evidence'); while ($true) { [Console]::Out.WriteLine('noise'); Start-Sleep -Milliseconds 20 }"
         | _ ->
@@ -213,6 +235,9 @@ match mode with
 
     for arg in [ "-NoProfile"; "-File"; childFile ] do
         psi.ArgumentList.Add arg
+
+    if mode = "capture-drain-failure" then
+        psi.StandardOutputEncoding <- System.Text.UTF8Encoding(false, true)
 
     let budget: ProcessCapture.Budget =
         { Idle = TimeSpan.FromSeconds 2.0
@@ -231,10 +256,22 @@ match mode with
     check (receipt = result) "Durable capture receipt differs from the returned child result"
     check result.ExitCode.HasValue "Child exit status lost"
 
+    check (result.InputCompleted && result.OwnedProcessesStopped) "Capture lifecycle did not complete"
+
+    if mode <> "capture-drain-failure" then
+        check (result.StreamsDrained && result.Failures.Length = 0) "Capture streams did not complete cleanly"
+
     match mode with
     | "capture-exit" ->
         check (result.ExitCode.Value = 7 && result.Reason = "Exited") "Natural exit lost"
         check (result.Stdout.Contains "stdout-evidence") "Stdout lost"
+    | "capture-drain-failure" ->
+        check (result.ExitCode.Value = 7 && result.Reason = "DrainFailed") "Drain failure hid actual child exit"
+        check (result.Stdout = "stdout-evidence" + Environment.NewLine) "Partial stdout lost"
+        check (File.ReadAllText(result.StdoutPath) = result.Stdout) "Durable partial stdout differs"
+        check (not result.StreamsDrained && result.Failures.Length = 1) "Failed stream reported clean completion"
+        check (result.Failures[0].StartsWith("DrainFailed:")) "Drain failure evidence lost"
+        check (result.Elapsed < TimeSpan.FromSeconds 12.) "Drain failure exceeded cleanup grace"
     | "capture-noisy" ->
         check (result.Reason = "HardBudget") "Noise renewed absolute budget"
         check (result.Elapsed < TimeSpan.FromSeconds 12.0) "Hard budget not bounded"

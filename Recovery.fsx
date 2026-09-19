@@ -1,3 +1,5 @@
+#load "ProcessContainment.fsx"
+
 open System
 open System.IO
 open System.Diagnostics
@@ -320,6 +322,10 @@ module ProcessCapture =
           Stderr: string
           ExitCode: Nullable<int>
           Reason: string
+          InputCompleted: bool
+          StreamsDrained: bool
+          OwnedProcessesStopped: bool
+          Failures: string array
           Elapsed: TimeSpan
           StdoutPath: string
           StderrPath: string
@@ -339,13 +345,22 @@ module ProcessCapture =
         psi.RedirectStandardOutput <- true
         psi.RedirectStandardError <- true
         psi.RedirectStandardInput <- input.IsSome
-        use child = new Process(StartInfo = psi)
+
+        if input.IsSome then
+            psi.StandardInputEncoding <- UTF8Encoding(false)
+
         let clock = Stopwatch.StartNew()
         let mutable lastActivity = 0L
+        let failures = ResizeArray<string>()
+        File.WriteAllText(stdoutPath, "")
+        File.WriteAllText(stderrPath, "")
+        use owned = new ProcessContainment.OwnedProcess(psi)
+        let child = owned.Process
 
-        let drain (reader: StreamReader) path =
+        let drain (stream: Stream) encoding path =
             Task.Run(fun () ->
-                use output = new StreamWriter(path, false, Encoding.UTF8)
+                use reader = new StreamReader(stream, encoding, true, 4096, true)
+                use output = new StreamWriter(path, false, UTF8Encoding(false))
                 output.AutoFlush <- true
                 let buffer = Array.zeroCreate<char> 4096
                 let mutable count = reader.Read(buffer, 0, buffer.Length)
@@ -355,62 +370,131 @@ module ProcessCapture =
                     output.Write(buffer, 0, count)
                     count <- reader.Read(buffer, 0, buffer.Length))
 
-        child.Start() |> ignore
-        let stdout = drain child.StandardOutput stdoutPath
-        let stderr = drain child.StandardError stderrPath
+        let encoding value =
+            if isNull value then Console.OutputEncoding else value
+
+        let stdout = drain owned.Stdout (encoding psi.StandardOutputEncoding) stdoutPath
+        let stderr = drain owned.Stderr (encoding psi.StandardErrorEncoding) stderrPath
 
         let inputTask =
             Task.Run(fun () ->
                 match input with
                 | Some text ->
-                    child.StandardInput.WriteLine text
-                    child.StandardInput.Close()
+                    use writer = new StreamWriter(owned.Stdin.Value, psi.StandardInputEncoding, 4096)
+                    writer.WriteLine text
                 | None -> ())
 
         let mutable reason = "Exited"
         let mutable lastReported = 0L
 
-        while not (child.WaitForExit(50)) && reason = "Exited" do
-            if clock.Elapsed >= budget.Hard then
-                reason <- "HardBudget"
-            elif clock.Elapsed.Ticks - Interlocked.Read(&lastActivity) >= budget.Idle.Ticks then
-                reason <- "IdleLease"
-            elif clock.Elapsed.Ticks - lastReported >= TimeSpan.FromSeconds(30.0).Ticks then
-                let activity = Interlocked.Read(&lastActivity)
+        try
+            while not (child.WaitForExit(50)) && reason = "Exited" do
+                if clock.Elapsed >= budget.Hard then
+                    reason <- "HardBudget"
+                elif clock.Elapsed.Ticks - Interlocked.Read(&lastActivity) >= budget.Idle.Ticks then
+                    reason <- "IdleLease"
+                elif clock.Elapsed.Ticks - lastReported >= TimeSpan.FromSeconds(30.0).Ticks then
+                    let activity = Interlocked.Read(&lastActivity)
 
-                if activity > lastReported then
-                    Logging.info $"Agent output: phase={phase}, pid={child.Id}, elapsed={clock.Elapsed}"
+                    if activity > lastReported then
+                        Logging.info $"Agent output: phase={phase}, pid={child.Id}, elapsed={clock.Elapsed}"
 
-                lastReported <- clock.Elapsed.Ticks
+                    lastReported <- clock.Elapsed.Ticks
+        with ex ->
+            reason <- "CaptureFailed"
+            failures.Add ex.Message
 
-        if reason <> "Exited" then
-            try
-                child.Kill(true)
-            with :? InvalidOperationException ->
-                ()
+        let failed category message =
+            failures.Add $"{category}: {message}"
 
-        if not (child.WaitForExit(5000)) then
-            failwith $"Could not stop child PID {child.Id}"
+            if reason = "Exited" then
+                reason <- category
 
-        if not (Task.WaitAll([| stdout; stderr |], 5000)) then
-            failwith $"Capture drain exceeded budget for PID {child.Id}"
+        // The job outlives the direct parent, including descendants with no captured pipes.
+        let cleanup = Stopwatch.StartNew()
+        let mutable stopped = false
 
         try
-            inputTask.Wait(1000) |> ignore
+            owned.Terminate()
+
+            while not stopped && cleanup.ElapsedMilliseconds < 5000L do
+                stopped <- owned.ActiveCount = 0u
+
+                if not stopped then
+                    Thread.Sleep 20
+
+            if not stopped then
+                failed "CleanupFailed" "Owned processes did not exit within five seconds"
+        with ex ->
+            failed "CleanupFailed" ex.Message
+
+        let exitCode =
+            if child.HasExited then
+                Nullable child.ExitCode
+            else
+                Nullable()
+
+        if not exitCode.HasValue then
+            failed "CleanupFailed" "Parent exit code unavailable"
+
+        // One shared I/O deadline; input completion includes closing the pipe.
+        try
+            Task.WaitAll([| stdout; stderr; inputTask |], 5000) |> ignore
         with :? AggregateException ->
             ()
+
+        let completed category (work: Task) =
+            if work.IsCompletedSuccessfully then
+                true
+            else
+                let detail =
+                    if work.IsFaulted then work.Exception.Flatten().Message
+                    elif work.IsCanceled then "Task cancelled"
+                    else "I/O completion exceeded five seconds"
+
+                failed category detail
+                false
+
+        let stdoutDone = completed "DrainFailed" stdout
+        let stderrDone = completed "DrainFailed" stderr
+        let inputDone = completed "InputFailed" inputTask
+
+        let read path =
+            try
+                use snapshot =
+                    new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite)
+
+                use reader = new StreamReader(snapshot)
+                reader.ReadToEnd()
+            with ex ->
+                failed "DrainFailed" ex.Message
+                ""
+
+        let output, error = read stdoutPath, read stderrPath
 
         let result =
             { Phase = phase
               Pid = child.Id
-              Stdout = File.ReadAllText stdoutPath
-              Stderr = File.ReadAllText stderrPath
-              ExitCode = Nullable child.ExitCode
+              Stdout = output
+              Stderr = error
+              ExitCode = exitCode
               Reason = reason
+              InputCompleted = inputDone
+              StreamsDrained = stdoutDone && stderrDone
+              OwnedProcessesStopped = stopped
+              Failures = failures.ToArray()
               Elapsed = clock.Elapsed
               StdoutPath = stdoutPath
               StderrPath = stderrPath
               ResultPath = resultPath }
 
-        File.WriteAllText(resultPath, JsonSerializer.Serialize result)
+        let pending = resultPath + ".new"
+
+        use receipt =
+            new FileStream(pending, FileMode.Create, FileAccess.Write, FileShare.None)
+
+        JsonSerializer.Serialize(receipt, result)
+        receipt.Flush(true)
+        receipt.Close()
+        File.Move(pending, resultPath, true)
         result

@@ -83,6 +83,8 @@ let ralphProcess directory flags =
         Path.Combine(fakeDir, "copilot.cmd"),
         $"""@echo off
 echo %%*>>"{calls}"
+pwsh -NoProfile -Command "[Console]::In.ReadToEnd() | Out-Null"
+if errorlevel 1 exit /b 42
 if defined RECOVERY_FAIL_ONCE echo %%* | findstr /c:"%%RECOVERY_FAIL_ONCE%%" >nul && (if not exist "{calls}.failed" (echo failed>"{calls}.failed" & echo ^<ManagementSummary^>retained failure evidence^</ManagementSummary^> & echo VERIFY_FAILED & exit /b 0))
 if defined RECOVERY_FAIL_FINAL echo %%* | findstr /c:"FinalVerify-FUNCTIONAL-" >nul && (echo ^<ManagementSummary^>retained failure evidence^</ManagementSummary^> & echo VERIFY_FAILED & exit /b 0)
 if defined RECOVERY_INCOMPLETE_ONCE echo %%* | findstr /c:"Implement-" >nul && (if not exist "{calls}.incomplete" (echo incomplete>"{calls}.incomplete" & echo SUBTASK_INCOMPLETE & exit /b 0))
@@ -485,7 +487,108 @@ test "capture retains stdout stderr phase and exit" (fun () -> runWorker "captur
 test "noisy child is bounded by hard phase budget" (fun () -> runWorker "capture-noisy")
 test "idle child process tree is killed with stderr retained" (fun () -> runWorker "capture-idle")
 
-Directory.Delete(scratch, true)
+for inherited in [ "stdout"; "stderr"; "both"; "neither" ] do
+    test $"boundary parent-first {inherited}" (fun () -> runWorker ("capture-parent-first-" + inherited))
+
+test "boundary drain failure retains receipt" (fun () -> runWorker "capture-drain-failure")
+
+for mode in [ "complete"; "closed"; "dropped"; "truncated" ] do
+    test $"boundary stdin: actual runAgent {mode}" (fun () ->
+        let directory = Path.Combine(scratch, "stdin-" + mode)
+        let fakeDir = Path.Combine(directory, ".tools", ".npm-global")
+        Directory.CreateDirectory fakeDir |> ignore
+
+        let launcher =
+            if mode = "dropped" || mode = "truncated" then
+                let copy = Path.Combine(directory, "launcher")
+                Directory.CreateDirectory(Path.Combine(copy, "tests")) |> ignore
+
+                for file in Directory.GetFiles(root, "*.fsx") do
+                    File.Copy(file, Path.Combine(copy, Path.GetFileName file))
+
+                for folder in [ "templates"; "verifiers" ] do
+                    Directory.CreateDirectory(Path.Combine(copy, folder)) |> ignore
+
+                    for file in Directory.GetFiles(Path.Combine(root, folder)) do
+                        File.Copy(file, Path.Combine(copy, folder, Path.GetFileName file))
+
+                File.Copy(
+                    Path.Combine(__SOURCE_DIRECTORY__, "PromptDelivery.Worker.fsx"),
+                    Path.Combine(copy, "tests", "PromptDelivery.Worker.fsx")
+                )
+
+                let path = Path.Combine(copy, "Ralph.fsx")
+                let source = File.ReadAllText path
+
+                let replacement =
+                    if mode = "dropped" then
+                        "(Some \"\")"
+                    else
+                        "(Some (prompt.Substring(0, 1024)))"
+
+                let mutated = source.Replace("(Some prompt)", replacement)
+                check (source <> mutated) "Stdin mutation did not target the production handoff"
+                File.WriteAllText(path, mutated)
+                copy
+            else
+                root
+
+        let fakeCli = Path.Combine(__SOURCE_DIRECTORY__, "PromptDelivery.Cli.ps1")
+
+        File.WriteAllText(
+            Path.Combine(fakeDir, "copilot.cmd"),
+            $"@echo off\r\npwsh -NoProfile -File \"{fakeCli}\" %%*\r\nexit /b %%errorlevel%%\r\n"
+        )
+
+        let psi =
+            ProcessStartInfo(
+                "dotnet",
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true
+            )
+
+        for arg in
+            [ "fsi"
+              Path.Combine(launcher, "tests", "PromptDelivery.Worker.fsx")
+              "--check" ] do
+            psi.ArgumentList.Add arg
+
+        psi.Environment["DM_BASE_DIR"] <- directory
+        psi.Environment["RALPH_WORK_DIR"] <- root
+        psi.Environment["RALPH_STATE_DIR"] <- directory
+        psi.Environment["RECOVERY_PROMPT_DIRECTORY"] <- directory
+        psi.Environment["RECOVERY_PROMPT_MODE"] <- mode
+        psi.Environment["RALPH_IDLE_SECONDS"] <- "15"
+        psi.Environment["RALPH_PHASE_SECONDS"] <- "30"
+
+        for name in
+            [ "GH_TOKEN"
+              "GITHUB_TOKEN"
+              "COPILOT_GITHUB_TOKEN"
+              "GH_ENTERPRISE_TOKEN"
+              "GITHUB_ENTERPRISE_TOKEN" ] do
+            psi.Environment.Remove name |> ignore
+
+        runProcessExpect (if mode = "dropped" || mode = "truncated" then 1 else 0) psi
+
+        if mode = "dropped" || mode = "truncated" then
+            check
+                (File.ReadAllText(Path.Combine(directory, "mismatch.txt")).StartsWith("PROMPT_BYTES_MISMATCH"))
+                "Mutation was not rejected by the EOF-reading CLI"
+
+            check
+                (File.ReadAllBytes(Path.Combine(directory, "received.bin"))
+                 <> File.ReadAllBytes(Path.Combine(directory, "expected.bin")))
+                "Stdin mutation did not corrupt bytes"
+        else
+            check (File.Exists(Path.Combine(directory, "invocation.json"))) "Fake CLI did not execute")
+
+if failed = 0 then
+    Directory.Delete(scratch, true)
+else
+    printfn "Failure evidence retained: %s" scratch
+
 printfn "Recovery tests: %d passed, %d failed" passed failed
 
 if failed > 0 then
