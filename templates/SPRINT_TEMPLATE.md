@@ -10,7 +10,8 @@
   1. # Sprint: [title]
   2. ## Context
   3. ## Description  
-  4. ## Definition of Done
+  4. ## Validation scope and completion contract
+  5. ## Definition of Done
   
   The implementor agent sees only this file. Include every detail needed to implement the sprint.
 -->
@@ -43,9 +44,14 @@
 When user does A, the result should be B.
 Example: `input -> expected output`
 
+## Validation scope and completion contract
+[List exact commands, working directories, budgets, and evidence required for this sprint.
+Select scoped checks for the changed code; do not default to unrelated root build/test commands.
+If a real smoke trial is required, specify its acceptance criteria; unavailable is not passing.]
+
 ## Definition of Done
-- Build succeeds with no new warnings
+- Required validation checks succeed with recorded evidence
 - Feature works as described in Expected Behavior
 - Unit tests added for new functionality
-- All tests pass locally (dotnet test -c Release)
+- All tests required by the validation contract pass locally
 - Changes committed with descriptive message
