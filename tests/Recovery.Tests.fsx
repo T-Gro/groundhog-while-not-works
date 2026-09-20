@@ -116,7 +116,9 @@ let runProcessExpect expectedExit (psi: ProcessStartInfo) =
         (child.ExitCode = expectedExit)
         $"Fixture exit {child.ExitCode}, expected {expectedExit}: {stdout.Result}\n{stderr.Result}"
 
-let runProcess = runProcessExpect 0
+    stdout.Result
+
+let runProcess psi = runProcessExpect 0 psi |> ignore
 
 let runWorkerAt directory mode =
     let psi =
@@ -384,17 +386,7 @@ for stage in [ "Implement"; "Verify" ] do
             for arg in [ "-c"; "core.hooksPath=NUL" ] @ args do
                 psi.ArgumentList.Add arg
 
-            use child = Process.Start psi
-            let stdout = child.StandardOutput.ReadToEndAsync()
-            let stderr = child.StandardError.ReadToEndAsync()
-
-            if not (child.WaitForExit(fixtureTimeoutMs)) then
-                child.Kill(true)
-                child.WaitForExit()
-                failwith "Fixture Git command timed out"
-
-            check (child.ExitCode = 0) $"Fixture Git failed: {stderr.Result}"
-            stdout.Result.Trim()
+            (runProcessExpect 0 psi).Trim()
 
         git [ "init"; "--quiet" ] |> ignore
         git [ "config"; "user.name"; "Recovery fixture" ] |> ignore
@@ -581,7 +573,7 @@ test "loop: unsuccessful completion remains unsuccessful on repeated resume" (fu
     runWorkerAt directory "save-final-pending"
     let psi, calls = ralphProcess directory [ "--resume" ]
     psi.Environment["RECOVERY_FAIL_FINAL"] <- "1"
-    runProcessExpect 1 psi
+    runProcessExpect 1 psi |> ignore
     let checkpoint = Path.Combine(directory, "resume.json")
     let before = JsonNode.Parse(File.ReadAllText checkpoint)
     check (before.["Sprints"].AsArray().Count = 5) "Final failure did not exhaust exactly three fixups"
@@ -595,7 +587,7 @@ test "loop: unsuccessful completion remains unsuccessful on repeated resume" (fu
     let invocations = File.ReadAllText calls
 
     for _ in 1..2 do
-        runProcessExpect 1 psi
+        runProcessExpect 1 psi |> ignore
         let after = JsonNode.Parse(File.ReadAllText checkpoint)
         check (after.ToJsonString() = before.ToJsonString()) "Repeated unsuccessful resume changed durable outcome"
         check (after.["Phase"].GetValue<string>() <> "Complete") "Failure converted to successful completion"
@@ -651,7 +643,7 @@ for restart in [ false; true ] do
 
             let psi, calls = ralphProcess directory (if restart then [ "--restart" ] else [])
             psi.Environment["RECOVERY_REPLAN"] <- "1"
-            runProcessExpect (if archiveFails then 1 else 0) psi
+            runProcessExpect (if archiveFails then 1 else 0) psi |> ignore
 
             if archiveFails then
                 check (not (File.Exists calls)) "Archive failure invoked an agent"
@@ -774,6 +766,7 @@ for mode in [ "complete"; "closed"; "dropped"; "truncated" ] do
             psi.Environment.Remove name |> ignore
 
         runProcessExpect (if mode = "dropped" || mode = "truncated" then 1 else 0) psi
+        |> ignore
 
         if mode = "dropped" || mode = "truncated" then
             check
