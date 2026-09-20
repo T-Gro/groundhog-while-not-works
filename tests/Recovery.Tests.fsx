@@ -13,6 +13,68 @@ open Prompting
 
 let root = Path.GetFullPath(Path.Combine(__SOURCE_DIRECTORY__, ".."))
 
+let testGroup (name: string) =
+    if name.Contains("after arbiter", StringComparison.Ordinal) then
+        "arbiter"
+    elif name.StartsWith("loop:", StringComparison.Ordinal) then
+        "loop"
+    elif name.StartsWith("boundary ", StringComparison.Ordinal) then
+        "boundary"
+    else
+        "state"
+
+if fsi.CommandLineArgs.Length = 1 then
+    let children =
+        ResizeArray<Process * Threading.Tasks.Task<string> * Threading.Tasks.Task<string>>()
+
+    let deadline = DateTime.UtcNow.AddMinutes 14.
+    let mutable exitCode = 0
+
+    try
+        for group in [ "state"; "arbiter"; "loop"; "boundary" ] do
+            let psi =
+                ProcessStartInfo(
+                    "dotnet",
+                    UseShellExecute = false,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true
+                )
+
+            for arg in [ "fsi"; fsi.CommandLineArgs[0]; "--group=" + group ] do
+                psi.ArgumentList.Add arg
+
+            let child = Process.Start psi
+            children.Add(child, child.StandardOutput.ReadToEndAsync(), child.StandardError.ReadToEndAsync())
+
+        for child, stdout, stderr in children do
+            let remaining = max 0 (int (deadline - DateTime.UtcNow).TotalMilliseconds)
+
+            if not (child.WaitForExit remaining) then
+                child.Kill true
+                child.WaitForExit()
+
+                eprintfn
+                    "Recovery test group PID %d exceeded the shared fourteen-minute deadline (exit %d)."
+                    child.Id
+                    child.ExitCode
+
+                exitCode <- 1
+
+            printf "%s" stdout.Result
+            eprintf "%s" stderr.Result
+
+            if child.ExitCode <> 0 then
+                exitCode <- 1
+    finally
+        for child, _, _ in children do
+            if not child.HasExited then
+                child.Kill true
+                child.WaitForExit()
+
+            child.Dispose()
+
+    exit exitCode
+
 let scratch =
     Path.Combine(root, ".tools", "recovery-tests", Guid.NewGuid().ToString("N"))
 
@@ -27,8 +89,10 @@ let check condition message =
 
 let test (name: string) action =
     if
-        fsi.CommandLineArgs.Length = 1
-        || name.Contains(fsi.CommandLineArgs[1], StringComparison.Ordinal)
+        (if fsi.CommandLineArgs[1].StartsWith("--group=", StringComparison.Ordinal) then
+             fsi.CommandLineArgs[1] = "--group=" + testGroup name
+         else
+             name.Contains(fsi.CommandLineArgs[1], StringComparison.Ordinal))
     then
         try
             action ()
@@ -88,8 +152,13 @@ if errorlevel 1 exit /b 42
 if defined RECOVERY_FAIL_ONCE echo %%* | findstr /c:"%%RECOVERY_FAIL_ONCE%%" >nul && (if not exist "{calls}.failed" (echo failed>"{calls}.failed" & echo ^<ManagementSummary^>retained failure evidence^</ManagementSummary^> & echo VERIFY_FAILED & exit /b 0))
 if defined RECOVERY_FAIL_FINAL echo %%* | findstr /c:"FinalVerify-FUNCTIONAL-" >nul && (echo ^<ManagementSummary^>retained failure evidence^</ManagementSummary^> & echo VERIFY_FAILED & exit /b 0)
 if defined RECOVERY_INCOMPLETE_ONCE echo %%* | findstr /c:"Implement-" >nul && (if not exist "{calls}.incomplete" (echo incomplete>"{calls}.incomplete" & echo SUBTASK_INCOMPLETE & exit /b 0))
+if defined RECOVERY_ARBITER if not exist "{directory}\sprints\09_Saved.md" goto skipinterrupt
 if defined RECOVERY_INTERRUPT echo %%* | findstr /c:"%%RECOVERY_INTERRUPT%%" >nul && (echo waiting>"{calls}.waiting" & pwsh -NoProfile -Command Start-Sleep -Seconds 120)
+:skipinterrupt
 if defined RECOVERY_REPLAN echo %%* | findstr /c:"Architect-" >nul && (dotnet fsi "{Path.Combine(__SOURCE_DIRECTORY__, "Recovery.Worker.fsx")}" replan "{directory}" & exit /b)
+if defined RECOVERY_ARBITER echo %%* | findstr /c:"Architect-" >nul && (dotnet fsi "{Path.Combine(__SOURCE_DIRECTORY__, "Recovery.Worker.fsx")}" plan-arbiter "{directory}" & exit /b)
+if defined RECOVERY_ARBITER echo %%* | findstr /c:"Implement-4-" >nul && (echo SUBTASK_INCOMPLETE & exit /b 0)
+if defined RECOVERY_ARBITER echo %%* | findstr /c:"Arbiter-" >nul && (dotnet fsi "{Path.Combine(__SOURCE_DIRECTORY__, "Recovery.Worker.fsx")}" replan-arbiter "{directory}" & exit /b)
 echo SUBTASK_COMPLETE
 echo VERIFY_PASSED
 """
@@ -116,7 +185,8 @@ echo VERIFY_PASSED
           "RECOVERY_FAIL_FINAL"
           "RECOVERY_INCOMPLETE_ONCE"
           "RECOVERY_INTERRUPT"
-          "RECOVERY_REPLAN" ] do
+          "RECOVERY_REPLAN"
+          "RECOVERY_ARBITER" ] do
         psi.Environment.Remove name |> ignore
 
     psi, calls
@@ -294,6 +364,139 @@ test "new process resumes partial final verification" (fun () ->
     check
         (not (File.ReadAllText(Path.Combine(scratch, "fake-agent-calls.log")).Contains("FinalVerify-FUNCTIONAL-")))
         "Completed final verifier reran")
+
+for stage in [ "Implement"; "Verify" ] do
+    test $"loop: fresh-process resume after arbiter reload at {stage} preserves saved descendant" (fun () ->
+        let directory = Path.Combine(scratch, "arbiter-" + stage)
+        let workDir = Path.Combine(directory, "product")
+        Directory.CreateDirectory workDir |> ignore
+
+        let git args =
+            let psi =
+                ProcessStartInfo(
+                    "git",
+                    WorkingDirectory = workDir,
+                    UseShellExecute = false,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true
+                )
+
+            for arg in [ "-c"; "core.hooksPath=NUL" ] @ args do
+                psi.ArgumentList.Add arg
+
+            use child = Process.Start psi
+            let stdout = child.StandardOutput.ReadToEndAsync()
+            let stderr = child.StandardError.ReadToEndAsync()
+
+            if not (child.WaitForExit(fixtureTimeoutMs)) then
+                child.Kill(true)
+                child.WaitForExit()
+                failwith "Fixture Git command timed out"
+
+            check (child.ExitCode = 0) $"Fixture Git failed: {stderr.Result}"
+            stdout.Result.Trim()
+
+        git [ "init"; "--quiet" ] |> ignore
+        git [ "config"; "user.name"; "Recovery fixture" ] |> ignore
+        git [ "config"; "user.email"; "recovery@example.invalid" ] |> ignore
+        let source = Path.Combine(workDir, "saved.bin")
+        File.WriteAllBytes(source, [| 0uy; 128uy; 255uy |])
+        git [ "add"; "saved.bin" ] |> ignore
+
+        git [ "-c"; "commit.gpgsign=false"; "commit"; "--quiet"; "-m"; "saved" ]
+        |> ignore
+
+        let saved = git [ "rev-parse"; "HEAD" ]
+        File.AppendAllText(Path.Combine(workDir, "descendant.txt"), "real saved-descendant bytes")
+        git [ "add"; "descendant.txt" ] |> ignore
+
+        git [ "-c"; "commit.gpgsign=false"; "commit"; "--quiet"; "-m"; "descendant" ]
+        |> ignore
+
+        let head = git [ "rev-parse"; "HEAD" ]
+        check (head <> saved) "Fixture did not create a saved descendant"
+        git [ "merge-base"; "--is-ancestor"; saved; head ] |> ignore
+
+        let bytes =
+            Directory.GetFiles(workDir) |> Array.map (fun p -> p, File.ReadAllBytes p)
+
+        let psi, calls = ralphProcess directory []
+        psi.WorkingDirectory <- workDir
+        psi.Environment["RALPH_WORK_DIR"] <- workDir
+        psi.Environment["RECOVERY_ARBITER"] <- "1"
+
+        interruptRalph
+            psi
+            calls
+            (if stage = "Implement" then
+                 "Implement-9-"
+             else
+                 "Verify-FUNCTIONAL-")
+
+        let checkpoint = Path.Combine(directory, "resume.json")
+        let before = JsonNode.Parse(File.ReadAllText checkpoint)
+
+        let archives =
+            Directory.GetDirectories(Path.Combine(directory, "archives"))
+            |> Array.filter (fun p -> File.Exists(Path.Combine(p, "resume.json")))
+
+        check (archives.Length = 1) "Expected exactly one checkpoint archive before arbiter mutation"
+
+        let archived =
+            JsonNode.Parse(File.ReadAllText(Path.Combine(archives[0], "resume.json")))
+
+        let archiveBytes =
+            Directory.GetFiles(archives[0], "*", SearchOption.AllDirectories)
+            |> Array.map (fun p -> p, File.ReadAllBytes p)
+
+        check (before.["Request"].GetValue<string>() = "Recovery test request") "Request identity changed"
+        check (before.["WorkDir"].GetValue<string>() = workDir) "Checkpoint escaped the fixture worktree"
+        check (before.["Cursor"].["Stage"].GetValue<string>() = stage) "Replacement cursor not durable"
+        check (before.["Sprints"].AsArray().Count = 2) "Arbiter retained the obsolete pending sprint"
+        check (before.["Sprints"].[1].["Path"].GetValue<string>().EndsWith("09_Saved.md")) "Arbiter plan not reloaded"
+
+        check
+            (before.["BacklogHash"].ToJsonString() <> archived.["BacklogHash"].ToJsonString())
+            "Backlog hash not reloaded"
+
+        check (git [ "rev-parse"; "HEAD" ] = head) "Arbiter changed saved-descendant HEAD"
+        check (File.ReadAllText(calls).Contains("\"Arbiter-")) "Real arbiter dispatch did not run"
+        let resume, resumedCalls = ralphProcess directory [ "--resume" ]
+        resume.WorkingDirectory <- workDir
+        resume.Environment["RALPH_WORK_DIR"] <- workDir
+        runProcess resume
+        let afterText = File.ReadAllText checkpoint
+        let after = JsonNode.Parse afterText
+
+        for field in [ "Request"; "WorkDir"; "StartTime" ] do
+            check (after.[field].ToJsonString() = archived.[field].ToJsonString()) $"Resume reset {field}"
+
+        check (after.["Phase"].GetValue<string>() = "Complete") "Resumed replacement plan did not complete"
+        check (after.["Sprints"].AsArray().Count = 2) "Resume invented archived sprint completion"
+
+        for state in [ before; after ] do
+            check
+                (state.["Sprints"].[0].ToJsonString() = archived.["Sprints"].[0].ToJsonString())
+                "Accepted sprint reset"
+
+        check
+            (after.["CompletedIterations"].GetValue<int>() = archived.["CompletedIterations"].GetValue<int>() + 1)
+            "Resume reset or recounted archived iterations"
+
+        let invocations = File.ReadAllText resumedCalls
+
+        for forbidden in [ "Architect-"; "Arbiter-"; "Implement-1-"; "Implement-4-" ] do
+            check (not (invocations.Contains forbidden)) $"Resume repeated {forbidden}"
+
+        check (invocations.Contains("Implement-9-") = (stage = "Implement")) "Wrong replacement stage resumed"
+        runProcess resume
+        check (File.ReadAllText checkpoint = afterText) "Repeated resume changed checkpoint"
+        check (File.ReadAllText resumedCalls = invocations) "Repeated resume invoked agents"
+        check (git [ "rev-parse"; "HEAD" ] = head) "Resume reset saved-descendant HEAD"
+        check (git [ "status"; "--porcelain=v1"; "--untracked-files=all" ] = "") "Resume changed product status"
+
+        for path, expected in Array.append bytes archiveBytes do
+            check (File.ReadAllBytes path = expected) $"Resume changed preserved bytes: {path}")
 
 for final in [ false; true ] do
     let phase = if final then "final" else "sprint"
@@ -585,6 +788,9 @@ for mode in [ "complete"; "closed"; "dropped"; "truncated" ] do
             check (File.Exists(Path.Combine(directory, "invocation.json"))) "Fake CLI did not execute")
 
 if failed = 0 then
+    for file in Directory.GetFiles(scratch, "*", SearchOption.AllDirectories) do
+        File.SetAttributes(file, FileAttributes.Normal)
+
     Directory.Delete(scratch, true)
 else
     printfn "Failure evidence retained: %s" scratch

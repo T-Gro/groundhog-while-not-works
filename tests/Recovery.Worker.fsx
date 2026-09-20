@@ -70,6 +70,20 @@ let sample verifying =
     Resume.save checkpoint request state cursor
 
 match mode with
+| "plan-arbiter" ->
+    File.WriteAllText(Path.Combine(root, "BACKLOG.md"), "Original plan: retain accepted sprint 1 and retry sprint 4.")
+    makeSprint 1 |> ignore
+    makeSprint 4 |> ignore
+| "replan-arbiter" ->
+    File.Delete(Path.Combine(sprintDir, "04_Saved.md"))
+
+    File.WriteAllText(
+        Path.Combine(root, "BACKLOG.md"),
+        "Arbiter replacement: retain accepted sprint 1 and run sprint 9."
+    )
+
+    makeSprint 9 |> ignore
+    printfn "ARBITER_COMPLETE"
 | "capture-parent-first-stdout"
 | "capture-parent-first-stderr"
 | "capture-parent-first-both"

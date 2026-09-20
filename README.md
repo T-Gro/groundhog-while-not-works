@@ -121,11 +121,17 @@ Fixture processes have a three-minute startup/execution budget to include FSI
 dependency resolution and nested script loads. Timeout failures retain captured
 stdout/stderr. This does not change the shorter idle/deadline budgets exercised
 by the process-supervision tests or the launcher's production limits.
+The full harness runs four disjoint groups in separate processes, each with its
+own scratch directory, under one fourteen-minute deadline. A test-name argument
+still runs matching cases serially for focused diagnosis.
 
 The dependency-free test harness uses the real script load chain and existing
 runtime dependencies, an inert fixed-token backend for new-process Ralph tests
 (including interruption after failed verification, durable unsuccessful completion,
-and archive-before-mutation/fail-closed replanning),
+archive-before-mutation/fail-closed replanning, and fresh-process resume at
+implementation/verification boundaries after arbiter plan replacement while
+preserving checkpoint identity, accepted sprint history, archives, and a real
+saved-descendant Git checkout),
 and bounded local PowerShell children for capture/termination tests. Scratch
 files stay beneath the ignored `.tools` directory and are removed afterward.
 
