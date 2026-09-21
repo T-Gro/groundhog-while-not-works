@@ -119,6 +119,7 @@ module GUI =
                 | Running (_, iter) -> 
                     $"[yellow]⏳ Run[/]", if iter > 1 then $"[yellow]⟲{iter}[/]" else $"[yellow]{iter}[/]"
                 | Done iters -> "[green]✓ Done[/]", $"[green]{iters}[/]"
+                | Blocked _ -> "[yellow]Blocked[/]", "[dim]-[/]"
             let timeStr = 
                 match status, timing.EndTime with
                 | Done _, Some endT -> 

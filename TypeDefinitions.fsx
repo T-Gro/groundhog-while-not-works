@@ -1,3 +1,5 @@
+#load "BlockedProtocol.fsx"
+
 open System
 
 type SafeMarkup = SafeMarkup of string
@@ -54,9 +56,17 @@ type BacklogStatus =
     | Todo
     | Running of phase: Phase * iteration: int
     | Done of iterations: int
+    | Blocked of reason: string
+
+type DispatchResult<'T> =
+    | Complete of 'T
+    | Retry of string
+    | Block of BlockedProtocol.BlockRecord
+    | Fault of string
 
 type State = {
     Backlog: (BacklogItem * BacklogStatus * BacklogItemTiming) list
+    ActiveSprints: string list
     StartTime: DateTime
     Message: string
     AgentStartTime: DateTime option  // When agent started (None = idle)
@@ -88,6 +98,7 @@ let emptyTiming = {
 
 let emptyState = {
     Backlog = []
+    ActiveSprints = []
     StartTime = DateTime.Now
     Message = ""
     AgentStartTime = None

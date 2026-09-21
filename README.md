@@ -40,7 +40,40 @@ ralph "Resolve all PR comments and CI failures on current branch" --push
 
 The `--push` flag pushes changes after completion and monitors CI. When CI fails, it extracts unique failures and creates fixup commits. Requires a skill/tool that can fetch CI build errors (e.g., Azure DevOps or GitHub Actions integration).
 
+## Owner-blocked work
+
+An implementer can request a durable pause with one output line:
+
+```text
+SUBTASK_BLOCKED {"reason":"Missing owner launch","retryCondition":"owner-launch-enrolled"}
+```
+
+The reason is limited to 512 characters. Contradictory or malformed blocked requests
+also pause for owner inspection; they never trigger clarification or retries.
+Ralph persists the attempt and completed sprint history before returning exit **42**.
+No verifier, arbiter, architect, final-success or push path runs after the pause.
+Exit **43** means invalid or inaccessible checkpoint state and also requires owner
+inspection, not a fresh plan.
+
+`RALPH_STATE_DIR` holds the version-1 `blocked.json` contract and the full
+`scheduler-state.json` snapshot. The record binds the issue, worktree, source and
+sprint-file fingerprint, snapshot hash, current sprint and original launch.
+Repeated dispatch does not mutate that checkpoint. Deleting a record, touching a
+file or changing agent text is not resume authorization.
+
+Daily Monitor's explicit owner transition uses its existing retained-worktree and
+launch enrollment. It supplies a one-shot claim bound to a new executor/launch;
+Ralph validates and consumes it before restoring the saved sprint history.
+An interrupted consumed resume fails closed. Deploy both repositories together:
+already-running scripts do not reload source.
+
+Run the actual scheduler fixtures (temporary Git repository, injected agents,
+600-second cap, no model calls or publication):
+
+```powershell
+.\Test-Scheduler.ps1
+```
+
 ## License
 
 Any derivatives of this work must keep using F#.
-

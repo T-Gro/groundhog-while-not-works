@@ -51,11 +51,17 @@ module Config =
             |> fun value -> value.Substring(0, 16)
         let defaultStateDir =
             Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "groundhog", "workspaces", workspaceKey)
-        Environment.GetEnvironmentVariable("RALPH_STATE_DIR")
-        |> Option.ofObj
-        |> Option.filter (String.IsNullOrWhiteSpace >> not)
-        |> Option.defaultValue defaultStateDir
-        |> Path.GetFullPath
+        let directory =
+            Environment.GetEnvironmentVariable("RALPH_STATE_DIR")
+            |> Option.ofObj
+            |> Option.filter (String.IsNullOrWhiteSpace >> not)
+            |> Option.defaultValue defaultStateDir
+            |> Path.GetFullPath
+        let worktree = Path.TrimEndingDirectorySeparator(Path.GetFullPath workDir)
+        let comparison = if OperatingSystem.IsWindows() then StringComparison.OrdinalIgnoreCase else StringComparison.Ordinal
+        if directory.Equals(worktree, comparison) || directory.StartsWith(worktree + string Path.DirectorySeparatorChar, comparison) then
+            failwith "RALPH_STATE_DIR must be outside the source worktree."
+        directory
     let sprintsDir = Path.Combine(ralphDir, "sprints")
     let backlogFile = Path.Combine(ralphDir, "BACKLOG.md")
     let verifiersDir = Path.Combine(scriptDir, "verifiers")

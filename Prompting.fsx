@@ -84,7 +84,7 @@ module SprintFiles =
                 let body = File.ReadAllText filePath |> YamlFrontmatter.extractBody
                 let (order, name) = parseFileName (Path.GetFileName filePath)
                 Some { FilePath = filePath; Order = order; Name = name; Description = parseDescription body; DoD = parseDoD body; TargetVerifiers = None; EliminatedVerifiers = Set.empty }
-            with _ -> None
+            with ex -> failwith $"Cannot read sprint {filePath}: {ex.Message}"
     
     let readAllSprints () = listSprints () |> List.choose readSprint
     let ensureDir () = Directory.CreateDirectory(Config.sprintsDir) |> ignore
@@ -483,6 +483,7 @@ module Prompts =
                 xt "step" "Verify each DoD criterion for THIS sprint"
                 xt "step" "Commit changes"
                 xt "signal" "SUBTASK_COMPLETE"
+                xt "blocked" """If only an external owner action can unblock this sprint, stop and output exactly one line: SUBTASK_BLOCKED {"reason":"brief reason (max 512 characters)","retryCondition":"owner-launch-enrolled"}. Do not output SUBTASK_COMPLETE or SUBTASK_INCOMPLETE with it. This requests a durable pause; it never authorizes killing processes, adopting a checkpoint, fabricating launch records, or resuming."""
             ]
         ]) |> XmlPrompt.toPrompt
 
