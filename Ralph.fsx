@@ -14,6 +14,7 @@
 open System
 open System.IO
 open System.Diagnostics
+open System.Text
 open System.Text.RegularExpressions
 open System.Threading
 open System.Threading.Tasks
@@ -44,6 +45,7 @@ let setMessage msg = StateOps.setMessage &state liveCtx msg
 
 let buildDashboard () = GUI.buildDashboard state (Verifiers.listAll ())
 
+let private completionMarker = "RALPH_AGENT_COMPLETE"
 
 /// Run a copilot agent session. Returns (output, sessionName) where sessionName can be used with askFollowUp.
 /// If resumeSessionId is provided (Some), resumes that session instead of starting a new one.
@@ -63,10 +65,6 @@ let private runAgentCore (prompt: string) (title: string) (_showWindow: bool) (r
     let mutable output = ""
     let mutable exn: exn option = None
     try
-        // Escape curly braces - Fli uses StreamWriter.WriteLine(format, arg) internally
-        // which interprets { and } as format placeholders
-        let escapedPrompt = prompt.Replace("{", "{{").Replace("}", "}}")
-        
         // First invocation: --name creates a named session.
         // Subsequent invocations: --resume= continues an existing session by name.
         let sessionArgs = 
@@ -74,23 +72,54 @@ let private runAgentCore (prompt: string) (title: string) (_showWindow: bool) (r
             | None   -> [| "--name"; sessionName |]
             | Some n -> [| $"--resume={n}" |]
         let baseArgs = Array.append [| "--allow-all-tools"; "--allow-all-paths"; "--no-ask-user";"--no-color";"--plain-diff";"-s";"--model"; Config.Model; "--effort"; Config.Effort; "--context"; Config.Context; "--stream"; "off" |] sessionArgs
-        
-        // Run copilot via Fli — use Config.workDir so copilot runs in the target repo
-        let result = 
-            cli {
-                Exec Config.CopilotExe
-                Arguments baseArgs
-                Input escapedPrompt
-                WorkingDirectory Config.workDir
-            }
-            |> Command.execute
-        
-        output <- result.Text |> Option.defaultValue ""
+
+        let request =
+            prompt
+            + $"\n\nWhen every requested action is complete, print a final line containing exactly `{completionMarker}`. Do not print that line before completion."
+        let psi = ProcessStartInfo(Config.CopilotExe)
+        for argument in baseArgs do psi.ArgumentList.Add argument
+        psi.WorkingDirectory <- Config.workDir
+        psi.UseShellExecute <- false
+        psi.CreateNoWindow <- true
+        psi.RedirectStandardInput <- true
+        psi.RedirectStandardOutput <- true
+        psi.RedirectStandardError <- true
+        use proc = Process.Start psi
+        let stdout = System.Text.StringBuilder()
+        let stderr = System.Text.StringBuilder()
+        use completed = new Threading.ManualResetEventSlim(false)
+        proc.OutputDataReceived.Add(fun args ->
+            if not (isNull args.Data) then
+                lock stdout (fun () -> stdout.AppendLine(args.Data) |> ignore)
+                if args.Data.Trim() = completionMarker then completed.Set())
+        proc.ErrorDataReceived.Add(fun args ->
+            if not (isNull args.Data) then lock stderr (fun () -> stderr.AppendLine(args.Data) |> ignore))
+        proc.BeginOutputReadLine()
+        proc.BeginErrorReadLine()
+        proc.StandardInput.WriteLine(request)
+        proc.StandardInput.Close()
+
+        let deadline = DateTime.UtcNow.AddMinutes(float Config.AgentTimeoutMinutes)
+        while not proc.HasExited && not completed.IsSet && DateTime.UtcNow < deadline do
+            completed.Wait(TimeSpan.FromSeconds 1.) |> ignore
+
+        let completedEarly = completed.IsSet && not proc.HasExited
+        if completedEarly then
+            Logging.info $"Agent {title} emitted the completion marker; stopping its lingering process."
+            proc.Kill(true)
+        elif not proc.HasExited then
+            proc.Kill(true)
+            proc.WaitForExit()
+            failwith $"Agent {title} exceeded the {Config.AgentTimeoutMinutes}-minute timeout."
+
+        proc.WaitForExit()
+        output <- lock stdout (fun () -> stdout.ToString().Trim())
         Logging.info $"Agent {title} completed, output length: {output.Length}"
-        
-        if result.ExitCode <> 0 then
-            let err = result.Error |> Option.defaultValue "(no error text)"
-            Logging.error $"Agent {title} exited with code {result.ExitCode}: {err}"
+
+        if not completedEarly && proc.ExitCode <> 0 then
+            let err = lock stderr (fun () -> stderr.ToString().Trim())
+            let errorText = if err = "" then "(no error text)" else err
+            failwith $"Agent {title} exited with code {proc.ExitCode}: {errorText}"
     with ex ->
         Logging.exn ex $"runAgent({title})"
         exn <- Some ex

@@ -14,6 +14,13 @@ module Config =
     let Model = Environment.GetEnvironmentVariable("DM_COPILOT_MODEL") |> Option.ofObj |> Option.defaultValue "gpt-6-astra"
     let Effort = Environment.GetEnvironmentVariable("DM_COPILOT_EFFORT") |> Option.ofObj |> Option.defaultValue "high"
     let Context = Environment.GetEnvironmentVariable("DM_COPILOT_CONTEXT") |> Option.ofObj |> Option.defaultValue "long_context"
+    let AgentTimeoutMinutes =
+        match Environment.GetEnvironmentVariable("RALPH_AGENT_TIMEOUT_MINUTES") |> Option.ofObj with
+        | Some value ->
+            match Int32.TryParse value with
+            | true, minutes when minutes > 0 -> minutes
+            | _ -> 180
+        | None -> 180
     do
         let normalizedModel = Model.ToLowerInvariant()
         if ["anthropic"; "claude"; "opus"; "sonnet"; "haiku"] |> List.exists normalizedModel.Contains then
