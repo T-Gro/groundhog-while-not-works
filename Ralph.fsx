@@ -350,7 +350,7 @@ let rec runBacklogItem (item: BacklogItem) iter totalIter feedback showWin = asy
 
         match SchedulerState.blockRequest out with
         | Some reason ->
-            updateStatus item.FilePath (Blocked reason) reason
+            updateStatus item.FilePath (Blocked reason) (Markup.Escape reason)
             state <- { state with CurrentPhase = "Blocked"; AgentStartTime = None; CurrentAgentTask = "" }
             try
                 let blocked = SchedulerState.persistBlock item.FilePath reason state

@@ -16,7 +16,7 @@ open Ralph
 let equal expected actual =
     if actual <> expected then failwith $"Expected {expected}, actual {actual}"
 
-let blockedOutput = """SUBTASK_BLOCKED {"reason":"Missing owner launch","retryCondition":"owner-launch-enrolled"}"""
+let blockedOutput = """SUBTASK_BLOCKED {"reason":"Missing [owner] launch","retryCondition":"owner-launch-enrolled"}"""
 let options = JsonSerializerOptions()
 options.Converters.Add(JsonFSharpConverter())
 dashboardDisabled <- true
