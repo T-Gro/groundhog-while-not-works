@@ -997,6 +997,16 @@ let runInteractive () =
     let request = AnsiConsole.Ask<string> "[green]Request:[/] "
     run request showWin false 0 None
 
+let requestFromArgs args =
+    match args |> List.tryFindIndex ((=) "--request-file") with
+    | Some index when index + 1 < args.Length ->
+        let path = args[index + 1]
+        if not (Path.IsPathFullyQualified path) || not (File.Exists path) then
+            failwith $"Request file does not exist: {path}"
+        File.ReadAllText path
+    | Some _ -> failwith "--request-file requires an absolute file path."
+    | None -> args |> List.filter (fun a -> not (a.StartsWith "--")) |> String.concat " "
+
 /// Restart: Learn from previous failed run and create new plan
 let shouldResumeBeforeRestart () =
     File.Exists(Path.Combine(Config.ralphDir, "scheduler-state.json"))
@@ -1129,7 +1139,7 @@ match fsi.CommandLineArgs |> Array.toList |> List.tail with
 | [] -> runInteractive () |> ignore
 | ["--help"] | ["-h"] ->
     printfn "Ralph - Autonomous AI Coding Loop\n"
-    printfn "Usage:  dotnet fsi Ralph.fsx [request] [--yes] [--hidden] [--headless] [--push] [--restart] [--help]"
+    printfn "Usage:  dotnet fsi Ralph.fsx [request] [--request-file PATH] [--yes] [--hidden] [--headless] [--push] [--restart] [--help]"
     printfn ""
     printfn "Options:"
     printfn "  --yes       Auto-approve all prompts"
@@ -1137,8 +1147,9 @@ match fsi.CommandLineArgs |> Array.toList |> List.tail with
     printfn "  --headless  Disable live dashboard (for background/service execution)"
     printfn "  --push      Push after completion and monitor CI, fix failures"
     printfn "  --restart   Learn from previous failed run and restart with new plan"
+    printfn "  --request-file PATH  Read the request from a file instead of the command line"
 | args ->
-    let request = args |> List.filter (fun a -> not (a.StartsWith "--")) |> String.concat " "
+    let request = requestFromArgs args
     let showWin = not (List.contains "--hidden" args)
     let headless = List.contains "--headless" args
     let auto = List.contains "--yes" args

@@ -38,6 +38,13 @@ equal true (shouldResumeBeforeRestart ())
 File.Delete restartStatePath
 printfn "PASS explicit restart bypasses missing scheduler state"
 
+let requestPath = Path.Combine(Config.ralphDir, "request.txt")
+File.WriteAllText(requestPath, "large request from file")
+equal "large request from file" (requestFromArgs ["--request-file"; requestPath; "--yes"])
+equal "inline request" (requestFromArgs ["inline"; "request"; "--yes"])
+File.Delete requestPath
+printfn "PASS requests can be delivered without command-line length limits"
+
 let setup partial =
     if Directory.Exists Config.ralphDir then Directory.Delete(Config.ralphDir, true)
     Directory.CreateDirectory Config.sprintsDir |> ignore
