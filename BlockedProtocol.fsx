@@ -3,6 +3,7 @@ module BlockedProtocol
 open System
 open System.Diagnostics
 open System.IO
+open System.Runtime.InteropServices
 open System.Security.Cryptography
 open System.Text
 open System.Text.Json
@@ -189,6 +190,67 @@ let private requireDead pid =
         if not proc.HasExited then failwith "Previous launch PID is still live (or has been reused)."
     with :? ArgumentException -> ()
 
+module private Native =
+    [<Struct; StructLayout(LayoutKind.Sequential)>]
+    type ProcessBasicInformation =
+        val mutable ExitStatus: nativeint
+        val mutable Peb: nativeint
+        val mutable Affinity: nativeint
+        val mutable Priority: nativeint
+        val mutable Pid: nativeint
+        val mutable ParentPid: nativeint
+
+    [<DllImport("ntdll.dll")>]
+    extern int NtQueryInformationProcess(nativeint handle, int informationClass, ProcessBasicInformation& information, int size, int& returned)
+
+let private parentPid (proc: Process) =
+    if OperatingSystem.IsWindows() then
+        let mutable information = Unchecked.defaultof<Native.ProcessBasicInformation>
+        let mutable returned = 0
+        let status = Native.NtQueryInformationProcess(proc.Handle, 0, &information, Marshal.SizeOf<Native.ProcessBasicInformation>(), &returned)
+        if status <> 0 then failwith $"Cannot authenticate parent of PID {proc.Id}: NTSTATUS {status}."
+        int information.ParentPid
+    elif OperatingSystem.IsLinux() then
+        let stat = File.ReadAllText($"/proc/{proc.Id}/stat")
+        Int32.Parse(stat.Substring(stat.LastIndexOf(')') + 2).Split(' ')[1])
+    else
+        let psi = ProcessStartInfo("ps")
+        for argument in ["-o"; "ppid="; "-p"; string proc.Id] do psi.ArgumentList.Add argument
+        psi.UseShellExecute <- false
+        psi.RedirectStandardOutput <- true
+        use query = Process.Start psi
+        let output = query.StandardOutput.ReadToEndAsync()
+        if not (query.WaitForExit 5000) then
+            query.Kill()
+            query.WaitForExit()
+            failwith "Parent identity query timed out."
+        if query.ExitCode <> 0 then failwith $"Cannot authenticate parent of PID {proc.Id}."
+        Int32.Parse(output.Result.Trim())
+
+let private requireLive (pid, started: DateTime) =
+    if pid <= 0 || started.Kind <> DateTimeKind.Utc || started = DateTime.MinValue then
+        failwith "Missing enrolled process identity."
+    use proc = Process.GetProcessById pid
+    if proc.HasExited || proc.StartTime.ToUniversalTime() <> started then
+        failwith "Enrolled process is dead or its PID has been reused."
+
+let private requireAncestor ancestor descendant =
+    requireLive ancestor
+    requireLive descendant
+    let visited = System.Collections.Generic.HashSet<int>()
+    let mutable current = descendant
+    while current <> ancestor do
+        let pid, started = current
+        if visited.Count >= 128 || not (visited.Add pid) then failwith "Invalid process ancestry."
+        use proc = Process.GetProcessById pid
+        requireLive current
+        use parent = Process.GetProcessById(parentPid proc)
+        let parentIdentity = parent.Id, parent.StartTime.ToUniversalTime()
+        if parent.HasExited || snd parentIdentity > started then failwith "Parent PID was reused."
+        current <- parentIdentity
+    requireLive ancestor
+    requireLive descendant
+
 let consumeResume stateDir (block: BlockRecord) launchFile =
     validateBlock stateDir block.Issue block.Worktree block
     if readBlock stateDir <> Some block then failwith "Resume requires its exact current durable block."
@@ -223,9 +285,13 @@ let consumeResume stateDir (block: BlockRecord) launchFile =
         if executor.GetProperty("Pid").GetInt32() <> claim.NewExecutorPid
            || executor.GetProperty("StartedUtc").GetDateTime() <> claim.NewExecutorStartedUtc then
             failwith "Resume executor binding changed."
-        use proc = Process.GetProcessById claim.NewExecutorPid
-        if proc.HasExited || proc.StartTime.ToUniversalTime() <> claim.NewExecutorStartedUtc then
-            failwith "Resume executor is no longer the enrolled process."
+        let executorIdentity = claim.NewExecutorPid, claim.NewExecutorStartedUtc
+        let child = current.RootElement.GetProperty "Child"
+        let childIdentity = child.GetProperty("Pid").GetInt32(), child.GetProperty("StartedUtc").GetDateTime()
+        if childIdentity = executorIdentity then failwith "Resume child must be a distinct executor descendant."
+        requireAncestor executorIdentity childIdentity
+        use consumer = Process.GetCurrentProcess()
+        requireAncestor childIdentity (consumer.Id, consumer.StartTime.ToUniversalTime())
         let used = pathIn stateDir $"resume-used-{block.BlockId}.json"
         let archived = pathIn stateDir $"blocked-{block.BlockId}.json"
         File.Move(claimPath, used)

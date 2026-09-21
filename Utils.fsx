@@ -78,13 +78,20 @@ module XmlHelpers =
     let sanitizeXmlText (text: string) =
         if isNull text then ""
         else
-            text
-            |> Seq.map (fun c ->
-                if c = '\t' || c = '\n' || c = '\r'
-                   || (c >= '\u0020' && c <> '\uFFFE' && c <> '\uFFFF') then c
-                else '\uFFFD')
-            |> Seq.toArray
-            |> String
+            let result = StringBuilder(text.Length)
+            let mutable index = 0
+            while index < text.Length do
+                let c = text[index]
+                if Char.IsHighSurrogate c && index + 1 < text.Length && Char.IsLowSurrogate text[index + 1] then
+                    result.Append(c).Append(text[index + 1]) |> ignore
+                    index <- index + 2
+                else
+                    let valid =
+                        c = '\t' || c = '\n' || c = '\r'
+                        || (c >= '\u0020' && c <> '\uFFFE' && c <> '\uFFFF' && not (Char.IsSurrogate c))
+                    result.Append(if valid then c else '\uFFFD') |> ignore
+                    index <- index + 1
+            result.ToString()
 
     let xe name (attrs: (string * string) list) (children: XElement list) text : XElement =
         let el = XElement(XName.Get name)

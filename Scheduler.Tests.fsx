@@ -9,6 +9,7 @@ open System.IO
 open System.Diagnostics
 open System.Text.Json
 open System.Text.Json.Serialization
+open System.Xml.Linq
 open Utils
 open TypeDefinitions
 open Ralph
@@ -16,11 +17,34 @@ open Ralph
 let equal expected actual =
     if actual <> expected then failwith $"Expected {expected}, actual {actual}"
 
+let mutable regressionFailures = []
+let regression name test =
+    try
+        test ()
+        printfn "PASS regression: %s" name
+    with ex ->
+        regressionFailures <- name :: regressionFailures
+        eprintfn "FAIL regression: %s: %s" name ex.Message
+
+let rejected action =
+    let mutable failed = false
+    try action () with _ -> failed <- true
+    equal true failed
+
+let realAgentRunner = agentRunner
 let blockedOutput = """SUBTASK_BLOCKED {"reason":"Missing [owner] launch","retryCondition":"owner-launch-enrolled"}"""
 let options = JsonSerializerOptions()
 options.Converters.Add(JsonFSharpConverter())
 dashboardDisabled <- true
 pushChanges <- fun () -> failwith "Blocked dispatch attempted publication"
+
+let fixtureArgs = fsi.CommandLineArgs |> Array.toList
+match fixtureArgs |> List.tryFindIndex ((=) "--request-sink") with
+| Some index ->
+    let request = requestFromArgs (fixtureArgs |> List.skip (index + 1))
+    File.WriteAllText(Environment.GetEnvironmentVariable "RALPH_FIXTURE_SINK", request)
+    exit 0
+| None -> ()
 
 let xmlWithTerminalControl = XmlHelpers.xt "log" "before\u001b[31mafter"
 let serializedXml = xmlWithTerminalControl.ToString()
@@ -45,6 +69,21 @@ equal "inline request" (requestFromArgs ["inline"; "request"; "--yes"])
 File.Delete requestPath
 printfn "PASS requests can be delivered without command-line length limits"
 
+regression "exact long request reader and parse errors" (fun () ->
+    let request = String.replicate 1500 "{ \"quoted\": \"žluťoučký 🦔 日本語\" }\r\n" + "\n"
+    equal true (request.Length >= 50000)
+    File.WriteAllText(requestPath, request)
+    equal request (requestFromArgs ["--request-file"; requestPath; "--yes"])
+    equal "inline {quoted} 日本語" (requestFromArgs ["inline"; "{quoted}"; "日本語"; "--yes"])
+    for args in [
+        ["--request-file"]
+        ["--request-file"; "relative.txt"]
+        ["--request-file"; requestPath + ".missing"]
+        ["--request-file"; requestPath; "--request-file"; requestPath]
+        ["--request-file"; requestPath; "silently discarded inline"]
+    ] do rejected (fun () -> requestFromArgs args |> ignore)
+    File.Delete requestPath)
+
 let setup partial =
     if Directory.Exists Config.ralphDir then Directory.Delete(Config.ralphDir, true)
     Directory.CreateDirectory Config.sprintsDir |> ignore
@@ -57,6 +96,196 @@ let setup partial =
     let timing = { emptyTiming with IterationHistory = [history]; Summary = Some "Original completed history" }
     state <- { emptyState with Backlog = (if partial then [completed, Done 1, timing] else []) @ [item, Todo, emptyTiming] }
     item
+
+match fixtureArgs |> List.tryFindIndex ((=) "--exit-case") with
+| Some index ->
+    let mode = fixtureArgs[index + 1]
+    let item = setup true
+    agentRunner <- fun _ title _ _ -> async {
+        match mode with
+        | "blocked" -> return blockedOutput, "fixture"
+        | "failure" -> return failwith "ordinary fixture failure with retained journal"
+        | "complete" -> return (if title.StartsWith "Implement-" then "SUBTASK_COMPLETE" else "VERIFY_PASSED"), "fixture"
+        | _ -> return failwith "Protocol fault must not dispatch an agent"
+    }
+    let code =
+        if mode = "fault" then
+            File.WriteAllText(Path.Combine(Config.ralphDir, "scheduler-state.json"), "{")
+            state <- emptyState
+            run "corrupt journal" false true 0 None
+        else runWithLive [item] false "exit fixture" |> dispatchExit
+    equal (mode = "complete") (File.Exists(Path.Combine(Config.ralphDir, "completed-state.json")))
+    equal (mode <> "complete") (File.Exists(Path.Combine(Config.ralphDir, "scheduler-state.json")))
+    equal (mode = "blocked") (File.Exists(Path.Combine(Config.ralphDir, "blocked.json")))
+    printfn "EXIT-FIXTURE %s retained journal=%b, blocked=%b; exiting %d" mode (mode <> "complete") (mode = "blocked") code
+    exit code
+| None -> ()
+
+let rawFailure =
+    "useful <failure attr=\"'&\"> 日本語 🦔 \u001b[31m\u0000\u0001\u000b\uFFFE\uFFFF high:"
+    + string (char 0xD800) + " low:" + string (char 0xDC00) + " end"
+let cleanFailure = "useful <failure attr=\"'&\"> 日本語 🦔 �[31m����� high:� low:� end"
+
+regression "durable raw UTF-16 history roundtrip" (fun () ->
+    let item = setup false
+    let record = { Iteration = 1; AgentOutput = rawFailure; VerifierResults = ["FUNCTIONAL", false, rawFailure] }
+    state <- { state with CurrentPhase = "Complete"; Backlog = [item, Done 1, { emptyTiming with IterationHistory = [record] }] }
+    SchedulerState.save state
+    SchedulerState.archiveCompleted ()
+    state <- emptyState
+    equal None (resumeCheckpoint "load raw evidence" false)
+    equal [record] (getItemTiming item.FilePath |> Option.get).IterationHistory)
+
+for kind in ["corrective"; "arbiter"] do
+    regression (kind + " actual prompt XML characters") (fun () ->
+        let item = { setup false with Name = rawFailure; Description = rawFailure; FilePath = rawFailure; DoD = [rawFailure] }
+        let history: Prompting.XmlPrompt.IterationHistory list =
+            [{ Iteration = 1; AgentOutput = rawFailure; VerifierResults = ["FUNCTIONAL", false, rawFailure] }]
+        let prompt =
+            if kind = "corrective" then
+                Prompting.Prompts.implement item 2 [rawFailure] [] [] [] history
+            else
+                let context: Prompting.XmlPrompt.FailedSprintContext = {
+                    SprintOrder = 2; SprintName = rawFailure; SprintFilePath = rawFailure
+                    IterationsSpent = 1; LastIterations = history; VerifierFailureCounts = Map.ofList ["FUNCTIONAL", 1]
+                }
+                Prompting.Prompts.arbiter rawFailure (Some context) [] [2, rawFailure, rawFailure]
+        let parsed = XElement.Parse prompt
+        equal true (parsed.Value.Contains cleanFailure)
+        if kind = "arbiter" then
+            equal true (parsed.Descendants() |> Seq.collect _.Attributes() |> Seq.exists (fun a -> a.Value = cleanFailure))
+        equal rawFailure history.Head.AgentOutput
+        equal ["FUNCTIONAL", false, rawFailure] history.Head.VerifierResults)
+
+regression "verifier failure reaches corrective and arbiter prompts with raw history" (fun () ->
+    let item = { setup false with TargetVerifiers = Some ["FUNCTIONAL"] }
+    state <- { state with Backlog = [item, Todo, emptyTiming] }
+    let mutable implementers, corrections, arbiters = 0, 0, 0
+    agentRunner <- fun prompt title _ _ -> async {
+        let output =
+            if title.StartsWith "Implement-" then
+                implementers <- implementers + 1
+                if implementers > 1 then
+                    equal true ((XElement.Parse prompt).Value.Contains cleanFailure)
+                    corrections <- corrections + 1
+                "SUBTASK_COMPLETE"
+            elif title = "Arbiter" then
+                equal true ((XElement.Parse prompt).Value.Contains cleanFailure)
+                arbiters <- arbiters + 1
+                "ARBITER_COMPLETE"
+            elif title.StartsWith "Cutter-" then "<EliminatedVerifiers></EliminatedVerifiers>"
+            else "VERIFY_FAILED\n<ManagementSummary>" + rawFailure + "</ManagementSummary>"
+        return output, "fixture"
+    }
+    match runWithLive [item] false "fixture" with
+    | Retry error -> equal true (error.Contains "ARBITER_NEEDED")
+    | actual -> failwith $"Expected bounded verifier retry, got {actual}"
+    equal Config.ArbiterThreshold implementers
+    equal (Config.ArbiterThreshold - 1) corrections
+    let history = (getItemTiming item.FilePath |> Option.get).IterationHistory
+    equal true (history |> List.forall (fun h -> h.VerifierResults |> List.exists (fun (_, passed, text) -> not passed && text.Contains rawFailure)))
+    invokeArbiter rawFailure false |> ignore
+    equal 1 arbiters
+    equal history (getItemTiming item.FilePath |> Option.get).IterationHistory)
+
+regression "clarification block persists once without implementer retry or downstream" (fun () ->
+    let item = setup true
+    let checkpoint = BlockedProtocol.checkpoint Config.workDir Config.ralphDir
+    let mutable calls = []
+    agentRunner <- fun _ title _ resume -> async {
+        calls <- calls @ [title]
+        if calls.Length = 1 then
+            equal None resume
+            return "Need to clarify owner availability", "fixture-session"
+        else
+            equal (Some "fixture-session") resume
+            return blockedOutput, "fixture-session"
+    }
+    let block =
+        match runWithLive [item] false "fixture" with
+        | Block block -> block
+        | actual -> failwith $"Clarification lost blocked result: {actual}"
+    equal ["Implement-2"; "Disambiguate-Subtask-Blocked-followup"] calls
+    equal checkpoint (BlockedProtocol.checkpoint Config.workDir Config.ralphDir)
+    equal (Some block) (BlockedProtocol.readBlock Config.ralphDir)
+    let saved = JsonSerializer.Deserialize<State>(File.ReadAllText(Path.Combine(Config.ralphDir, "scheduler-state.json")), options)
+    equal state saved
+    equal 1 (saved.Backlog |> List.sumBy (fun (_, status, _) -> match status with Blocked _ -> 1 | _ -> 0))
+    let timing = getItemTiming item.FilePath |> Option.get
+    equal true (timing.IterationHistory.Head.AgentOutput.Contains blockedOutput)
+    equal true (saved.Backlog |> List.exists (fun (_, status, timing) -> status = Done 1 && timing.Summary = Some "Original completed history")))
+
+for response in ["SUBTASK_INCOMPLETE"; blockedOutput; "timeout"] do
+    regression $"owned process cleanup {response}" (fun () ->
+        let item = setup false
+        let ready = Path.Combine(Config.ralphDir, "agent-child.json")
+        let psi = ProcessStartInfo("pwsh")
+        for arg in ["-NoProfile"; "-NonInteractive"; "-Command"; "Start-Sleep -Seconds 120"] do psi.ArgumentList.Add arg
+        use sentinel = Process.Start psi
+        use launcher = Process.GetCurrentProcess()
+        let sentinelStart, launcherStart = sentinel.StartTime, launcher.StartTime
+        let originalStart, originalClock = startAgentProcess, agentUtcNow
+        let mutable owned: Process option = None
+        try
+            startAgentProcess <- fun info ->
+                info.FileName <- "pwsh"
+                info.ArgumentList.Clear()
+                let childScript = """
+$null = [Console]::In.ReadToEnd()
+$info = [Diagnostics.ProcessStartInfo]::new('pwsh')
+$info.UseShellExecute = $false
+foreach ($arg in @('-NoProfile', '-NonInteractive', '-Command', 'Start-Sleep -Seconds 120')) { $info.ArgumentList.Add($arg) }
+$child = [Diagnostics.Process]::Start($info)
+[IO.File]::WriteAllText($env:FIXTURE_READY, (@{ Pid=$child.Id; StartedUtc=$child.StartTime.ToUniversalTime() } | ConvertTo-Json))
+if ($env:FIXTURE_RESPONSE -ne 'timeout') {
+    [Console]::WriteLine($env:FIXTURE_RESPONSE)
+    [Console]::WriteLine('RALPH_AGENT_COMPLETE')
+    [Console]::Out.Flush()
+}
+Start-Sleep -Seconds 120
+"""
+                for arg in ["-NoProfile"; "-NonInteractive"; "-Command"; childScript] do info.ArgumentList.Add arg
+                info.Environment["FIXTURE_READY"] <- ready
+                info.Environment["FIXTURE_RESPONSE"] <- response
+                let proc = Process.Start info
+                let observed = Process.GetProcessById proc.Id
+                observed.Handle |> ignore
+                owned <- Some observed
+                proc
+            if response = "timeout" then
+                let epoch = DateTime.UtcNow
+                let mutable first = true
+                agentUtcNow <- fun () ->
+                    if first then first <- false; epoch
+                    elif File.Exists ready then epoch.AddMinutes(float Config.AgentTimeoutMinutes + 1.)
+                    else epoch
+            agentRunner <- realAgentRunner
+            let result = runBacklogItem item Config.ArbiterThreshold 0 [] false |> Async.Catch |> Async.RunSynchronously
+            match response, result with
+            | "SUBTASK_INCOMPLETE", Choice1Of2 (Retry error) -> equal "ARBITER_NEEDED" error
+            | "timeout", Choice2Of2 error -> equal true (error.Message.Contains "timeout")
+            | _, Choice1Of2 (Block _) when response = blockedOutput -> ()
+            | _ -> failwith $"Completion marker changed scheduler outcome: {result}"
+            let proc = owned |> Option.get
+            equal true (proc.WaitForExit 10000)
+            use childRecord = JsonDocument.Parse(File.ReadAllText ready)
+            let childPid = childRecord.RootElement.GetProperty("Pid").GetInt32()
+            try
+                use child = Process.GetProcessById childPid
+                equal true (child.WaitForExit 10000)
+            with :? ArgumentException -> ()
+            equal false sentinel.HasExited
+            equal sentinelStart sentinel.StartTime
+            equal launcherStart launcher.StartTime
+            printfn "CLEANUP agent=%d exit=%d descendant=%d exited; sentinel=%d alive; launcher=%d unchanged" proc.Id proc.ExitCode childPid sentinel.Id launcher.Id
+        finally
+            startAgentProcess <- originalStart
+            agentUtcNow <- originalClock
+            for proc in (sentinel :: Option.toList owned) do
+                if not proc.HasExited then
+                    proc.Kill true
+                    proc.WaitForExit 10000 |> ignore
+            owned |> Option.iter _.Dispose())
 
 let dirty = Path.Combine(Config.workDir, "tracked.txt")
 File.AppendAllText(dirty, "dirty\n")
@@ -193,7 +422,23 @@ if OperatingSystem.IsWindows() then
     | actual -> failwith $"Denied checkpoint was not a terminal fault: {actual}"
     printfn "PASS denied persistence launches no agent and retains checkpoint"
 
-do
+regression "fresh retries stop at the arbiter limit" (fun () ->
+    setup true |> ignore
+    let mutable architects, arbiters, implementers = 0, 0, 0
+    agentRunner <- fun _ title _ _ -> async {
+        if title = "Architect" then
+            architects <- architects + 1
+            File.WriteAllText(Path.Combine(Config.sprintsDir, "02_Retry.md"), "# Retry\n\n## Definition of Done\n- Pass\n")
+        elif title = "Arbiter" then arbiters <- arbiters + 1
+        elif title.StartsWith "Implement-" then implementers <- implementers + 1
+        return (if title.StartsWith "Implement-" then "SUBTASK_INCOMPLETE" else "ARBITER_COMPLETE"), "fixture"
+    }
+    equal 1 (run "bounded retry" false true 0 None)
+    equal Config.MaxArbiterAttempts architects
+    equal Config.MaxArbiterAttempts arbiters
+    equal (2 * Config.ArbiterThreshold * Config.MaxArbiterAttempts) implementers)
+
+let resumeFixture retry exhaust =
     let item = setup true
     let abandoned = { item with Order = 0; Name = "Abandoned"; FilePath = Path.Combine(Config.sprintsDir, "00_Abandoned.md") }
     File.WriteAllText(abandoned.FilePath, "Historical plan, not active")
@@ -203,7 +448,7 @@ do
         (abandoned, Running(Implement, 1), emptyTiming) ::
         (state.Backlog |> List.map (fun (sprint, status, timing) ->
             sprint, status, if sprint = item then { timing with IterationHistory = attempts } else timing))
-    state <- { state with Backlog = history }
+    state <- { state with Backlog = history; ArbiterAttempt = if exhaust then Config.MaxArbiterAttempts - 1 else 0 }
     let captureDir = Path.Combine(Path.GetFullPath(Path.Combine(Config.ralphDir, "..", "..", "..")), "data", "executors", "910")
     Directory.CreateDirectory captureDir |> ignore
     let oldLaunch, newLaunch = Path.Combine(captureDir, "old.launch.json"), Path.Combine(captureDir, "new.launch.json")
@@ -212,8 +457,9 @@ do
         for arg in ["-NoProfile"; "-NonInteractive"; "-Command"; "Start-Sleep -Seconds 120"] do psi.ArgumentList.Add arg
         Process.Start psi
     let identity (proc: Process) = {| Pid = proc.Id; StartedUtc = proc.StartTime.ToUniversalTime() |}
-    use executor = Process.GetCurrentProcess()
-    use child = startOwned ()
+    use fixtureLaunch = JsonDocument.Parse(File.ReadAllText(Environment.GetEnvironmentVariable "RALPH_FIXTURE_LAUNCH"))
+    use executor = Process.GetProcessById(fixtureLaunch.RootElement.GetProperty("Executor").GetProperty("Pid").GetInt32())
+    use child = Process.GetProcessById(fixtureLaunch.RootElement.GetProperty("Child").GetProperty("Pid").GetInt32())
     use oldExecutor = startOwned ()
     use oldChild = startOwned ()
     let previousIssue, previousLaunch = Environment.GetEnvironmentVariable("RALPH_ISSUE_NUMBER"), Environment.GetEnvironmentVariable("RALPH_LAUNCH_FILE")
@@ -243,13 +489,27 @@ do
         Environment.SetEnvironmentVariable("RALPH_LAUNCH_FILE", newLaunch)
         state <- emptyState
         let mutable implementers = []
+        let mutable arbiters = 0
         agentRunner <- fun _ title _ _ -> async {
             if title.StartsWith "Implement-" then implementers <- implementers @ [title]
-            return (if title.StartsWith "Implement-" then "SUBTASK_COMPLETE" else "VERIFY_PASSED"), "fixture"
+            let output =
+                if title = "Arbiter" then
+                    arbiters <- arbiters + 1
+                    let recovery = Path.Combine(Config.sprintsDir, "03_Recovery.md")
+                    File.Delete item.FilePath
+                    File.WriteAllText(recovery, "# Recovery\n\n## Definition of Done\n- Recovered\n")
+                    "ARBITER_COMPLETE"
+                elif title.StartsWith "Implement-" && (exhaust || (retry && title = "Implement-2")) then "SUBTASK_INCOMPLETE"
+                elif title.StartsWith "Implement-" then "SUBTASK_COMPLETE"
+                elif title.StartsWith "Cutter-" then "<EliminatedVerifiers></EliminatedVerifiers>"
+                else "VERIFY_PASSED"
+            return output, "fixture"
         }
-        equal 0 (run "resume" false true 0 None)
-        equal ["Implement-2"] implementers
-        equal checkpoint (BlockedProtocol.checkpoint Config.workDir Config.ralphDir)
+        equal (if exhaust then 1 else 0) (run "resume" false true 0 None)
+        equal (if exhaust then "Implement-2" :: List.replicate Config.ArbiterThreshold "Implement-3"
+               elif retry then ["Implement-2"; "Implement-3"] else ["Implement-2"]) implementers
+        equal (if retry then 1 else 0) arbiters
+        if not retry then equal checkpoint (BlockedProtocol.checkpoint Config.workDir Config.ralphDir)
         equal snapshot (File.ReadAllText(Path.Combine(Config.ralphDir, $"scheduler-state-{block.BlockId}.json")))
         let _, _, resumedTiming = state.Backlog |> List.find (fun (sprint, _, _) -> sprint.FilePath = item.FilePath)
         equal (Config.ArbiterThreshold + 1) resumedTiming.IterationHistory.Length
@@ -260,13 +520,17 @@ do
         state <- emptyState
         agentRunner <- fun _ _ _ _ -> failwith "Replayed resume must not dispatch"
         equal 43 (run "duplicate resume" false true 0 None)
-        printfn "PASS authenticated scheduler resume once at final retry; active plan/history/source preserved; replay refused"
+        printfn "PASS authenticated scheduler resume retry=%b once at final retry; active plan/history/source preserved; replay refused" retry
     finally
         Environment.SetEnvironmentVariable("RALPH_ISSUE_NUMBER", previousIssue)
         Environment.SetEnvironmentVariable("RALPH_LAUNCH_FILE", previousLaunch)
-        for proc in [oldExecutor; oldChild; child] do
+        for proc in [oldExecutor; oldChild] do
             if not proc.HasExited then
                 proc.Kill true
                 proc.WaitForExit 10000 |> ignore
 
+for retry, exhaust in [false, false; true, false; true, true] do
+    regression $"authenticated resume retry={retry} exhaust={exhaust}" (fun () -> resumeFixture retry exhaust)
+
+if not regressionFailures.IsEmpty then failwith ("Regression failures: " + String.concat ", " regressionFailures)
 printfn "Scheduler fixtures passed."

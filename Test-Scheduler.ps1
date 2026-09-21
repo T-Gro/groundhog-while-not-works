@@ -1,16 +1,18 @@
 $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $true
-$root = Join-Path ([IO.Path]::GetTempPath()) ("ralph-fixture-" + [Guid]::NewGuid().ToString('N'))
+$root = Join-Path $PSScriptRoot (".fake\scheduler-" + [Guid]::NewGuid().ToString('N'))
 [IO.Directory]::CreateDirectory($root) | Out-Null
 $oldWork = $env:RALPH_WORK_DIR
 $oldState = $env:RALPH_STATE_DIR
 $oldIssue = $env:RALPH_ISSUE_NUMBER
 $oldLaunch = $env:RALPH_LAUNCH_FILE
+$oldFixtureLaunch = $env:RALPH_FIXTURE_LAUNCH
 try {
     $env:RALPH_WORK_DIR = Join-Path $root 'worktree'
     $env:RALPH_STATE_DIR = [IO.Path]::Combine($root, 'data', 'ralph', 'issue-910')
     $env:RALPH_ISSUE_NUMBER = '0'
     $env:RALPH_LAUNCH_FILE = ''
+    $env:RALPH_FIXTURE_LAUNCH = Join-Path $root 'fixture-launch.json'
     [IO.Directory]::CreateDirectory($env:RALPH_WORK_DIR) | Out-Null
     git -C $env:RALPH_WORK_DIR init --quiet
     git -C $env:RALPH_WORK_DIR config core.autocrlf false
@@ -23,24 +25,56 @@ try {
     [IO.File]::WriteAllText($tracked, "staged`n")
     git -C $env:RALPH_WORK_DIR add tracked.txt
     if ($LASTEXITCODE -ne 0) { throw 'Cannot prepare fixture repository' }
-    $psi = [Diagnostics.ProcessStartInfo]::new('dotnet')
-    $psi.UseShellExecute = $false
-    $psi.WorkingDirectory = $env:RALPH_WORK_DIR
-    foreach ($argument in @('fsi', (Join-Path $PSScriptRoot 'Scheduler.Tests.fsx'), '--', '--fixture')) {
-        $psi.ArgumentList.Add($argument)
+    $launcher = [Diagnostics.Process]::GetCurrentProcess()
+    $launcherStart = $launcher.StartTime
+    function Invoke-Fixture([string[]] $Arguments, [int] $ExpectedExit) {
+        $psi = [Diagnostics.ProcessStartInfo]::new('dotnet')
+        $psi.UseShellExecute = $false
+        $psi.WorkingDirectory = $env:RALPH_WORK_DIR
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError = $true
+        $psi.Environment['RALPH_FIXTURE_SINK'] = (Join-Path $root 'sink.txt')
+        foreach ($argument in (@('fsi', (Join-Path $PSScriptRoot 'Scheduler.Tests.fsx'), '--', '--fixture') + $Arguments)) {
+            $psi.ArgumentList.Add($argument)
+        }
+        if (($psi.ArgumentList | Measure-Object -Property Length -Sum).Sum -gt 2048) { throw 'Unbounded request argument vector' }
+        $process = [Diagnostics.Process]::Start($psi)
+        $stdout = $process.StandardOutput.ReadToEndAsync()
+        $stderr = $process.StandardError.ReadToEndAsync()
+        try {
+            [IO.File]::WriteAllText($env:RALPH_FIXTURE_LAUNCH, (@{
+                Executor = @{ Pid = $launcher.Id; StartedUtc = $launcher.StartTime.ToUniversalTime() }
+                Child = @{ Pid = $process.Id; StartedUtc = $process.StartTime.ToUniversalTime() }
+            } | ConvertTo-Json))
+            if (-not $process.WaitForExit(600000)) { throw 'Scheduler fixtures exceeded 600 seconds' }
+            Write-Output $stdout.GetAwaiter().GetResult()
+            Write-Output $stderr.GetAwaiter().GetResult()
+            Write-Output "SUBPROCESS pid=$($process.Id) actual=$($process.ExitCode) expected=$ExpectedExit"
+            if ($process.ExitCode -ne $ExpectedExit) { throw "Scheduler fixtures exited $($process.ExitCode), expected $ExpectedExit" }
+            if ($launcher.StartTime -ne $launcherStart) { throw 'Launcher identity changed' }
+        } finally {
+            if (-not $process.HasExited) { $process.Kill($true); $process.WaitForExit() }
+            $process.Dispose()
+        }
     }
-    $process = [Diagnostics.Process]::Start($psi)
-    if (-not $process.WaitForExit(600000)) {
-        $process.Kill($true)
-        $process.WaitForExit()
-        throw 'Scheduler fixtures exceeded 600 seconds'
+    Invoke-Fixture @() 0
+    foreach ($case in @(@('complete', 0), @('failure', 1), @('blocked', 42), @('fault', 43))) {
+        Invoke-Fixture @('--exit-case', $case[0]) $case[1]
     }
-    if ($process.ExitCode -ne 0) { throw "Scheduler fixtures exited $($process.ExitCode)" }
+    $request = ('{ "quoted": "žluťoučký 🦔 日本語" }' + "`r`n") * 1500 + "`n"
+    $requestPath = Join-Path $root 'long request 日本語.txt'
+    [IO.File]::WriteAllText($requestPath, $request)
+    Invoke-Fixture @('--request-sink', '--request-file', $requestPath, '--yes') 0
+    if ($request.Length -lt 50000 -or [IO.File]::ReadAllText((Join-Path $root 'sink.txt')) -cne $request) {
+        throw 'Actual request reader subprocess did not preserve exact long Unicode request'
+    }
+    Write-Output "PASS request-file subprocess sink: $($request.Length) UTF-16 units, bounded arguments, trailing newlines preserved"
 } finally {
     $env:RALPH_WORK_DIR = $oldWork
     $env:RALPH_STATE_DIR = $oldState
     $env:RALPH_ISSUE_NUMBER = $oldIssue
     $env:RALPH_LAUNCH_FILE = $oldLaunch
+    $env:RALPH_FIXTURE_LAUNCH = $oldFixtureLaunch
     Get-ChildItem -LiteralPath $root -Recurse -Force -File | ForEach-Object { $_.IsReadOnly = $false }
     [IO.Directory]::Delete($root, $true)
 }

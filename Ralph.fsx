@@ -46,6 +46,8 @@ let setMessage msg = StateOps.setMessage &state liveCtx msg
 let buildDashboard () = GUI.buildDashboard state (Verifiers.listAll ())
 
 let private completionMarker = "RALPH_AGENT_COMPLETE"
+let mutable startAgentProcess = fun (psi: ProcessStartInfo) -> Process.Start psi
+let mutable agentUtcNow = fun () -> DateTime.UtcNow
 
 /// Run a copilot agent session. Returns (output, sessionName) where sessionName can be used with askFollowUp.
 /// If resumeSessionId is provided (Some), resumes that session instead of starting a new one.
@@ -84,7 +86,7 @@ let private runAgentCore (prompt: string) (title: string) (_showWindow: bool) (r
         psi.RedirectStandardInput <- true
         psi.RedirectStandardOutput <- true
         psi.RedirectStandardError <- true
-        use proc = Process.Start psi
+        use proc = startAgentProcess psi
         let stdout = System.Text.StringBuilder()
         let stderr = System.Text.StringBuilder()
         use completed = new Threading.ManualResetEventSlim(false)
@@ -99,8 +101,8 @@ let private runAgentCore (prompt: string) (title: string) (_showWindow: bool) (r
         proc.StandardInput.WriteLine(request)
         proc.StandardInput.Close()
 
-        let deadline = DateTime.UtcNow.AddMinutes(float Config.AgentTimeoutMinutes)
-        while not proc.HasExited && not completed.IsSet && DateTime.UtcNow < deadline do
+        let deadline = (agentUtcNow ()).AddMinutes(float Config.AgentTimeoutMinutes)
+        while not proc.HasExited && not completed.IsSet && agentUtcNow () < deadline do
             completed.Wait(TimeSpan.FromSeconds 1.) |> ignore
 
         let completedEarly = completed.IsSet && not proc.HasExited
@@ -170,9 +172,9 @@ let resolveVerifierAmbiguity (sessionId: string) (originalSummary: string) (veri
 
 /// When implementor output is ambiguous about SUBTASK_COMPLETE, resume session to clarify.
 let resolveSubtaskAmbiguity (sessionId: string) (sprintName: string) =
-    disambiguateSignal sessionId $"Subtask-{sprintName}"
-        "If you completed ALL work for this sprint, output only SUBTASK_COMPLETE. Otherwise, output only SUBTASK_INCOMPLETE."
-        "SUBTASK_COMPLETE" "SUBTASK_INCOMPLETE"
+    askFollowUp sessionId
+        """If you completed ALL work for this sprint, output only SUBTASK_COMPLETE. Otherwise, output SUBTASK_INCOMPLETE, or if only an external owner action can unblock it, output SUBTASK_BLOCKED {"reason":"brief reason","retryCondition":"owner-launch-enrolled"}."""
+        $"Disambiguate-Subtask-{sprintName}"
 
 /// Interpret verifier output and automatically disambiguate if inconclusive.
 let interpretAndDisambiguate (output: string) (sessionId: string) (verifierName: string) = async {
@@ -378,7 +380,23 @@ let rec runBacklogItem (item: BacklogItem) iter totalIter feedback showWin = asy
         addIterationRecord item.FilePath currentRecord
         SchedulerState.save state
 
-        match SchedulerState.blockRequest out with
+        let! resolved = async {
+            let complete = hasSignalAny "SUBTASK_COMPLETE" out
+            let incomplete = hasSignalAny "SUBTASK_INCOMPLETE" out
+            if SchedulerState.blockRequest out |> Option.isSome || complete <> incomplete then return out
+            else
+                let! clarification = resolveSubtaskAmbiguity sessionId item.Name
+                updateTiming item.FilePath (fun timing ->
+                    let history =
+                        timing.IterationHistory |> List.mapi (fun index record ->
+                            if index = timing.IterationHistory.Length - 1 then
+                                { record with AgentOutput = record.AgentOutput + "\n" + clarification }
+                            else record)
+                    { timing with IterationHistory = history })
+                SchedulerState.save state
+                return clarification
+        }
+        match SchedulerState.blockRequest resolved with
         | Some reason ->
             updateStatus item.FilePath (Blocked reason) (Markup.Escape reason)
             state <- { state with CurrentPhase = "Blocked"; AgentStartTime = None; CurrentAgentTask = "" }
@@ -396,13 +414,7 @@ let rec runBacklogItem (item: BacklogItem) iter totalIter feedback showWin = asy
                 state <- { state with CompletedIterations = state.CompletedIterations + 1 }
                 runBacklogItem item (iter + 1) (totalIter + 1) fb showWin
 
-            let hasCompleteSignal = hasSignalAny "SUBTASK_COMPLETE" out
-            let hasIncompleteSignal = hasSignalAny "SUBTASK_INCOMPLETE" out
-            let! isComplete = async {
-                if hasCompleteSignal && not hasIncompleteSignal then return true
-                elif hasIncompleteSignal && not hasCompleteSignal then return false
-                else return! resolveSubtaskAmbiguity sessionId item.Name
-            }
+            let isComplete = hasSignalAny "SUBTASK_COMPLETE" resolved && not (hasSignalAny "SUBTASK_INCOMPLETE" resolved)
 
             if isComplete then
                 state <- { state with CompletedIterations = state.CompletedIterations + 1 }
@@ -735,12 +747,13 @@ let invokeArbiter (originalRequest: string) (showWin: bool) : DispatchResult<Bac
     liveCtx |> Option.iter (fun ctx -> ctx.Refresh())
     
     // Find the failed sprint (the one that's Running or first non-Done)
+    let activeBacklog = state.Backlog |> List.filter (fun (item, _, _) -> List.contains item.FilePath state.ActiveSprints)
     let failedItem = 
-        state.Backlog 
+        activeBacklog
         |> List.tryFind (fun (_, status, _) -> 
             match status with Running _ -> true | _ -> false)
         |> Option.orElse (
-            state.Backlog 
+            activeBacklog
             |> List.tryFind (fun (_, status, _) -> 
                 match status with Done _ -> false | _ -> true))
         |> Option.map (fun (item, _, _) -> item)
@@ -758,7 +771,7 @@ let invokeArbiter (originalRequest: string) (showWin: bool) : DispatchResult<Bac
     
     // Build pending sprints with file paths
     let pendingSprints: (int * string * string) list = 
-        state.Backlog 
+        activeBacklog
         |> List.choose (fun (item, status, _) -> 
             match status with Done _ -> None | _ -> Some (item.Order, item.Name, item.FilePath))
     
@@ -809,8 +822,12 @@ let invokeArbiter (originalRequest: string) (showWin: bool) : DispatchResult<Bac
     Logging.info $"Arbiter: found {newSprintsFromDisk.Length} sprint files on disk"
     
     let newUncompletedSprints = 
+        let historicalPaths =
+            state.Backlog
+            |> List.choose (fun (item, _, _) -> if List.contains item.FilePath state.ActiveSprints then None else Some item.FilePath)
+            |> Set.ofList
         newSprintsFromDisk 
-        |> List.filter (fun s -> not (completedFilePaths.Contains s.FilePath))
+        |> List.filter (fun s -> not (completedFilePaths.Contains s.FilePath || historicalPaths.Contains s.FilePath))
     
     // Run cutter on new sprints only (completed ones already ran)
     let cutNewSprints = runCutter newUncompletedSprints showWin
@@ -839,7 +856,7 @@ let dispatchExit = function
         43
     | Retry _ -> 1
 
-let resumeCheckpoint request showWin =
+let rec resumeCheckpoint request showWin =
     try
         match SchedulerState.restore (not state.Backlog.IsEmpty) with
         | SchedulerState.Fresh -> None
@@ -853,11 +870,11 @@ let resumeCheckpoint request showWin =
                 saved.Backlog |> List.choose (fun (item, _, _) ->
                     if List.contains item.FilePath saved.ActiveSprints then Some item else None)
             let result = runWithLive sprints showWin request
-            Some (dispatchExit result)
+            Some (recover request showWin true saved.ArbiterAttempt result)
     with ex ->
         Some (dispatchExit (Fault $"Checkpoint dispatch refused: {ex.Message}"))
 
-let rec run request showWin autoApprove arbiterCount (ciFailureContext: string option) = 
+and run request showWin autoApprove arbiterCount (ciFailureContext: string option) =
     match resumeCheckpoint request showWin with
     | Some code -> code
     | None ->
@@ -968,27 +985,27 @@ let rec run request showWin autoApprove arbiterCount (ciFailureContext: string o
             sprintsResult <- cutSprints
             showPlan sprintsResult overview
             if autoApprove || AnsiConsole.Confirm("Execute? ", true) then
-                match runWithLive sprintsResult showWin request with
-                | Complete () -> 0
-                | Block blocked -> dispatchExit (Block blocked)
-                | Fault error -> dispatchExit (Fault error)
-                | Retry e ->
-                    match invokeArbiter request showWin with
-                    | Complete newSprints ->
-                        showPlan newSprints overview
-                        match runWithLive newSprints showWin request with
-                        | Complete () -> 0
-                        | Block blocked -> dispatchExit (Block blocked)
-                        | Fault error -> dispatchExit (Fault error)
-                        | Retry e2 ->
-                            state <- { state with ErrorLog = Some $"Arbiter recovery also failed: {e2}" }
-                            run request showWin autoApprove (arbiterCount + 1) None
-                    | Block blocked -> dispatchExit (Block blocked)
-                    | Fault error -> dispatchExit (Fault error)
-                    | Retry arbErr ->
-                        state <- { state with ErrorLog = Some $"Arbiter could not produce a valid plan" }
-                        run request showWin autoApprove (arbiterCount + 1) None
+                runWithLive sprintsResult showWin request
+                |> recover request showWin autoApprove arbiterCount
             else 0
+
+and recover request showWin autoApprove arbiterCount result =
+    match result with
+    | Retry _ when arbiterCount < Config.MaxArbiterAttempts ->
+        match invokeArbiter request showWin with
+        | Complete newSprints ->
+            showPlan newSprints state.PlanOverview
+            match runWithLive newSprints showWin request with
+            | Retry error ->
+                state <- { state with ErrorLog = Some $"Arbiter recovery also failed: {error}" }
+                run request showWin autoApprove (arbiterCount + 1) None
+            | terminal -> dispatchExit terminal
+        | Retry _ ->
+            state <- { state with ErrorLog = Some "Arbiter could not produce a valid plan" }
+            run request showWin autoApprove (arbiterCount + 1) None
+        | Block blocked -> dispatchExit (Block blocked)
+        | Fault error -> dispatchExit (Fault error)
+    | terminal -> dispatchExit terminal
 
 
 let runInteractive () = 
@@ -1000,6 +1017,10 @@ let runInteractive () =
 let requestFromArgs args =
     match args |> List.tryFindIndex ((=) "--request-file") with
     | Some index when index + 1 < args.Length ->
+        if args |> List.filter ((=) "--request-file") |> List.length <> 1
+           || (args |> List.mapi (fun i arg -> i, arg) |> List.exists (fun (i, arg) ->
+               i <> index + 1 && not (arg.StartsWith "--"))) then
+            failwith "--request-file cannot be repeated or combined with an inline request."
         let path = args[index + 1]
         if not (Path.IsPathFullyQualified path) || not (File.Exists path) then
             failwith $"Request file does not exist: {path}"

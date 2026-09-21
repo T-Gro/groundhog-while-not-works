@@ -8,8 +8,41 @@ open Utils
 open TypeDefinitions
 open BlockedProtocol
 
+// JSON's string encoder replaces isolated surrogates; preserve those rare raw logs verbatim.
+type private EvidenceStringConverter() =
+    inherit JsonConverter<string>()
+    override _.Read(reader, _, _) =
+        if reader.TokenType = JsonTokenType.String then reader.GetString()
+        else
+            use document = JsonDocument.ParseValue(&reader)
+            let root = document.RootElement
+            if root.ValueKind <> JsonValueKind.Object || Seq.length (root.EnumerateObject()) <> 1 then
+                raise (JsonException "Invalid raw evidence string.")
+            let bytes = root.GetProperty("utf16").GetBytesFromBase64()
+            if bytes.Length % 2 <> 0 then raise (JsonException "Invalid raw UTF-16 evidence.")
+            let chars = Array.zeroCreate<char> (bytes.Length / 2)
+            Buffer.BlockCopy(bytes, 0, chars, 0, bytes.Length)
+            String chars
+    override _.Write(writer, value, _) =
+        let malformed =
+            value |> Seq.mapi (fun index c ->
+                if Char.IsHighSurrogate c then index + 1 = value.Length || not (Char.IsLowSurrogate value[index + 1])
+                elif Char.IsLowSurrogate c then index = 0 || not (Char.IsHighSurrogate value[index - 1])
+                else false)
+            |> Seq.exists id
+        if not malformed then writer.WriteStringValue value
+        else
+            let bytes = Array.zeroCreate<byte> (value.Length * 2)
+            Buffer.BlockCopy(value.ToCharArray(), 0, bytes, 0, bytes.Length)
+            writer.WriteStartObject()
+            writer.WriteBase64String("utf16", ReadOnlySpan<byte> bytes)
+            writer.WriteEndObject()
+    override _.ReadAsPropertyName(reader, _, _) = reader.GetString()
+    override _.WriteAsPropertyName(writer, value, _) = writer.WritePropertyName value
+
 let private options =
     let options = JsonSerializerOptions()
+    options.Converters.Add(EvidenceStringConverter())
     options.Converters.Add(JsonFSharpConverter())
     options
 let private snapshotPath () = Path.Combine(Config.ralphDir, "scheduler-state.json")
