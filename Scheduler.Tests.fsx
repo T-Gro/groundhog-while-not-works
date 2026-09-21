@@ -20,6 +20,7 @@ let blockedOutput = """SUBTASK_BLOCKED {"reason":"Missing [owner] launch","retry
 let options = JsonSerializerOptions()
 options.Converters.Add(JsonFSharpConverter())
 dashboardDisabled <- true
+pushChanges <- fun () -> failwith "Blocked dispatch attempted publication"
 
 let setup partial =
     if Directory.Exists Config.ralphDir then Directory.Delete(Config.ralphDir, true)

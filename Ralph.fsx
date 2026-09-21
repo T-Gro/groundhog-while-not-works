@@ -105,6 +105,7 @@ let private runAgentCore (prompt: string) (title: string) (_showWindow: bool) (r
 }
 
 let mutable agentRunner = runAgentCore
+let mutable pushChanges = CIMonitor.runGitPush
 let runAgent prompt title showWindow resumeSessionId = agentRunner prompt title showWindow resumeSessionId
 
 /// Resume a previous session with a short clarifying question.
@@ -1049,7 +1050,7 @@ let rec runWithPush request showWin auto ciAttempt =
         let result = run request showWin auto 0 None
         if result = 0 then
             setMessage "[cyan]Pushing changes and monitoring CI...[/]"
-            match CIMonitor.runGitPush() with
+            match pushChanges() with
             | Ok _ ->
                 setMessage "[green]✓ Pushed successfully[/]"
                 let status = CIMonitor.pollCI setMessage 120 |> Async.RunSynchronously  // 2 hour timeout
@@ -1074,7 +1075,7 @@ and runWithCIContext request showWin auto ciAttempt ciOutput =
     let result = run request showWin auto 0 (Some ciOutput)
     if result = 0 then
         setMessage "[cyan]Pushing CI fixes...[/]"
-        match CIMonitor.runGitPush() with
+        match pushChanges() with
         | Ok _ ->
             setMessage "[green]✓ Pushed fixes[/]"
             let status = CIMonitor.pollCI setMessage 120 |> Async.RunSynchronously

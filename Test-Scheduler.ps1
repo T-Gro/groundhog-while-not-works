@@ -25,6 +25,7 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Cannot prepare fixture repository' }
     $psi = [Diagnostics.ProcessStartInfo]::new('dotnet')
     $psi.UseShellExecute = $false
+    $psi.WorkingDirectory = $env:RALPH_WORK_DIR
     foreach ($argument in @('fsi', (Join-Path $PSScriptRoot 'Scheduler.Tests.fsx'), '--', '--fixture')) {
         $psi.ArgumentList.Add($argument)
     }
