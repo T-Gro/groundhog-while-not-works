@@ -84,6 +84,8 @@ resumes use the same bounded arbiter recovery as fresh execution; unrelated
 historical sprints are not reactivated by an arbiter.
 Ordinary arbiter transport exceptions remain ordinary failures (exit **1**) after
 resume, rather than being misreported as checkpoint faults (exit **43**).
+Typed checkpoint faults during resumed execution, including a denied final
+checkpoint write, still return **43** and retain the last persisted journal.
 An interrupted consumed resume fails closed. Deploy both repositories together:
 already-running scripts do not reload source.
 
@@ -95,7 +97,8 @@ injected agents, bounded subprocesses, no model calls or publication):
 ```
 
 The runner checks real FSI exit statuses 0/1/42/43, exact long-request transport,
-one-shot resume and replay denial, fresh/resumed arbiter exceptions, raw prompt/history
+one-shot resume and replay denial, fresh/resumed arbiter exceptions, resumed
+checkpoint-finalization faults, raw prompt/history
 boundaries, and marker/virtual-clock timeout cleanup without disturbing an independent
 sentinel or the launcher.
 

@@ -54,8 +54,13 @@ try {
             if ($Arguments[0] -eq '--recovery-exit-case') {
                 $case = $Arguments[1]
                 if (-not $stdout.Result.Contains("PASS recovery exit fixture ${case}:")) { throw 'Recovery exit assertions did not complete' }
-                if ($case -ne 'replay' -and -not $stderr.Result.Contains('injected ordinary arbiter transport failure')) {
+                if ($case -in @('fresh', 'resumed') -and -not $stderr.Result.Contains('injected ordinary arbiter transport failure')) {
                     throw 'Ordinary arbiter exception was not propagated'
+                }
+                if ($case -eq 'checkpoint-fault' -and (-not $stdout.Result.Contains('PASS checkpoint finalization fault:') -or
+                    -not $stderr.Result.Contains('Cannot persist scheduler checkpoint:') -or
+                    -not $stderr.Result.Contains('scheduler-state.json.new'))) {
+                    throw 'Checkpoint finalization fault was not propagated'
                 }
             }
             if ($launcher.StartTime -ne $launcherStart) { throw 'Launcher identity changed' }
@@ -68,7 +73,7 @@ try {
     foreach ($case in @(@('complete', 0), @('failure', 1), @('blocked', 42), @('fault', 43))) {
         Invoke-Fixture @('--exit-case', $case[0]) $case[1]
     }
-    foreach ($case in @(@('fresh', 1), @('resumed', 1), @('replay', 43))) {
+    foreach ($case in @(@('fresh', 1), @('resumed', 1), @('replay', 43), @('checkpoint-fault', 43))) {
         Invoke-Fixture @('--recovery-exit-case', $case[0]) $case[1]
     }
     $request = ('{ "quoted": "žluťoučký 🦔 日本語" }' + "`r`n") * 1500 + "`n"

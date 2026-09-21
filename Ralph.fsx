@@ -872,8 +872,11 @@ let rec resumeCheckpoint request showWin =
         let sprints =
             saved.Backlog |> List.choose (fun (item, _, _) ->
                 if List.contains item.FilePath saved.ActiveSprints then Some item else None)
-        let result = runWithLive sprints showWin request
-        Some (recover request showWin true saved.ArbiterAttempt result)
+        try
+            let result = runWithLive sprints showWin request
+            Some (recover request showWin true saved.ArbiterAttempt result)
+        with SchedulerState.CheckpointFault error ->
+            Some (dispatchExit (Fault error))
 
 and run request showWin autoApprove arbiterCount (ciFailureContext: string option) =
     match resumeCheckpoint request showWin with
