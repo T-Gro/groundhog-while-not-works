@@ -80,12 +80,18 @@ for partial in [false; true] do
         equal checkpoint (BlockedProtocol.checkpoint Config.workDir Config.ralphDir)
         printfn "PASS blocked partial=%b malformed=%b; one implementer, zero downstream effects" partial (output <> blockedOutput)
 
-for success in [false; true] do
+for output in [
+    "SUBTASK_INCOMPLETE"
+    "SUBTASK_COMPLETE"
+    "Implemented SUBTASK_BLOCKED support.\nSUBTASK_COMPLETE"
+    "\"SUBTASK_BLOCKED\" is a documented token.\nSUBTASK_COMPLETE"
+] do
+    let success = output <> "SUBTASK_INCOMPLETE"
     let item = setup false
     let mutable calls = 0
     agentRunner <- fun _ _ _ _ -> async {
         calls <- calls + 1
-        return (if success then "SUBTASK_COMPLETE" else "SUBTASK_INCOMPLETE"), "fixture"
+        return output, "fixture"
     }
     match runAllBacklogItems [item] false |> Async.RunSynchronously with
     | Complete () when success -> equal 1 calls

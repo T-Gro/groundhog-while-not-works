@@ -31,10 +31,10 @@ let private issue () =
         | _ -> failwith "Invalid RALPH_ISSUE_NUMBER."
 
 let blockRequest (output: string) =
-    if not (output.Contains("SUBTASK_BLOCKED", StringComparison.OrdinalIgnoreCase)) then None
+    let lines = output.Split('\n') |> Array.filter (fun line -> line.TrimStart().StartsWith("SUBTASK_BLOCKED", StringComparison.OrdinalIgnoreCase))
+    if lines.Length = 0 then None
     else
         let invalid = "Invalid or contradictory SUBTASK_BLOCKED request; owner must inspect the retained attempt."
-        let lines = output.Split('\n') |> Array.filter (fun line -> line.TrimStart().StartsWith("SUBTASK_BLOCKED", StringComparison.Ordinal))
         try
             if lines.Length <> 1 || XmlHelpers.hasSignalAny "SUBTASK_COMPLETE" output
                || XmlHelpers.hasSignalAny "SUBTASK_INCOMPLETE" output then Some invalid
