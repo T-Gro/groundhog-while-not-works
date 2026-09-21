@@ -438,7 +438,9 @@ regression "fresh retries stop at the arbiter limit" (fun () ->
     equal Config.MaxArbiterAttempts arbiters
     equal (2 * Config.ArbiterThreshold * Config.MaxArbiterAttempts) implementers)
 
-let resumeFixture retry exhaust =
+let arbiterFailureMessage = "injected ordinary arbiter transport failure"
+
+let resumeFixture retry exhaust arbiterFailure =
     let item = setup true
     let abandoned = { item with Order = 0; Name = "Abandoned"; FilePath = Path.Combine(Config.sprintsDir, "00_Abandoned.md") }
     File.WriteAllText(abandoned.FilePath, "Historical plan, not active")
@@ -495,6 +497,7 @@ let resumeFixture retry exhaust =
             let output =
                 if title = "Arbiter" then
                     arbiters <- arbiters + 1
+                    if arbiterFailure then failwith arbiterFailureMessage
                     let recovery = Path.Combine(Config.sprintsDir, "03_Recovery.md")
                     File.Delete item.FilePath
                     File.WriteAllText(recovery, "# Recovery\n\n## Definition of Done\n- Recovered\n")
@@ -505,22 +508,38 @@ let resumeFixture retry exhaust =
                 else "VERIFY_PASSED"
             return output, "fixture"
         }
-        equal (if exhaust then 1 else 0) (run "resume" false true 0 None)
-        equal (if exhaust then "Implement-2" :: List.replicate Config.ArbiterThreshold "Implement-3"
+        let code, failure =
+            try run "resume" false true 0 None, None
+            with ex when arbiterFailure && ex.Message = arbiterFailureMessage -> 1, Some ex
+        if not arbiterFailure then equal (if exhaust then 1 else 0) code
+        equal (if arbiterFailure then ["Implement-2"]
+               elif exhaust then "Implement-2" :: List.replicate Config.ArbiterThreshold "Implement-3"
                elif retry then ["Implement-2"; "Implement-3"] else ["Implement-2"]) implementers
         equal (if retry then 1 else 0) arbiters
-        if not retry then equal checkpoint (BlockedProtocol.checkpoint Config.workDir Config.ralphDir)
+        if not retry || arbiterFailure then equal checkpoint (BlockedProtocol.checkpoint Config.workDir Config.ralphDir)
         equal snapshot (File.ReadAllText(Path.Combine(Config.ralphDir, $"scheduler-state-{block.BlockId}.json")))
         let _, _, resumedTiming = state.Backlog |> List.find (fun (sprint, _, _) -> sprint.FilePath = item.FilePath)
         equal (Config.ArbiterThreshold + 1) resumedTiming.IterationHistory.Length
         equal Config.ArbiterThreshold (List.last resumedTiming.IterationHistory).Iteration
         equal true (state.Backlog |> List.exists (fun (sprint, status, _) -> sprint = abandoned && status = Running(Implement, 1)))
         equal true (state.Backlog |> List.exists (fun (_, status, timing) -> status = Done 1 && timing.Summary = Some "Original completed history"))
-        File.Copy(Path.Combine(Config.ralphDir, $"resume-used-{block.BlockId}.json"), Path.Combine(Config.ralphDir, "resume-launch.json"))
+        let usedClaim = Path.Combine(Config.ralphDir, $"resume-used-{block.BlockId}.json")
+        equal false (File.Exists(Path.Combine(Config.ralphDir, "resume-launch.json")))
+        equal false (File.Exists(Path.Combine(Config.ralphDir, "blocked.json")))
+        let retainedPath =
+            let active = Path.Combine(Config.ralphDir, "scheduler-state.json")
+            if File.Exists active then active else Path.Combine(Config.ralphDir, "completed-state.json")
+        let retainedSnapshot = File.ReadAllText retainedPath
+        let retainedClaim = File.ReadAllText usedClaim
+        File.Copy(usedClaim, Path.Combine(Config.ralphDir, "resume-launch.json"))
         state <- emptyState
         agentRunner <- fun _ _ _ _ -> failwith "Replayed resume must not dispatch"
-        equal 43 (run "duplicate resume" false true 0 None)
+        let replayCode = run "duplicate resume" false true 0 None
+        equal 43 replayCode
+        equal retainedClaim (File.ReadAllText usedClaim)
+        equal retainedSnapshot (File.ReadAllText retainedPath)
         printfn "PASS authenticated scheduler resume retry=%b once at final retry; active plan/history/source preserved; replay refused" retry
+        code, failure, replayCode
     finally
         Environment.SetEnvironmentVariable("RALPH_ISSUE_NUMBER", previousIssue)
         Environment.SetEnvironmentVariable("RALPH_LAUNCH_FILE", previousLaunch)
@@ -530,7 +549,40 @@ let resumeFixture retry exhaust =
                 proc.WaitForExit 10000 |> ignore
 
 for retry, exhaust in [false, false; true, false; true, true] do
-    regression $"authenticated resume retry={retry} exhaust={exhaust}" (fun () -> resumeFixture retry exhaust)
+    regression $"authenticated resume retry={retry} exhaust={exhaust}" (fun () -> resumeFixture retry exhaust false |> ignore)
 
 if not regressionFailures.IsEmpty then failwith ("Regression failures: " + String.concat ", " regressionFailures)
 printfn "Scheduler fixtures passed."
+
+match fixtureArgs |> List.tryFindIndex ((=) "--recovery-exit-case") with
+| Some index ->
+    match fixtureArgs[index + 1] with
+    | "fresh" ->
+        setup false |> ignore
+        let mutable implementers, arbiters = 0, 0
+        agentRunner <- fun _ title _ _ -> async {
+            if title = "Architect" then
+                File.WriteAllText(Path.Combine(Config.sprintsDir, "02_Retry.md"), "# Retry\n\n## Definition of Done\n- Pass\n")
+            elif title = "Arbiter" then
+                arbiters <- arbiters + 1
+                failwith arbiterFailureMessage
+            elif title.StartsWith "Implement-" then implementers <- implementers + 1
+            return (if title.StartsWith "Implement-" then "SUBTASK_INCOMPLETE" else "ARBITER_COMPLETE"), "fixture"
+        }
+        let code =
+            try run "fresh arbiter failure" false true 0 None
+            finally
+                equal Config.ArbiterThreshold implementers
+                equal 1 arbiters
+                equal true (File.Exists(Path.Combine(Config.ralphDir, "scheduler-state.json")))
+                equal false (File.Exists(Path.Combine(Config.ralphDir, "blocked.json")))
+                printfn "PASS recovery exit fixture fresh: journal retained, one arbiter"
+        exit code
+    | "resumed" | "replay" as mode ->
+        let code, failure, replayCode = resumeFixture true false (mode = "resumed")
+        printfn "PASS recovery exit fixture %s: checkpoint/history retained, one claim consumed, replay refused" mode
+        match failure with
+        | Some error -> raise error
+        | None -> exit (if mode = "replay" then replayCode else code)
+    | mode -> failwith $"Unknown recovery exit fixture: {mode}"
+| None -> ()

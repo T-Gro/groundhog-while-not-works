@@ -51,6 +51,13 @@ try {
             Write-Output $stderr.GetAwaiter().GetResult()
             Write-Output "SUBPROCESS pid=$($process.Id) actual=$($process.ExitCode) expected=$ExpectedExit"
             if ($process.ExitCode -ne $ExpectedExit) { throw "Scheduler fixtures exited $($process.ExitCode), expected $ExpectedExit" }
+            if ($Arguments[0] -eq '--recovery-exit-case') {
+                $case = $Arguments[1]
+                if (-not $stdout.Result.Contains("PASS recovery exit fixture ${case}:")) { throw 'Recovery exit assertions did not complete' }
+                if ($case -ne 'replay' -and -not $stderr.Result.Contains('injected ordinary arbiter transport failure')) {
+                    throw 'Ordinary arbiter exception was not propagated'
+                }
+            }
             if ($launcher.StartTime -ne $launcherStart) { throw 'Launcher identity changed' }
         } finally {
             if (-not $process.HasExited) { $process.Kill($true); $process.WaitForExit() }
@@ -60,6 +67,9 @@ try {
     Invoke-Fixture @() 0
     foreach ($case in @(@('complete', 0), @('failure', 1), @('blocked', 42), @('fault', 43))) {
         Invoke-Fixture @('--exit-case', $case[0]) $case[1]
+    }
+    foreach ($case in @(@('fresh', 1), @('resumed', 1), @('replay', 43))) {
+        Invoke-Fixture @('--recovery-exit-case', $case[0]) $case[1]
     }
     $request = ('{ "quoted": "žluťoučký 🦔 日本語" }' + "`r`n") * 1500 + "`n"
     $requestPath = Join-Path $root 'long request 日本語.txt'

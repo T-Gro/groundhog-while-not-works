@@ -82,6 +82,8 @@ The enrolled child must be a live descendant of the live executor, and Ralph mus
 be that child or its descendant (including `dotnet` → FSI wrappers). Authenticated
 resumes use the same bounded arbiter recovery as fresh execution; unrelated
 historical sprints are not reactivated by an arbiter.
+Ordinary arbiter transport exceptions remain ordinary failures (exit **1**) after
+resume, rather than being misreported as checkpoint faults (exit **43**).
 An interrupted consumed resume fails closed. Deploy both repositories together:
 already-running scripts do not reload source.
 
@@ -93,8 +95,9 @@ injected agents, bounded subprocesses, no model calls or publication):
 ```
 
 The runner checks real FSI exit statuses 0/1/42/43, exact long-request transport,
-one-shot resume, raw prompt/history boundaries, and marker/virtual-clock timeout
-cleanup without disturbing an independent sentinel or the launcher.
+one-shot resume and replay denial, fresh/resumed arbiter exceptions, raw prompt/history
+boundaries, and marker/virtual-clock timeout cleanup without disturbing an independent
+sentinel or the launcher.
 
 ## License
 

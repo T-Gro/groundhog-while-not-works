@@ -857,22 +857,23 @@ let dispatchExit = function
     | Retry _ -> 1
 
 let rec resumeCheckpoint request showWin =
-    try
-        match SchedulerState.restore (not state.Backlog.IsEmpty) with
-        | SchedulerState.Fresh -> None
-        | SchedulerState.Finished saved ->
-            state <- saved
-            None
-        | SchedulerState.Paused blocked -> Some (Block blocked |> dispatchExit)
-        | SchedulerState.Resumed saved ->
-            state <- saved
-            let sprints =
-                saved.Backlog |> List.choose (fun (item, _, _) ->
-                    if List.contains item.FilePath saved.ActiveSprints then Some item else None)
-            let result = runWithLive sprints showWin request
-            Some (recover request showWin true saved.ArbiterAttempt result)
-    with ex ->
-        Some (dispatchExit (Fault $"Checkpoint dispatch refused: {ex.Message}"))
+    let restored =
+        try Ok (SchedulerState.restore (not state.Backlog.IsEmpty))
+        with ex -> Error $"Checkpoint dispatch refused: {ex.Message}"
+    match restored with
+    | Error error -> Some (dispatchExit (Fault error))
+    | Ok SchedulerState.Fresh -> None
+    | Ok (SchedulerState.Finished saved) ->
+        state <- saved
+        None
+    | Ok (SchedulerState.Paused blocked) -> Some (Block blocked |> dispatchExit)
+    | Ok (SchedulerState.Resumed saved) ->
+        state <- saved
+        let sprints =
+            saved.Backlog |> List.choose (fun (item, _, _) ->
+                if List.contains item.FilePath saved.ActiveSprints then Some item else None)
+        let result = runWithLive sprints showWin request
+        Some (recover request showWin true saved.ArbiterAttempt result)
 
 and run request showWin autoApprove arbiterCount (ciFailureContext: string option) =
     match resumeCheckpoint request showWin with
