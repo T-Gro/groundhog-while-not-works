@@ -22,6 +22,13 @@ options.Converters.Add(JsonFSharpConverter())
 dashboardDisabled <- true
 pushChanges <- fun () -> failwith "Blocked dispatch attempted publication"
 
+let xmlWithTerminalControl = XmlHelpers.xt "log" "before\u001b[31mafter"
+let serializedXml = xmlWithTerminalControl.ToString()
+equal false (serializedXml.Contains('\u001b'))
+equal true (serializedXml.Contains("before"))
+equal true (serializedXml.Contains("after"))
+printfn "PASS terminal control characters are sanitized before XML serialization"
+
 let setup partial =
     if Directory.Exists Config.ralphDir then Directory.Delete(Config.ralphDir, true)
     Directory.CreateDirectory Config.sprintsDir |> ignore

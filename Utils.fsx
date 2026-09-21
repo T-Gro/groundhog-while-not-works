@@ -75,11 +75,22 @@ module Config =
     let templateFile = Path.Combine(scriptDir, "templates", "SPRINT_TEMPLATE.md")
 
 module XmlHelpers =
+    let sanitizeXmlText (text: string) =
+        if isNull text then ""
+        else
+            text
+            |> Seq.map (fun c ->
+                if c = '\t' || c = '\n' || c = '\r'
+                   || (c >= '\u0020' && c <> '\uFFFE' && c <> '\uFFFF') then c
+                else '\uFFFD')
+            |> Seq.toArray
+            |> String
+
     let xe name (attrs: (string * string) list) (children: XElement list) text : XElement =
         let el = XElement(XName.Get name)
-        for (k, v) in attrs do el.Add(XAttribute(XName.Get k, v))
+        for (k, v) in attrs do el.Add(XAttribute(XName.Get k, sanitizeXmlText v))
         for c in children do el.Add(c)
-        if not (String.IsNullOrEmpty text) then el.Add(text)
+        if not (String.IsNullOrEmpty text) then el.Add(sanitizeXmlText text)
         el
 
     let x   name                = xe name [] [] ""
