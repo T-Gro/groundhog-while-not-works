@@ -29,6 +29,15 @@ equal true (serializedXml.Contains("before"))
 equal true (serializedXml.Contains("after"))
 printfn "PASS terminal control characters are sanitized before XML serialization"
 
+Directory.CreateDirectory Config.ralphDir |> ignore
+let restartStatePath = Path.Combine(Config.ralphDir, "scheduler-state.json")
+if File.Exists restartStatePath then File.Delete restartStatePath
+equal false (shouldResumeBeforeRestart ())
+File.WriteAllText(restartStatePath, "{}")
+equal true (shouldResumeBeforeRestart ())
+File.Delete restartStatePath
+printfn "PASS explicit restart bypasses missing scheduler state"
+
 let setup partial =
     if Directory.Exists Config.ralphDir then Directory.Delete(Config.ralphDir, true)
     Directory.CreateDirectory Config.sprintsDir |> ignore

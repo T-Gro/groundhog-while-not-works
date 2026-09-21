@@ -998,8 +998,11 @@ let runInteractive () =
     run request showWin false 0 None
 
 /// Restart: Learn from previous failed run and create new plan
+let shouldResumeBeforeRestart () =
+    File.Exists(Path.Combine(Config.ralphDir, "scheduler-state.json"))
+
 let runRestart (request: string) showWin autoApprove =
-    match resumeCheckpoint request showWin with
+    match if shouldResumeBeforeRestart () then resumeCheckpoint request showWin else None with
     | Some code -> code
     | None ->
     AnsiConsole.Write(FigletText("RESTART").Color(Color.Yellow))
