@@ -120,6 +120,12 @@ let pendingBlock () =
 
 type Restore = Fresh | Finished of State | Paused of BlockRecord | Resumed of State
 
+let private readSnapshot () =
+    let saved = JsonSerializer.Deserialize<State>(File.ReadAllText(snapshotPath ()), options)
+    if obj.ReferenceEquals(saved, null) || saved.Backlog.IsEmpty then
+        failwith "Retained scheduler snapshot is empty."
+    saved
+
 let restore allowPlanning =
     match pendingBlock () with
     | Some block ->
@@ -149,6 +155,18 @@ let restore allowPlanning =
         elif not (Prompting.SprintFiles.listSprints().IsEmpty) then
             failwith "Retained sprint files have no scheduler state; explicit recovery is required."
         else Fresh
+
+let restoreExplicitRestart () =
+    match pendingBlock () with
+    | Some _ -> restore false
+    | None when exists (Path.Combine(Config.ralphDir, "resume-launch.json")) ->
+        failwith "Retained sprint state has an unauthenticated resume launch."
+    | None when exists (snapshotPath ()) ->
+        let saved = readSnapshot ()
+        if saved.CurrentPhase = "Complete" then
+            failwith "Completed scheduler state cannot be restarted."
+        Resumed saved
+    | None -> restore false
 
 let archiveCompleted () =
     let path = snapshotPath ()

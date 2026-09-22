@@ -856,9 +856,11 @@ let dispatchExit = function
         43
     | Retry _ -> 1
 
-let rec resumeCheckpoint request showWin =
+let rec resumeCheckpoint request showWin explicitRestart =
     let restored =
-        try Ok (SchedulerState.restore (not state.Backlog.IsEmpty))
+        try
+            if explicitRestart then Ok (SchedulerState.restoreExplicitRestart ())
+            else Ok (SchedulerState.restore (not state.Backlog.IsEmpty))
         with ex -> Error $"Checkpoint dispatch refused: {ex.Message}"
     match restored with
     | Error error -> Some (dispatchExit (Fault error))
@@ -879,7 +881,7 @@ let rec resumeCheckpoint request showWin =
             Some (dispatchExit (Fault error))
 
 and run request showWin autoApprove arbiterCount (ciFailureContext: string option) =
-    match resumeCheckpoint request showWin with
+    match resumeCheckpoint request showWin false with
     | Some code -> code
     | None ->
     Logging.info $"run() called: arbiterCount={arbiterCount}, autoApprove={autoApprove}"
@@ -1037,7 +1039,7 @@ let shouldResumeBeforeRestart () =
     File.Exists(Path.Combine(Config.ralphDir, "scheduler-state.json"))
 
 let runRestart (request: string) showWin autoApprove =
-    match if shouldResumeBeforeRestart () then resumeCheckpoint request showWin else None with
+    match if shouldResumeBeforeRestart () then resumeCheckpoint request showWin true else None with
     | Some code -> code
     | None ->
     AnsiConsole.Write(FigletText("RESTART").Color(Color.Yellow))

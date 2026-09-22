@@ -97,6 +97,14 @@ let setup partial =
     state <- { emptyState with Backlog = (if partial then [completed, Done 1, timing] else []) @ [item, Todo, emptyTiming] }
     item
 
+regression "explicit restart restores ordinary scheduler state" (fun () ->
+    let item = setup false
+    state <- { state with CurrentPhase = "Executing"; ActiveSprints = [item.FilePath] }
+    SchedulerState.save state
+    match SchedulerState.restoreExplicitRestart () with
+    | SchedulerState.Resumed saved -> equal state saved
+    | restored -> failwith $"Expected resumed state, got {restored}")
+
 match fixtureArgs |> List.tryFindIndex ((=) "--exit-case") with
 | Some index ->
     let mode = fixtureArgs[index + 1]
@@ -133,7 +141,7 @@ regression "durable raw UTF-16 history roundtrip" (fun () ->
     SchedulerState.save state
     SchedulerState.archiveCompleted ()
     state <- emptyState
-    equal None (resumeCheckpoint "load raw evidence" false)
+    equal None (resumeCheckpoint "load raw evidence" false false)
     equal [record] (getItemTiming item.FilePath |> Option.get).IterationHistory)
 
 for kind in ["corrective"; "arbiter"] do
@@ -369,7 +377,7 @@ equal (Complete ()) (runWithLive [completedItem] false "fixture")
 let completedHistory = state.Backlog
 state <- emptyState
 agentRunner <- fun _ _ _ _ -> failwith "Loading completed history must not invoke an agent"
-equal None (resumeCheckpoint "next CI iteration" false)
+equal None (resumeCheckpoint "next CI iteration" false false)
 equal completedHistory state.Backlog
 printfn "PASS completed dispatch permits ordinary continuation without losing history"
 
