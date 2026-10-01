@@ -141,7 +141,10 @@ regression "durable raw UTF-16 history roundtrip" (fun () ->
     SchedulerState.save state
     SchedulerState.archiveCompleted ()
     state <- emptyState
-    equal None (resumeCheckpoint "load raw evidence" false false)
+    equal (Some 43) (resumeCheckpoint "load raw evidence" false false)
+    match SchedulerState.restore false with
+    | SchedulerState.Finished saved -> state <- saved
+    | restored -> failwith $"Expected completed raw evidence, got {restored}"
     equal [record] (getItemTiming item.FilePath |> Option.get).IterationHistory)
 
 for kind in ["corrective"; "arbiter"] do
@@ -377,9 +380,9 @@ equal (Complete ()) (runWithLive [completedItem] false "fixture")
 let completedHistory = state.Backlog
 state <- emptyState
 agentRunner <- fun _ _ _ _ -> failwith "Loading completed history must not invoke an agent"
-equal None (resumeCheckpoint "next CI iteration" false false)
+equal (Some 0) (resumeCheckpoint "completed checkpoint" false false)
 equal completedHistory state.Backlog
-printfn "PASS completed dispatch permits ordinary continuation without losing history"
+printfn "PASS completed dispatch terminates successfully without losing history"
 
 let item = setup true
 let mutable afterBlock = false

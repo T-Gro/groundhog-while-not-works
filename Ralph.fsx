@@ -859,15 +859,33 @@ let dispatchExit = function
 let rec resumeCheckpoint request showWin explicitRestart =
     let restored =
         try
-            if explicitRestart then Ok (SchedulerState.restoreExplicitRestart ())
-            else Ok (SchedulerState.restore (not state.Backlog.IsEmpty))
+            let restored =
+                if explicitRestart then SchedulerState.restoreExplicitRestart ()
+                else SchedulerState.restore (not state.Backlog.IsEmpty)
+            match restored with
+            | SchedulerState.Finished saved ->
+                if saved.Backlog.IsEmpty
+                   || (saved.Backlog |> List.exists (fun (_, status, _) ->
+                       match status with Done iterations when iterations > 0 -> false | _ -> true)) then
+                    raise (SchedulerState.CheckpointFault "Completed checkpoint requires a nonempty, finished backlog with positive iteration counts.")
+                let requiredVerifiers = Verifiers.listAll ()
+                if requiredVerifiers.IsEmpty
+                   || (requiredVerifiers |> List.exists (fun name ->
+                       match saved.FinalVerifierResults.TryFind name with
+                       | Some (Passed iterations) when iterations > 0 -> false
+                       | _ -> true)) then
+                    raise (SchedulerState.CheckpointFault "Completed checkpoint requires passing results with positive iteration counts for every final verifier.")
+                if saved.AgentStartTime.IsSome || saved.CurrentAgentTask <> "" || saved.ErrorLog.IsSome then
+                    raise (SchedulerState.CheckpointFault "Completed checkpoint contains unfinished agent or error state.")
+            | _ -> ()
+            Ok restored
         with ex -> Error $"Checkpoint dispatch refused: {ex.Message}"
     match restored with
     | Error error -> Some (dispatchExit (Fault error))
     | Ok SchedulerState.Fresh -> None
     | Ok (SchedulerState.Finished saved) ->
         state <- saved
-        None
+        Some (dispatchExit (Complete ()))
     | Ok (SchedulerState.Paused blocked) -> Some (Block blocked |> dispatchExit)
     | Ok (SchedulerState.Resumed saved) ->
         state <- saved
