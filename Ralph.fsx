@@ -73,7 +73,7 @@ let private runAgentCore (prompt: string) (title: string) (_showWindow: bool) (r
             match resumeSessionId with
             | None   -> [| "--name"; sessionName |]
             | Some n -> [| $"--resume={n}" |]
-        let baseArgs = Array.append [| "--allow-all-tools"; "--allow-all-paths"; "--no-ask-user";"--no-color";"--plain-diff";"-s";"--model"; Config.Model; "--effort"; Config.Effort; "--context"; Config.Context; "--stream"; "off" |] sessionArgs
+        let baseArgs = Array.append [| "--allow-all-tools"; "--allow-all-paths"; "--no-ask-user"; "--disable-builtin-mcps"; "--no-color";"--plain-diff";"-s";"--model"; Config.Model; "--effort"; Config.Effort; "--context"; Config.Context; "--output-format"; "json"; "--stream"; "off" |] sessionArgs
 
         let request =
             prompt
@@ -87,13 +87,14 @@ let private runAgentCore (prompt: string) (title: string) (_showWindow: bool) (r
         psi.RedirectStandardOutput <- true
         psi.RedirectStandardError <- true
         use proc = startAgentProcess psi
-        let stdout = System.Text.StringBuilder()
+        let transport = AgentTransport.Output()
         let stderr = System.Text.StringBuilder()
         use completed = new Threading.ManualResetEventSlim(false)
         proc.OutputDataReceived.Add(fun args ->
             if not (isNull args.Data) then
-                lock stdout (fun () -> stdout.AppendLine(args.Data) |> ignore)
-                if args.Data.Trim() = completionMarker then completed.Set())
+                lock transport (fun () ->
+                    transport.AddLine args.Data
+                    if transport.IsFinished then completed.Set()))
         proc.ErrorDataReceived.Add(fun args ->
             if not (isNull args.Data) then lock stderr (fun () -> stderr.AppendLine(args.Data) |> ignore))
         proc.BeginOutputReadLine()
@@ -105,9 +106,9 @@ let private runAgentCore (prompt: string) (title: string) (_showWindow: bool) (r
         while not proc.HasExited && not completed.IsSet && agentUtcNow () < deadline do
             completed.Wait(TimeSpan.FromSeconds 1.) |> ignore
 
-        let completedEarly = completed.IsSet && not proc.HasExited
+        let completedEarly = completed.IsSet && not (proc.WaitForExit 1000)
         if completedEarly then
-            Logging.info $"Agent {title} emitted the completion marker; stopping its lingering process."
+            Logging.info $"Agent {title} finished JSONL transport; stopping its lingering process."
             proc.Kill(true)
         elif not proc.HasExited then
             proc.Kill(true)
@@ -115,13 +116,12 @@ let private runAgentCore (prompt: string) (title: string) (_showWindow: bool) (r
             failwith $"Agent {title} exceeded the {Config.AgentTimeoutMinutes}-minute timeout."
 
         proc.WaitForExit()
-        output <- lock stdout (fun () -> stdout.ToString().Trim())
-        Logging.info $"Agent {title} completed, output length: {output.Length}"
-
         if not completedEarly && proc.ExitCode <> 0 then
             let err = lock stderr (fun () -> stderr.ToString().Trim())
             let errorText = if err = "" then "(no error text)" else err
             failwith $"Agent {title} exited with code {proc.ExitCode}: {errorText}"
+        output <- lock transport (fun () -> transport.GetOutput())
+        Logging.info $"Agent {title} completed, output length: {output.Length}"
     with ex ->
         Logging.exn ex $"runAgent({title})"
         exn <- Some ex
@@ -190,19 +190,28 @@ let verifyStage showWin sprintFilePath (verifierName: string) (sprintItem: Backl
     setMessage $"Verifying {verifierName}..."
     
     let timing = getItemTiming sprintFilePath |> Option.defaultValue emptyTiming
-    let approvedCommits = timing.ApprovedCommits
     let currentCommit = Git.getHeadCommit()
+    let cleanAtStart = Git.isWorktreeClean()
+    let approvedCommits =
+        match cleanAtStart, currentCommit with
+        | true, Some head -> timing.ApprovedCommits |> Map.filter (fun _ commit -> Git.isApprovalAncestor head commit)
+        | _ -> Map.empty
+    if approvedCommits.Count <> timing.ApprovedCommits.Count then
+        Logging.info "Legacy or foreign approval hashes are retained in history but excluded from incremental verification."
     let sprintContext = buildSprintVerificationContext sprintItem approvedCommits currentCommit verifierName
     let prompt = verifierPreamble + Verifiers.getPrompt verifierName + sprintContext + verifierSuffix
     let! (out, sessionId) = runAgent prompt $"Verify-{verifierName}" showWin None
-    let! outcome = interpretAndDisambiguate out sessionId verifierName
+    let! reported = interpretAndDisambiguate out sessionId verifierName
+    let outcome =
+        if Git.getHeadCommit() = currentCommit then reported
+        else VFailed "The target HEAD changed during verification. Recheck the current commit; no approval was recorded."
     
     match outcome with
     | VPassed summary ->
         state <- { state with LastVerifierLog = Some (sprintItem.Order, verifierName, true, summary) }
         addVerifierResultToLastIteration sprintFilePath verifierName true summary
         setMessage $"[green]✓ {verifierName} passed[/]"
-        return Ok ()
+        return Ok (if cleanAtStart && Git.isWorktreeClean() then currentCommit else None)
     | VFailed summary | VInconclusive summary ->
         state <- { state with LastVerifierLog = Some (sprintItem.Order, verifierName, false, summary) }
         addVerifierResultToLastIteration sprintFilePath verifierName false summary
@@ -210,20 +219,18 @@ let verifyStage showWin sprintFilePath (verifierName: string) (sprintItem: Backl
         return Error $"{verifierName}: {summary}"
 }
 
-let updateVerifierStatus sprintFilePath (verifierName: string) (passed: bool) =
+let updateVerifierStatus sprintFilePath (verifierName: string) (passed: bool) verifiedCommit =
     updateTiming sprintFilePath (fun t -> 
         let prevCount = 
             match t.VerifierResults.TryFind verifierName with
             | Some (Passed n) | Some (Failed n) -> n
             | _ -> 0
         let newStatus = if passed then Passed (prevCount + 1) else Failed (prevCount + 1)
-        // Capture commit hash when verifier passes (for incremental verification)
         let approvedCommits = 
-            if passed then
-                match Git.getHeadCommit() with
-                | Some commit -> t.ApprovedCommits.Add(verifierName, commit)
-                | None -> t.ApprovedCommits
-            else t.ApprovedCommits
+            match passed, verifiedCommit with
+            | true, Some commit when Git.getHeadCommit() = Some commit && Git.isWorktreeClean() -> t.ApprovedCommits.Add(verifierName, commit)
+            | true, Some _ -> invalidOp "The target HEAD or working tree changed before approval persistence."
+            | _ -> t.ApprovedCommits
         { t with VerifierResults = t.VerifierResults.Add(verifierName, newStatus); ApprovedCommits = approvedCommits })
     liveCtx |> Option.iter (fun ctx -> ctx.Refresh())
 
@@ -239,16 +246,16 @@ let runAllVerifiers showWin sprintFilePath (sprintItem: BacklogItem) = async {
     // Mark skipped verifiers in timing state
     let skippedVerifiers = allVerifiers |> List.filter (fun v -> not (activeVerifiers |> List.contains v))
     for name in skippedVerifiers do
-        updateVerifierStatus sprintFilePath name true  // count as pass for display
+        updateVerifierStatus sprintFilePath name true None  // Display only; skipped checks do not approve a commit.
     
     let mutable allPassed = true
     
     for name in activeVerifiers do
         match! verifyStage showWin sprintFilePath name sprintItem with
-        | Ok () -> 
-            updateVerifierStatus sprintFilePath name true
+        | Ok commit ->
+            updateVerifierStatus sprintFilePath name true commit
         | Error e -> 
-            updateVerifierStatus sprintFilePath name false
+            updateVerifierStatus sprintFilePath name false None
             allPassed <- false
     
     if allPassed then

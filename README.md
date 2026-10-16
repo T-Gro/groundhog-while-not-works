@@ -48,9 +48,27 @@ rejected before dispatch. Inline requests remain supported.
 Agent output is escaped and XML-invalid characters are replaced only when
 building prompts. Valid non-BMP Unicode is preserved. Checkpoints retain raw
 history, including malformed UTF-16 (encoded losslessly in the private journal).
-The `RALPH_AGENT_COMPLETE` line ends agent transport and cleans up a lingering
-owned process tree; it is never an implementation or verification success signal.
-Agents without that marker remain subject to the finite configured timeout.
+Fresh and resumed CLI calls use JSONL output. Only root final assistant content
+reaches the scheduler, without terminal wrapping or whitespace trimming. User,
+tool and subagent content cannot supply scheduler signals. Missing, malformed or
+contradictory transport envelopes fail explicitly.
+The stream must contain a root response and a terminal CLI result with exit code zero.
+After that result, a lingering owned process tree is cleaned up. A natural
+nonzero process exit still fails. Neither the result nor `RALPH_AGENT_COMPLETE`
+proves implementation or verification success. Calls without a terminal result
+remain subject to the finite configured timeout.
+
+Fresh and resumed agents use `gpt-6.1-sol`, `xhigh`, and `long_context` by
+default. Both paths disable built-in MCP servers only; custom MCP configuration
+remains enabled. The quality and final-assessment verifier instructions require
+the same explicit profile for their expert-reviewer subagents.
+
+Native Git commands run in `RALPH_WORK_DIR`, not the launcher checkout.
+Approval records use the target repository's full commit hash. Incremental
+verification excludes short or foreign historical hashes without deleting them.
+A moving HEAD fails verification, and skipped verifiers do not create approvals.
+Uncommitted changes also disable incremental approval reuse and commit approval
+recording; verifier results still describe the work that was actually checked.
 
 ## Owner-blocked work
 
@@ -96,11 +114,15 @@ injected agents, bounded subprocesses, no model calls or publication):
 .\Test-Scheduler.ps1
 ```
 
+Use `.\Test-Scheduler.ps1 -ProfileOnly` for the target-repository, dirty-tree,
+fresh/resume argument, and verifier subagent-profile regressions.
+
 The runner checks real FSI exit statuses 0/1/42/43, exact long-request transport,
 one-shot resume and replay denial, fresh/resumed arbiter exceptions, resumed
 checkpoint-finalization faults, raw prompt/history
-boundaries, and marker/virtual-clock timeout cleanup without disturbing an independent
-sentinel or the launcher.
+boundaries, structured fresh/resume output (including the original #2020 block),
+foreign-marker rejection, malformed/truncated transport, and terminal-result/
+virtual-clock timeout cleanup without disturbing an independent sentinel or the launcher.
 
 ## License
 

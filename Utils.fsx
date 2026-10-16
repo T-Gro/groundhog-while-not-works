@@ -5,14 +5,15 @@ open System.IO
 open System.Diagnostics
 open System.Text.RegularExpressions
 open System.Text
+open System.Text.Json
 open System.Security.Cryptography
 open System.Xml.Linq
 open System.Collections.Generic
 open YamlDotNet.Serialization
 
 module Config =
-    let Model = Environment.GetEnvironmentVariable("DM_COPILOT_MODEL") |> Option.ofObj |> Option.defaultValue "gpt-6-astra"
-    let Effort = Environment.GetEnvironmentVariable("DM_COPILOT_EFFORT") |> Option.ofObj |> Option.defaultValue "high"
+    let Model = Environment.GetEnvironmentVariable("DM_COPILOT_MODEL") |> Option.ofObj |> Option.defaultValue "gpt-6.1-sol"
+    let Effort = Environment.GetEnvironmentVariable("DM_COPILOT_EFFORT") |> Option.ofObj |> Option.defaultValue "xhigh"
     let Context = Environment.GetEnvironmentVariable("DM_COPILOT_CONTEXT") |> Option.ofObj |> Option.defaultValue "long_context"
     let AgentTimeoutMinutes =
         match Environment.GetEnvironmentVariable("RALPH_AGENT_TIMEOUT_MINUTES") |> Option.ofObj with
@@ -113,6 +114,91 @@ module XmlHelpers =
     let hasSignalAny (signal: string) (text: string) =
         hasSignal signal text || hasSignal (signal.Replace("_", " ")) text
 
+module AgentTransport =
+    type Output() =
+        let responses = ResizeArray<string>()
+        let mutable result: int option = None
+        let mutable failure: string option = None
+        let mutable lineNumber = 0
+        let mutable lastRootIsFinal = false
+
+        let objectValue (value: JsonElement) =
+            if value.ValueKind <> JsonValueKind.Object then
+                invalidOp "Expected a JSON object."
+            let names = HashSet<string>(StringComparer.Ordinal)
+            for property in value.EnumerateObject() do
+                if not (names.Add property.Name) then invalidOp "Duplicate JSON property."
+            value
+
+        let property name (value: JsonElement) =
+            match value.TryGetProperty(name: string) with
+            | true, value -> Some value
+            | _ -> None
+
+        let stringValue (value: JsonElement) =
+            if value.ValueKind <> JsonValueKind.String then invalidOp "Expected a JSON string."
+            value.GetString()
+
+        member _.AddLine(line: string) =
+            lineNumber <- lineNumber + 1
+            if failure.IsNone && not (String.IsNullOrWhiteSpace line) then
+                try
+                    if result.IsSome then invalidOp "Unexpected event after the terminal result."
+                    use document = JsonDocument.Parse line
+                    let root = objectValue document.RootElement
+                    let kind =
+                        property "type" root
+                        |> Option.defaultWith (fun () -> invalidOp "Missing event type.")
+                        |> stringValue
+                    let data = property "data" root |> Option.map objectValue
+                    let child =
+                        (property "agentId" root).IsSome
+                        || (property "parentToolCallId" root).IsSome
+                        || (data |> Option.exists (fun value -> (property "parentToolCallId" value).IsSome))
+                    match kind with
+                    | "assistant.turn_start" when not child -> lastRootIsFinal <- false
+                    | "assistant.message" when not child ->
+                        let data = data |> Option.defaultWith (fun () -> invalidOp "Missing assistant data.")
+                        let content =
+                            property "content" data
+                            |> Option.defaultWith (fun () -> invalidOp "Missing assistant content.")
+                            |> stringValue
+                        let phase = property "phase" data |> Option.map stringValue
+                        let hasTools =
+                            match property "toolRequests" data with
+                            | None -> false
+                            | Some tools when tools.ValueKind = JsonValueKind.Array -> tools.GetArrayLength() > 0
+                            | _ -> invalidOp "Invalid assistant tool requests."
+                        if phase = Some "final_answer" && hasTools then
+                            invalidOp "A final assistant response cannot request tools."
+                        lastRootIsFinal <- not hasTools && (phase.IsNone || phase = Some "final_answer") && content <> ""
+                        if lastRootIsFinal then
+                            responses.Add content
+                    | "result" when not child ->
+                        match property "exitCode" root with
+                        | Some code when code.ValueKind = JsonValueKind.Number ->
+                            match code.TryGetInt32() with
+                            | true, code -> result <- Some code
+                            | _ -> invalidOp "Invalid result exit code."
+                        | _ -> invalidOp "Missing or invalid result exit code."
+                    | "session.error" when not child -> invalidOp "The CLI reported a session error."
+                    | _ -> ()
+                with
+                | :? JsonException as error ->
+                    failure <- Some $"Invalid Copilot JSONL at line {lineNumber}: {error.Message}"
+                | :? InvalidOperationException as error ->
+                    failure <- Some $"Invalid Copilot JSONL at line {lineNumber}: {error.Message}"
+
+        member _.IsFinished = failure.IsSome || result.IsSome
+
+        member _.GetOutput() =
+            failure |> Option.iter invalidOp
+            match result with
+            | Some 0 when lastRootIsFinal && responses.Count > 0 -> String.concat "\n" responses
+            | Some 0 -> invalidOp "Copilot JSONL completed without a root final assistant response."
+            | Some code -> invalidOp $"Copilot JSONL reported exit code {code}."
+            | None -> invalidOp "Copilot JSONL ended without its terminal result."
+
 module PromptBuilder =
     open XmlHelpers
     let instruction name text = xt name text
@@ -123,19 +209,40 @@ module PromptBuilder =
     let optionalEl name = function Some v -> [xt name v] | None -> []
 
 module Git =
-    /// Run a process and capture stdout. Returns Some output (trimmed) on success (exit code 0), None on failure.
     let runProcess (command: string) (args: string) =
         try
-            let psi = ProcessStartInfo(command, args, RedirectStandardOutput=true, UseShellExecute=false, CreateNoWindow=true)
+            let psi = ProcessStartInfo(command, args, RedirectStandardOutput=true, RedirectStandardError=true,
+                                       UseShellExecute=false, CreateNoWindow=true, WorkingDirectory=Config.workDir)
             use p = Process.Start(psi)
-            let output = p.StandardOutput.ReadToEnd().Trim()
-            p.WaitForExit()
-            if p.ExitCode = 0 then Some output else None
-        with _ -> None
+            let output, error = p.StandardOutput.ReadToEndAsync(), p.StandardError.ReadToEndAsync()
+            if not (p.WaitForExit 60000) then
+                p.Kill true
+                if not (p.WaitForExit 10000) then failwith "Target repository Git process did not stop."
+                failwith $"Target repository command timed out: {command} {args}"
+            if not (Threading.Tasks.Task.WaitAll([|output :> Threading.Tasks.Task; error :> Threading.Tasks.Task|], 10000)) then
+                failwith $"Target repository command output did not settle: {command} {args}"
+            if p.ExitCode = 0 then Some(output.Result.Trim())
+            else
+                eprintfn "Target repository command failed (%d): %s %s\n%s" p.ExitCode command args error.Result
+                None
+        with :? System.ComponentModel.Win32Exception as error ->
+            eprintfn "Target repository command could not start: %s: %s" command error.Message
+            None
 
     let getHeadCommit () =
-        runProcess "git" "rev-parse --short HEAD"
-        |> Option.bind (fun s -> if s.Length > 0 then Some s else None)
+        match runProcess "git" "rev-parse --verify HEAD" with
+        | Some head when Regex.IsMatch(head, @"\A[0-9a-f]{40}\z") -> Some head
+        | _ -> invalidOp "Cannot verify the target repository's full HEAD; no approval can be recorded."
+
+    let isApprovalAncestor (head: string) (commit: string) =
+        Regex.IsMatch(commit, @"\A[0-9a-f]{40}\z")
+        && Regex.IsMatch(head, @"\A[0-9a-f]{40}\z")
+        && (runProcess "git" $"merge-base --is-ancestor {commit} {head}").IsSome
+
+    let isWorktreeClean () =
+        match runProcess "git" "status --porcelain=v1 --untracked-files=all" with
+        | Some status -> status = ""
+        | None -> invalidOp "Cannot verify target working-tree state."
 
 module YamlFrontmatter =
     let private deserializer = DeserializerBuilder().Build()

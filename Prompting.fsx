@@ -574,6 +574,7 @@ let parseManagementSummary (output: string) : string option =
 
 /// Build context for sprint-level verification
 let buildSprintVerificationContext (sprintItem: BacklogItem) (approvedCommits: Map<string, string>) (currentCommit: string option) (currentVerifier: string) =
+    let targetHead = currentCommit |> Option.defaultValue "unknown"
     let commitSection = 
         if approvedCommits.IsEmpty then []
         else
@@ -598,6 +599,7 @@ let buildSprintVerificationContext (sprintItem: BacklogItem) (approvedCommits: M
     [
         ""
         "=== YOUR VERIFICATION SCOPE ==="
+        $"Current target HEAD: {targetHead}"
         $"Sprint file: {sprintItem.FilePath}"
         $"Sprint: {sprintItem.Name}"
         ""

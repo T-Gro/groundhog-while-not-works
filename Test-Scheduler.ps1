@@ -1,3 +1,5 @@
+param([switch]$ProfileOnly)
+
 $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $true
 $root = Join-Path $PSScriptRoot (".fake\scheduler-" + [Guid]::NewGuid().ToString('N'))
@@ -34,6 +36,9 @@ try {
         $psi.RedirectStandardOutput = $true
         $psi.RedirectStandardError = $true
         $psi.Environment['RALPH_FIXTURE_SINK'] = (Join-Path $root 'sink.txt')
+        $psi.Environment['DM_COPILOT_MODEL'] = 'gpt-6.1-sol'
+        $psi.Environment['DM_COPILOT_EFFORT'] = 'xhigh'
+        $psi.Environment['DM_COPILOT_CONTEXT'] = 'long_context'
         foreach ($argument in (@('fsi', (Join-Path $PSScriptRoot 'Scheduler.Tests.fsx'), '--', '--fixture') + $Arguments)) {
             $psi.ArgumentList.Add($argument)
         }
@@ -68,6 +73,10 @@ try {
             if (-not $process.HasExited) { $process.Kill($true); $process.WaitForExit() }
             $process.Dispose()
         }
+    }
+    if ($ProfileOnly) {
+        Invoke-Fixture @('--profile-only') 0
+        return
     }
     Invoke-Fixture @() 0
     foreach ($case in @(@('complete', 0), @('failure', 1), @('blocked', 42), @('fault', 43))) {

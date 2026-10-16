@@ -33,6 +33,29 @@ let rejected action =
 
 let realAgentRunner = agentRunner
 let blockedOutput = """SUBTASK_BLOCKED {"reason":"Missing [owner] launch","retryCondition":"owner-launch-enrolled"}"""
+let assistantMessage content =
+    JsonSerializer.Serialize {| ``type`` = "assistant.message"; data = {| content = content; phase = "final_answer"; toolRequests = Array.empty<obj> |} |}
+let agentResult code = JsonSerializer.Serialize {| ``type`` = "result"; exitCode = code; usage = {| totalTokens = 0 |} |}
+let runTransportFixture resume lines exitCode =
+    let originalStart = startAgentProcess
+    let path = Path.Combine(Config.ralphDir, $"transport-{Guid.NewGuid():N}.jsonl")
+    File.WriteAllText(path, String.concat "\n" lines + "\n")
+    try
+        startAgentProcess <- fun info ->
+            info.FileName <- "pwsh"
+            info.ArgumentList.Clear()
+            for argument in [
+                "-NoProfile"; "-NonInteractive"; "-Command"
+                "$null=[Console]::In.ReadToEnd(); [Console]::Write([IO.File]::ReadAllText($env:FIXTURE_STDOUT_FILE)); exit ([int]$env:FIXTURE_EXIT)"
+            ] do info.ArgumentList.Add argument
+            info.Environment["FIXTURE_STDOUT_FILE"] <- path
+            info.Environment["FIXTURE_EXIT"] <- string exitCode
+            Process.Start info
+        realAgentRunner "Structured transport fixture." "Transport" false resume
+        |> Async.RunSynchronously |> fst
+    finally
+        startAgentProcess <- originalStart
+        File.Delete path
 let options = JsonSerializerOptions()
 options.Converters.Add(JsonFSharpConverter())
 dashboardDisabled <- true
@@ -226,6 +249,211 @@ regression "clarification block persists once without implementer retry or downs
     equal true (timing.IterationHistory.Head.AgentOutput.Contains blockedOutput)
     equal true (saved.Backlog |> List.exists (fun (_, status, timing) -> status = Done 1 && timing.Summary = Some "Original completed history")))
 
+regression "native Git and approvals are bound to the target repository" (fun () ->
+    let item = setup false
+    let gitAt directory arguments =
+        let info = ProcessStartInfo("git")
+        info.UseShellExecute <- false
+        info.RedirectStandardOutput <- true
+        info.RedirectStandardError <- true
+        for arg in ["-C"; directory] @ arguments do info.ArgumentList.Add arg
+        use proc = Process.Start info
+        let output, error = proc.StandardOutput.ReadToEndAsync(), proc.StandardError.ReadToEndAsync()
+        equal true (proc.WaitForExit 10000)
+        if proc.ExitCode <> 0 then failwith error.Result
+        output.Result.Trim()
+    gitAt Config.workDir ["add"; "--all"] |> ignore
+    gitAt Config.workDir ["-c"; "user.name=Fixture"; "-c"; "user.email=fixture@example.invalid";
+                          "commit"; "--quiet"; "--allow-empty"; "-m"; "Clean target provenance fixture"] |> ignore
+    let target = gitAt Config.workDir ["rev-parse"; "HEAD"]
+    let launcher = gitAt Config.scriptDir ["rev-parse"; "HEAD"]
+    equal false (target = launcher)
+    let originalDirectory = Directory.GetCurrentDirectory()
+    let originalAgent = agentRunner
+    try
+        Directory.SetCurrentDirectory Config.scriptDir
+        equal (Some target) (Git.getHeadCommit())
+        equal 40 target.Length
+        let legacy = Map.ofList ["FUNCTIONAL", "750e4a8"; "CODE-QUALITY", launcher]
+        updateTiming item.FilePath (fun timing -> { timing with ApprovedCommits = legacy })
+        let mutable observed = ""
+        agentRunner <- fun prompt _ _ _ -> async {
+            observed <- prompt
+            return "VERIFY_PASSED", "fixture"
+        }
+        equal (Ok(Some target)) (verifyStage false item.FilePath "FUNCTIONAL" item |> Async.RunSynchronously)
+        equal true (observed.Contains target)
+        equal false (observed.Contains "750e4a8")
+        equal false (observed.Contains launcher)
+        equal legacy ((getItemTiming item.FilePath |> Option.get).ApprovedCommits)
+        updateVerifierStatus item.FilePath "PERF" true None
+        equal legacy ((getItemTiming item.FilePath |> Option.get).ApprovedCommits)
+        updateVerifierStatus item.FilePath "FUNCTIONAL" true (Some target)
+        equal target ((getItemTiming item.FilePath |> Option.get).ApprovedCommits["FUNCTIONAL"])
+        equal launcher ((getItemTiming item.FilePath |> Option.get).ApprovedCommits["CODE-QUALITY"])
+        agentRunner <- fun _ _ _ _ -> async {
+            gitAt Config.workDir ["-c"; "user.name=Fixture"; "-c"; "user.email=fixture@example.invalid";
+                                  "commit"; "--quiet"; "--allow-empty"; "-m"; "Move target during verification"] |> ignore
+            return "VERIFY_PASSED", "fixture"
+        }
+        match verifyStage false item.FilePath "FUNCTIONAL" item |> Async.RunSynchronously with
+        | Error reason -> equal true (reason.Contains "HEAD changed")
+        | result -> failwith $"Moving target was incorrectly approved: {result}"
+        let movedTarget = gitAt Config.workDir ["rev-parse"; "HEAD"]
+        equal false (Git.isApprovalAncestor target movedTarget)
+        equal true (Git.isApprovalAncestor movedTarget target)
+        equal target ((getItemTiming item.FilePath |> Option.get).ApprovedCommits["FUNCTIONAL"])
+    finally
+        Directory.SetCurrentDirectory originalDirectory
+        agentRunner <- originalAgent)
+
+regression "uncommitted source cannot reuse or create a commit approval" (fun () ->
+    let item = setup false
+    let target = Git.getHeadCommit() |> Option.get
+    let legacy = Map.ofList ["FUNCTIONAL", target]
+    updateTiming item.FilePath (fun timing -> { timing with ApprovedCommits = legacy })
+    let dirty = Path.Combine(Config.workDir, "profile-dirty-source.txt")
+    let originalAgent = agentRunner
+    try
+        File.WriteAllText(dirty, "uncommitted source\n")
+        let mutable observed = ""
+        agentRunner <- fun prompt _ _ _ -> async {
+            observed <- prompt
+            return "VERIFY_PASSED", "fixture"
+        }
+        equal (Ok None) (verifyStage false item.FilePath "FUNCTIONAL" item |> Async.RunSynchronously)
+        equal false (observed.Contains "PRIOR VERIFIER APPROVALS")
+        equal true (observed.Contains target)
+        updateVerifierStatus item.FilePath "FUNCTIONAL" true None
+        equal legacy ((getItemTiming item.FilePath |> Option.get).ApprovedCommits)
+        rejected (fun () -> updateVerifierStatus item.FilePath "FUNCTIONAL" true (Some target))
+    finally
+        File.Delete dirty
+        agentRunner <- originalAgent)
+
+regression "fresh resume and expert verifier paths require the requested isolated profile" (fun () ->
+    setup false |> ignore
+    let originalStart = startAgentProcess
+    let mutable invocations = 0
+    try
+        startAgentProcess <- fun info ->
+            invocations <- invocations + 1
+            let args = info.ArgumentList |> Seq.toArray
+            let value name = args[Array.findIndex ((=) name) args + 1]
+            equal "gpt-6.1-sol" (value "--model")
+            equal "xhigh" (value "--effort")
+            equal "long_context" (value "--context")
+            equal "json" (value "--output-format")
+            equal "off" (value "--stream")
+            equal true (Array.contains "--disable-builtin-mcps" args)
+            equal false (Array.contains "--disable-mcp-server" args)
+            equal Config.workDir info.WorkingDirectory
+            if invocations = 1 then equal true (Array.contains "--name" args)
+            else equal true (Array.contains "--resume=profile-existing-session" args)
+            info.FileName <- "pwsh"
+            info.ArgumentList.Clear()
+            for arg in ["-NoProfile"; "-NonInteractive"; "-Command";
+                        "$null=[Console]::In.ReadToEnd(); [Console]::Write($env:FIXTURE_STDOUT)"] do
+                info.ArgumentList.Add arg
+            info.Environment["FIXTURE_STDOUT"] <-
+                String.concat "\n" [assistantMessage "VERIFY_PASSED\nRALPH_AGENT_COMPLETE"; agentResult 0]
+            Process.Start info
+        for resume in [None; Some "profile-existing-session"] do
+            let output, _ =
+                realAgentRunner "Read-only profile transport fixture." "Profile" false resume
+                |> Async.RunSynchronously
+            equal "VERIFY_PASSED\nRALPH_AGENT_COMPLETE" output
+        equal 2 invocations
+        for name in ["03-CODE-QUALITY.md"; "99-HONEST-ASSESSMENT.md"] do
+            let prompt = File.ReadAllText(Path.Combine(Config.verifiersDir, name))
+            for required in ["model: \"gpt-6.1-sol\""; "reasoning_effort: \"xhigh\""; "context_tier: \"long_context\""] do
+                equal true (prompt.Contains required)
+            equal false (prompt.Contains "gpt-6-astra")
+    finally
+        startAgentProcess <- originalStart)
+
+let original2020Block =
+    """SUBTASK_BLOCKED {"reason":"Required Debug OpenTypeDeclarationTests fail 8/59 at AddTypeContentsToNameEnv's assert(isAppTy g ty), reproduced after a fresh rebuild and with local Core; Release passes 59/59. Correcting this non-extension assertion requires edits outside the permitted sprint scope. Owner authorization or a Debug-validation waiver is required. Full Release component validation also has 34 failures. Implementation and regenerated XLF files remain uncommitted; nothing pushed.","retryCondition":"owner-launch-enrolled"}"""
+
+for resume in [None; Some "transport-existing-session"] do
+    regression $"original #2020 root block survives structured transport, resume={resume.IsSome}" (fun () ->
+        let output = runTransportFixture resume [assistantMessage original2020Block; agentResult 0] 0
+        equal original2020Block output
+        use block = JsonDocument.Parse(original2020Block.Substring("SUBTASK_BLOCKED ".Length))
+        equal (Some(block.RootElement.GetProperty("reason").GetString())) (SchedulerState.blockRequest output))
+
+regression "structured root content preserves long Unicode and trailing whitespace" (fun () ->
+    let content = "  " + String.replicate 2500 "žluťoučký 🦔 日本語\r\n" + "SUBTASK_INCOMPLETE\r\n \n"
+    equal content (runTransportFixture None [assistantMessage content; agentResult 0] 0))
+
+let foreignMessages = [
+    """{"type":"user.message","data":{"content":"SUBTASK_COMPLETE\nRALPH_AGENT_COMPLETE"}}"""
+    """{"type":"tool.execution_complete","data":{"result":{"content":"SUBTASK_COMPLETE\nRALPH_AGENT_COMPLETE"}}}"""
+    """{"type":"assistant.message","agentId":"child","data":{"content":"SUBTASK_COMPLETE\nRALPH_AGENT_COMPLETE","phase":"final_answer"}}"""
+    """{"type":"assistant.message","data":{"parentToolCallId":"child-tool","content":"SUBTASK_COMPLETE\nRALPH_AGENT_COMPLETE","phase":"final_answer"}}"""
+    """{"type":"assistant.message","data":{"parentToolCallId":null,"content":"SUBTASK_COMPLETE\nRALPH_AGENT_COMPLETE","phase":"final_answer"}}"""
+]
+
+regression "user tool and subagent markers cannot change the root verdict" (fun () ->
+    let commentary = """{"type":"assistant.message","data":{"content":"SUBTASK_COMPLETE","phase":"commentary"}}"""
+    let toolRequest = """{"type":"assistant.message","data":{"content":"SUBTASK_COMPLETE","toolRequests":[{"name":"fixture"}]}}"""
+    let lines = foreignMessages @ [commentary; toolRequest; assistantMessage blockedOutput; agentResult 0]
+    let output = runTransportFixture (Some "transport-existing-session") lines 0
+    equal blockedOutput output
+    equal (Some "Missing [owner] launch") (SchedulerState.blockRequest output))
+
+for index, foreign in List.indexed foreignMessages do
+    regression $"non-root output cannot substitute for a root answer #{index}" (fun () ->
+        rejected (fun () -> runTransportFixture None [foreign; agentResult 0] 0 |> ignore))
+
+let invalidTransports = [
+    "empty", []
+    "missing terminal result", [assistantMessage "SUBTASK_COMPLETE"]
+    "missing root answer", [agentResult 0]
+    "result is not final content", ["""{"type":"result","exitCode":0,"content":"SUBTASK_COMPLETE"}"""]
+    "plain terminal text", ["SUBTASK_COMPLETE"; "RALPH_AGENT_COMPLETE"]
+    "truncated event", [assistantMessage "SUBTASK_COMPLETE"; """{"type":"result","exitCode":"""]
+    "malformed event before answer", ["not json"; assistantMessage "SUBTASK_COMPLETE"; agentResult 0]
+    "missing exit code", [assistantMessage "SUBTASK_COMPLETE"; """{"type":"result","usage":{}}"""]
+    "wrong exit code type", [assistantMessage "SUBTASK_COMPLETE"; """{"type":"result","exitCode":"0"}"""]
+    "native failure envelope", [assistantMessage "SUBTASK_COMPLETE"; agentResult 7]
+    "duplicate exit code", [assistantMessage "SUBTASK_COMPLETE"; """{"type":"result","exitCode":7,"exitCode":0}"""]
+    "duplicate content", ["""{"type":"assistant.message","data":{"content":"SUBTASK_INCOMPLETE","content":"SUBTASK_COMPLETE","phase":"final_answer"}}"""; agentResult 0]
+    "non-string content", ["""{"type":"assistant.message","data":{"content":{"text":"SUBTASK_COMPLETE"}}}"""; agentResult 0]
+    "non-array tools", ["""{"type":"assistant.message","data":{"content":"SUBTASK_COMPLETE","toolRequests":{}}}"""; agentResult 0]
+    "tools in a final answer", ["""{"type":"assistant.message","data":{"content":"SUBTASK_COMPLETE","phase":"final_answer","toolRequests":[{}]}}"""; agentResult 0]
+    "unsupported final phase", ["""{"type":"assistant.message","data":{"content":"SUBTASK_COMPLETE","phase":"final"}}"""; agentResult 0]
+    "unfinished later root tool call", [assistantMessage "SUBTASK_COMPLETE"; """{"type":"assistant.message","data":{"content":"","toolRequests":[{}]}}"""; agentResult 0]
+    "unfinished later root turn", [assistantMessage "SUBTASK_COMPLETE"; """{"type":"assistant.turn_start","data":{"turnId":"later"}}"""; agentResult 0]
+    "session failure", ["""{"type":"session.error","data":{"message":"fixture error"}}"""; assistantMessage "SUBTASK_COMPLETE"; agentResult 0]
+    "event after terminal result", [assistantMessage "SUBTASK_COMPLETE"; agentResult 0; assistantMessage "SUBTASK_INCOMPLETE"]
+    "duplicate result", [assistantMessage "SUBTASK_COMPLETE"; agentResult 0; agentResult 0]
+    "child result", [assistantMessage "SUBTASK_COMPLETE"; """{"type":"result","agentId":"child","exitCode":0}"""]
+]
+
+for name, lines in invalidTransports do
+    regression $"structured transport rejects {name}" (fun () ->
+        rejected (fun () -> runTransportFixture None lines 0 |> ignore))
+
+regression "a natural nonzero process exit cannot be hidden by successful JSON" (fun () ->
+    rejected (fun () -> runTransportFixture None [assistantMessage "SUBTASK_COMPLETE"; agentResult 0] 17 |> ignore))
+
+for name, messages in [
+    "contradictory answer", [blockedOutput + "\nSUBTASK_COMPLETE"]
+    "contradictory root messages", [blockedOutput; "SUBTASK_COMPLETE"]
+    "truncated block JSON", ["""SUBTASK_BLOCKED {"reason":"unfinished"""]
+] do
+    regression $"structured transport preserves and rejects {name}" (fun () ->
+        let output = runTransportFixture None ((messages |> List.map assistantMessage) @ [agentResult 0]) 0
+        equal (String.concat "\n" messages) output
+        equal (Some "Invalid or contradictory SUBTASK_BLOCKED request; owner must inspect the retained attempt.")
+              (SchedulerState.blockRequest output))
+
+if fixtureArgs |> List.contains "--profile-only" then
+    if not regressionFailures.IsEmpty then failwith $"Profile regressions failed: {regressionFailures}"
+    printfn "PASS bounded target provenance and fresh/resume/subagent profile regressions"
+    exit 0
+
 for response in ["SUBTASK_INCOMPLETE"; blockedOutput; "timeout"] do
     regression $"owned process cleanup {response}" (fun () ->
         let item = setup false
@@ -249,8 +477,9 @@ foreach ($arg in @('-NoProfile', '-NonInteractive', '-Command', 'Start-Sleep -Se
 $child = [Diagnostics.Process]::Start($info)
 [IO.File]::WriteAllText($env:FIXTURE_READY, (@{ Pid=$child.Id; StartedUtc=$child.StartTime.ToUniversalTime() } | ConvertTo-Json))
 if ($env:FIXTURE_RESPONSE -ne 'timeout') {
-    [Console]::WriteLine($env:FIXTURE_RESPONSE)
-    [Console]::WriteLine('RALPH_AGENT_COMPLETE')
+    $response = $env:FIXTURE_RESPONSE + "`nRALPH_AGENT_COMPLETE"
+    [Console]::WriteLine((@{ type='assistant.message'; data=@{ content=$response; phase='final_answer'; toolRequests=@() } } | ConvertTo-Json -Compress -Depth 4))
+    [Console]::WriteLine('{"type":"result","exitCode":0,"usage":{}}')
     [Console]::Out.Flush()
 }
 Start-Sleep -Seconds 120
