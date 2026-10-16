@@ -103,6 +103,22 @@ module BacklogFile =
     let readOverview () = if File.Exists(Config.backlogFile) then Some (File.ReadAllText(Config.backlogFile)) else None
     let hasValidPlan () = File.Exists(Config.backlogFile) && SprintFiles.listSprints().Length > 0
 
+let validationContract (sprint: BacklogItem) =
+    let lines = sprint.Description.Replace("\r\n", "\n").Split('\n')
+    let heading = Regex(@"^\s*(#{1,6})[ \t]+Validation scope and completion contract\b")
+    match lines |> Array.tryFindIndex heading.IsMatch with
+    | Some index ->
+        let level = heading.Match(lines.[index]).Groups.[1].Length
+        let sectionEnd = Regex(@"^\s*#{1," + string level + @"}[ \t]+")
+        lines
+        |> Array.skip (index + 1)
+        |> Array.takeWhile (fun line -> not (sectionEnd.IsMatch line))
+        |> String.concat "\n"
+        |> fun text -> text.Trim()
+    | None ->
+        "Use this sprint's Definition of Done and repository guidance to select scoped validation; do not add unrelated root build/test gates.\n"
+        + String.concat "\n" sprint.DoD
+
 module XmlPrompt =
     type Role = Implementor | Arbiter
     
@@ -117,7 +133,7 @@ module XmlPrompt =
     let private roleElement (role: Role) =
         match role with
         | Implementor ->
-            xt "Implementor" "YOU ARE THE IMPLEMENTOR for the F# compiler. Implement only the current sprint's requirements. Follow DoD. Minimize breaking changes. Reuse existing helpers. Minimize allocations. Build and tests MUST pass."
+            xt "Implementor" "YOU ARE THE IMPLEMENTOR. Implement only the current sprint's requirements. Follow its Validation scope and completion contract and DoD. Minimize breaking changes. Reuse existing helpers."
         | Arbiter ->
             xt "Arbiter" "You are the arbiter. A sprint has failed despite multiple attempts. Determine why, then restructure the plan to fix the root cause."
     
@@ -324,6 +340,7 @@ module Prompts =
                 xt "required" "# Sprint: [title]"
                 xt "required" "## Context - WHY this sprint exists"
                 xt "required" "## Description - WHAT to implement with DETAILED guidance"
+                xt "required" "## Validation scope and completion contract - exact scoped commands, evidence, and completion requirements"
                 xt "required" "## Definition of Done - bullet list starting with '- '"
             ]
             
@@ -476,10 +493,11 @@ module Prompts =
             else [xc "fix" (feedback |> List.map (fun f -> xt "issue" f))]
         
         xc "R" ([xml] @ feedbackEl @ [
+            xt "validation_contract" (validationContract s)
             xc "action" [
                 xt "focus" $"Sprint {s.Order}: {s.Name}. Other sprints are NOT your concern."
                 xt "step" "Implement code AND tests together"
-                xt "step" "Run: dotnet build -c Release && dotnet test -c Release"
+                xt "step" "Run every check in this sprint's Validation scope and completion contract. Retain commands, exit codes, and actual results. Do not substitute unrelated root build/test gates."
                 xt "step" "Verify each DoD criterion for THIS sprint"
                 xt "step" "Commit changes"
                 xt "signal" "SUBTASK_COMPLETE"
@@ -544,8 +562,9 @@ NEVER use 'git diff main...HEAD' (merge-base shifts after merging main, hides ea
 Code identical on main is OUT OF SCOPE. Do not review it, do not fail it.
 
 === PREREQUISITE ===
-Use the check errors skill — must have 0 issues.
-Run added/modified tests using fast run option — they must pass.
+Read the sprint's Validation scope and completion contract. Verify every required check and its actual evidence.
+That contract governs validation commands and completion; do not append unrelated root build/test gates.
+Do not call an unavailable required smoke check passing.
 """
 
 /// Standard suffix added after all verifier content.
@@ -607,6 +626,9 @@ let buildSprintVerificationContext (sprintItem: BacklogItem) (approvedCommits: M
         "Verify ONLY work described in this sprint file."
         "Do NOT look at BACKLOG.md or other sprint files."
         ""
+        "=== VALIDATION SCOPE AND COMPLETION CONTRACT ==="
+        validationContract sprintItem
+        ""
         "Definition of Done for THIS sprint:"
         yield! sprintItem.DoD |> List.map (fun d -> $"  - {d}")
         yield! commitSection
@@ -626,6 +648,7 @@ let buildFinalVerificationContext (sprintFiles: string list) =
         "Verify the COMPLETE FEATURE works as a whole."
         "Check integration between all sprints."
         "Verify the original request in BACKLOG.md is fully satisfied."
+        "For each sprint use its Validation scope and completion contract, retaining all required checks without unrelated root build/test gates."
         "Planning files are private orchestration state, never product changes. Run `git diff --name-only` and fail verification if `.tools/ralph/` appears in the branch diff."
         ""
     ] |> String.concat "\n"

@@ -50,7 +50,7 @@ let runTransportFixture resume lines exitCode =
             ] do info.ArgumentList.Add argument
             info.Environment["FIXTURE_STDOUT_FILE"] <- path
             info.Environment["FIXTURE_EXIT"] <- string exitCode
-            Process.Start info
+            new ProcessContainment.OwnedProcess(info)
         realAgentRunner "Structured transport fixture." "Transport" false resume
         |> Async.RunSynchronously |> fst
     finally
@@ -78,12 +78,17 @@ printfn "PASS terminal control characters are sanitized before XML serialization
 
 Directory.CreateDirectory Config.ralphDir |> ignore
 let restartStatePath = Path.Combine(Config.ralphDir, "scheduler-state.json")
-if File.Exists restartStatePath then File.Delete restartStatePath
+let restartMarkers = ["scheduler-state.json"; "completed-state.json"; "blocked.json"; "resume-launch.json"]
+for name in restartMarkers do
+    let path = Path.Combine(Config.ralphDir, name)
+    if File.Exists path then File.Delete path
 equal false (shouldResumeBeforeRestart ())
-File.WriteAllText(restartStatePath, "{}")
-equal true (shouldResumeBeforeRestart ())
-File.Delete restartStatePath
-printfn "PASS explicit restart bypasses missing scheduler state"
+for name in restartMarkers do
+    let path = Path.Combine(Config.ralphDir, name)
+    File.WriteAllText(path, "{}")
+    equal true (shouldResumeBeforeRestart ())
+    File.Delete path
+printfn "PASS explicit restart checks every retained scheduler marker"
 
 let requestPath = Path.Combine(Config.ralphDir, "request.txt")
 File.WriteAllText(requestPath, "large request from file")
@@ -357,7 +362,7 @@ regression "fresh resume and expert verifier paths require the requested isolate
                 info.ArgumentList.Add arg
             info.Environment["FIXTURE_STDOUT"] <-
                 String.concat "\n" [assistantMessage "VERIFY_PASSED\nRALPH_AGENT_COMPLETE"; agentResult 0]
-            Process.Start info
+            new ProcessContainment.OwnedProcess(info)
         for resume in [None; Some "profile-existing-session"] do
             let output, _ =
                 realAgentRunner "Read-only profile transport fixture." "Profile" false resume
@@ -487,11 +492,12 @@ Start-Sleep -Seconds 120
                 for arg in ["-NoProfile"; "-NonInteractive"; "-Command"; childScript] do info.ArgumentList.Add arg
                 info.Environment["FIXTURE_READY"] <- ready
                 info.Environment["FIXTURE_RESPONSE"] <- response
-                let proc = Process.Start info
+                let captured = new ProcessContainment.OwnedProcess(info)
+                let proc = captured.Process
                 let observed = Process.GetProcessById proc.Id
                 observed.Handle |> ignore
                 owned <- Some observed
-                proc
+                captured
             if response = "timeout" then
                 let epoch = DateTime.UtcNow
                 let mutable first = true
@@ -564,6 +570,8 @@ for partial in [false; true] do
             (fun () -> runRestart "fixture" false true)
             (fun () -> runWithPush "fixture" false true 0)
             (fun () -> runWithCIContext "fixture" false true 0 "CI failure")
+            (fun () -> runResume "fixture" false false)
+            (fun () -> runResume "fixture" false true)
         ] do equal 42 (dispatch ())
         match invokeArbiter "fixture" false with
         | Block again -> equal block again
@@ -606,12 +614,38 @@ agentRunner <- fun _ title _ _ -> async {
     return (if title.StartsWith "Implement-" then "SUBTASK_COMPLETE" else "VERIFY_PASSED"), "fixture"
 }
 equal (Complete ()) (runWithLive [completedItem] false "fixture")
+let retiredItem = { completedItem with Order = 0; FilePath = Path.Combine(Config.sprintsDir, "00_Retired.md"); Name = "Retired context" }
+state <- { state with Backlog = (retiredItem, Running(Implement, 7), emptyTiming) :: state.Backlog }
+SchedulerState.save state
+SchedulerState.archiveCompleted ()
 let completedHistory = state.Backlog
 state <- emptyState
 agentRunner <- fun _ _ _ _ -> failwith "Loading completed history must not invoke an agent"
 equal (Some 0) (resumeCheckpoint "completed checkpoint" false false)
 equal completedHistory state.Backlog
-printfn "PASS completed dispatch terminates successfully without losing history"
+printfn "PASS completed dispatch terminates successfully without losing or accepting inactive unfinished history"
+
+regression "explicit completed resume retains and repairs canonical finalization faults" (fun () ->
+    let item = setup true
+    agentRunner <- fun _ title _ _ -> async {
+        return (if title.StartsWith "Implement-" then "SUBTASK_COMPLETE" else "VERIFY_PASSED"), "fixture"
+    }
+    equal (Complete ()) (runWithLive [item] false "fixture")
+    let active = Path.Combine(Config.ralphDir, "scheduler-state.json")
+    File.Move(Path.Combine(Config.ralphDir, "completed-state.json"), active)
+    let retained = File.ReadAllBytes active
+    let continuation = File.ReadAllBytes checkpointPath
+    agentRunner <- fun _ _ _ _ -> failwith "Completed resume must not invoke an agent"
+    state <- emptyState
+    do
+        use denied = new FileStream(active + ".new", FileMode.Create, FileAccess.Write, FileShare.None)
+        equal 43 (runResume "fixture" false false)
+        equal retained (File.ReadAllBytes active)
+        equal continuation (File.ReadAllBytes checkpointPath)
+    equal 0 (runResume "fixture" false false)
+    equal false (File.Exists active)
+    equal true (File.Exists(Path.Combine(Config.ralphDir, "completed-state.json")))
+    equal continuation (File.ReadAllBytes checkpointPath))
 
 let item = setup true
 let mutable afterBlock = false
@@ -649,6 +683,8 @@ for corruption in ["missing-block"; "corrupt-block"; "stale-source"; "stale-spri
     state <- emptyState
     agentRunner <- fun _ _ _ _ -> failwith "Fault must not launch any agent"
     equal 43 (run "fixture" false true 0 None)
+    equal 43 (runResume "fixture" false false)
+    equal 43 (runResume "fixture" false true)
     printfn "PASS fail-closed %s" corruption
 
 if OperatingSystem.IsWindows() then

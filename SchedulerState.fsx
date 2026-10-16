@@ -9,7 +9,7 @@ open TypeDefinitions
 open BlockedProtocol
 
 // JSON's string encoder replaces isolated surrogates; preserve those rare raw logs verbatim.
-type private EvidenceStringConverter() =
+type EvidenceStringConverter() =
     inherit JsonConverter<string>()
     override _.Read(reader, _, _) =
         if reader.TokenType = JsonTokenType.String then reader.GetString()
@@ -48,6 +48,9 @@ let private options =
 let private snapshotPath () = Path.Combine(Config.ralphDir, "scheduler-state.json")
 let private completedPath () = Path.Combine(Config.ralphDir, "completed-state.json")
 exception CheckpointFault of string
+
+let serializeState (state: State) = JsonSerializer.Serialize(state, options)
+let deserializeState (text: string) = JsonSerializer.Deserialize<State>(text, options)
 
 let private exists (path: string) =
     try
@@ -126,6 +129,15 @@ let private readSnapshot () =
         failwith "Retained scheduler snapshot is empty."
     saved
 
+let readUnblockedSnapshot () =
+    try
+        let saved = readSnapshot ()
+        if saved.CurrentPhase = "Blocked" || (saved.Backlog |> List.exists (fun (_, status, _) ->
+            match status with Blocked _ -> true | _ -> false)) then
+            failwith "Blocked scheduler state requires its authenticated owner checkpoint."
+        saved
+    with ex -> raise (CheckpointFault $"Cannot restore unblocked scheduler state: {ex.Message}")
+
 let restore allowPlanning =
     match pendingBlock () with
     | Some block ->
@@ -162,7 +174,7 @@ let restoreExplicitRestart () =
     | None when exists (Path.Combine(Config.ralphDir, "resume-launch.json")) ->
         failwith "Retained sprint state has an unauthenticated resume launch."
     | None when exists (snapshotPath ()) ->
-        let saved = readSnapshot ()
+        let saved = readUnblockedSnapshot ()
         if saved.CurrentPhase = "Complete" then
             failwith "Completed scheduler state cannot be restarted."
         Resumed saved

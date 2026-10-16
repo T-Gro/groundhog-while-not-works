@@ -3,7 +3,7 @@
 #load "Utils.fsx"
 #load "TypeDefinitions.fsx"
 #load "Prompting.fsx"
-#load "SchedulerState.fsx"
+#load "Recovery.fsx"
 #load "GUI.fsx"
 #load "CI_Retries.fsx"
 
@@ -27,10 +27,23 @@ open TypeDefinitions
 open Prompting
 open GUI
 open CI_Retries
+open Recovery
 
 let mutable state: State = emptyState
 let mutable liveCtx: LiveDisplayContext option = None
 let mutable dashboardDisabled: bool = false
+let mutable currentRequest = ""
+let mutable resumeCursor: ResumeCursor option = None
+let checkpointPath = Path.Combine(Config.ralphDir, "resume.json")
+let persist () =
+    if not state.Backlog.IsEmpty
+       && List.contains state.CurrentPhase ["Executing"; "Fixup"; "Final Verification"; "Complete"]
+       && not (state.Backlog |> List.exists (fun (_, status, _) -> match status with Blocked _ -> true | _ -> false)) then
+        try Resume.save checkpointPath currentRequest state resumeCursor
+        with ex -> raise (SchedulerState.CheckpointFault $"Cannot persist durable continuation: {ex.Message}")
+let archivePlan () =
+    Directory.CreateDirectory Config.ralphDir |> ignore
+    Resume.archive Config.ralphDir |> fun path -> Logging.info $"Archived orchestration state: {path}"
 
 let updateStatus sprintPath status msg = StateOps.updateStatus &state liveCtx sprintPath status msg
 let updateTiming sprintPath f = StateOps.updateTiming &state sprintPath f
@@ -46,7 +59,14 @@ let setMessage msg = StateOps.setMessage &state liveCtx msg
 let buildDashboard () = GUI.buildDashboard state (Verifiers.listAll ())
 
 let private completionMarker = "RALPH_AGENT_COMPLETE"
-let mutable startAgentProcess = fun (psi: ProcessStartInfo) -> Process.Start psi
+let mutable startAgentProcess = fun (psi: ProcessStartInfo) ->
+    if psi.FileName.EndsWith(".cmd", StringComparison.OrdinalIgnoreCase) then
+        let command = psi.FileName
+        let quoted = psi.ArgumentList |> Seq.map (fun arg -> "\"" + arg.Replace("\"", "\\\"") + "\"") |> String.concat " "
+        psi.ArgumentList.Clear()
+        psi.FileName <- Environment.GetEnvironmentVariable("ComSpec")
+        psi.Arguments <- $"/d /s /c \"\"{command}\" {quoted}\""
+    new ProcessContainment.OwnedProcess(psi)
 let mutable agentUtcNow = fun () -> DateTime.UtcNow
 
 /// Run a copilot agent session. Returns (output, sessionName) where sessionName can be used with askFollowUp.
@@ -81,45 +101,45 @@ let private runAgentCore (prompt: string) (title: string) (_showWindow: bool) (r
         let psi = ProcessStartInfo(Config.CopilotExe)
         for argument in baseArgs do psi.ArgumentList.Add argument
         psi.WorkingDirectory <- Config.workDir
-        psi.UseShellExecute <- false
         psi.CreateNoWindow <- true
-        psi.RedirectStandardInput <- true
-        psi.RedirectStandardOutput <- true
-        psi.RedirectStandardError <- true
-        use proc = startAgentProcess psi
         let transport = AgentTransport.Output()
-        let stderr = System.Text.StringBuilder()
-        use completed = new Threading.ManualResetEventSlim(false)
-        proc.OutputDataReceived.Add(fun args ->
-            if not (isNull args.Data) then
-                lock transport (fun () ->
-                    transport.AddLine args.Data
-                    if transport.IsFinished then completed.Set()))
-        proc.ErrorDataReceived.Add(fun args ->
-            if not (isNull args.Data) then lock stderr (fun () -> stderr.AppendLine(args.Data) |> ignore))
-        proc.BeginOutputReadLine()
-        proc.BeginErrorReadLine()
-        proc.StandardInput.WriteLine(request)
-        proc.StandardInput.Close()
-
+        let pending = System.Text.StringBuilder()
+        let observe text =
+            lock transport (fun () ->
+                match text with
+                | Some text ->
+                    for c in text do
+                        if c = '\n' then
+                            transport.AddLine(pending.ToString())
+                            pending.Clear() |> ignore
+                        else pending.Append c |> ignore
+                | None when pending.Length > 0 ->
+                    transport.AddLine(pending.ToString())
+                    pending.Clear() |> ignore
+                | None -> ())
+        let seconds name fallback =
+            match Environment.GetEnvironmentVariable name |> Int32.TryParse with
+            | true, n when n > 0 && n <= 28800 -> TimeSpan.FromSeconds(float n)
+            | false, _ when String.IsNullOrEmpty(Environment.GetEnvironmentVariable name) -> TimeSpan.FromSeconds(float fallback)
+            | _ -> failwith $"{name} must be an integer from 1 to 28800 seconds"
+        let budget: ProcessCapture.Budget =
+            { Idle = seconds "RALPH_IDLE_SECONDS" 1200; Hard = seconds "RALPH_PHASE_SECONDS" 7200 }
+        let prefix = Path.Combine(Config.ralphDir, "captures", sessionName + "-" + Guid.NewGuid().ToString("N"))
         let deadline = (agentUtcNow ()).AddMinutes(float Config.AgentTimeoutMinutes)
-        while not proc.HasExited && not completed.IsSet && agentUtcNow () < deadline do
-            completed.Wait(TimeSpan.FromSeconds 1.) |> ignore
-
-        let completedEarly = completed.IsSet && not (proc.WaitForExit 1000)
-        if completedEarly then
-            Logging.info $"Agent {title} finished JSONL transport; stopping its lingering process."
-            proc.Kill(true)
-        elif not proc.HasExited then
-            proc.Kill(true)
-            proc.WaitForExit()
-            failwith $"Agent {title} exceeded the {Config.AgentTimeoutMinutes}-minute timeout."
-
-        proc.WaitForExit()
-        if not completedEarly && proc.ExitCode <> 0 then
-            let err = lock stderr (fun () -> stderr.ToString().Trim())
-            let errorText = if err = "" then "(no error text)" else err
-            failwith $"Agent {title} exited with code {proc.ExitCode}: {errorText}"
+        let result =
+            ProcessCapture.runCapturedControlled psi title budget prefix (Some request)
+                startAgentProcess observe
+                (fun () -> lock transport (fun () -> transport.IsFinished))
+                (fun () -> agentUtcNow () >= deadline)
+        Logging.info $"Agent {title}: phase={result.Phase}, pid={result.Pid}, reason={result.Reason}, exit={result.ExitCode}, stderr={result.StderrPath}"
+        let exited = result.Reason = "Exited" && result.ExitCode = Nullable 0
+        let terminal =
+            result.Reason = "TerminalResult"
+            && (result.ExitCode = Nullable ProcessCapture.terminalExitCode || result.ExitCode = Nullable 0)
+        if not (exited || terminal) || not result.InputCompleted || not result.StreamsDrained
+           || not result.OwnedProcessesStopped || result.Failures.Length <> 0 then
+            let timeout = if result.Reason = "HardBudget" || result.Reason = "IdleLease" then " (timeout)" else ""
+            failwith $"Agent {title}: {result.Reason}{timeout}, exit {result.ExitCode}; stderr retained at {result.StderrPath}"
         output <- lock transport (fun () -> transport.GetOutput())
         Logging.info $"Agent {title} completed, output length: {output.Length}"
     with ex ->
@@ -250,13 +270,29 @@ let runAllVerifiers showWin sprintFilePath (sprintItem: BacklogItem) = async {
     
     let mutable allPassed = true
     
+    let previous =
+        getItemTiming sprintFilePath
+        |> Option.bind (fun timing -> List.tryLast timing.IterationHistory)
+        |> Option.map (fun record -> record.VerifierResults)
+        |> Option.defaultValue []
     for name in activeVerifiers do
-        match! verifyStage showWin sprintFilePath name sprintItem with
-        | Ok commit ->
-            updateVerifierStatus sprintFilePath name true commit
-        | Error e -> 
-            updateVerifierStatus sprintFilePath name false None
-            allPassed <- false
+        match previous |> List.tryFind (fun (verifier, _, _) -> verifier = name) with
+        | Some (_, false, _) -> allPassed <- false
+        | Some (_, true, _) when
+            Git.isWorktreeClean()
+            && (getItemTiming sprintFilePath
+                |> Option.bind (fun timing -> timing.ApprovedCommits.TryFind name)
+                |> Option.exists (fun approved -> Git.getHeadCommit() = Some approved)) -> ()
+        | Some (_, true, _) | None ->
+            if previous |> List.exists (fun (verifier, passed, _) -> verifier = name && passed) then
+                Logging.info $"Rechecking {name}: retained result has no clean current-HEAD approval."
+            persist ()
+            match! verifyStage showWin sprintFilePath name sprintItem with
+            | Ok commit -> updateVerifierStatus sprintFilePath name true commit
+            | Error _ ->
+                updateVerifierStatus sprintFilePath name false None
+                allPassed <- false
+            persist ()
     
     if allPassed then
         return Ok ()
@@ -375,33 +411,45 @@ let rec runBacklogItem (item: BacklogItem) iter totalIter feedback showWin = asy
         
         updateStatus item.FilePath (Running (Implement, iter)) $"Sprint {item.Order}: Implement iteration {iter}"
         
-        let prompt = Prompts.implement item iter feedback prevDoDResults pastSprints pastSteps iterHistory
-        SchedulerState.save state
-        let! (out, sessionId) = runAgent prompt ($"Implement-{item.Order}") showWin None
+        let retry fb dodResults =
+            let reason = fb |> List.tryHead |> Option.defaultValue "Unknown"
+            addIterationReason item.FilePath iter reason
+            updateDoDResults item.FilePath dodResults
+            resumeCursor <- Some { SprintPath = item.FilePath; Iteration = iter + 1; Stage = "Implement" }
+            updateStatus item.FilePath (Running(Implement, iter + 1)) reason
+            persist ()
+            runBacklogItem item (iter + 1) (totalIter + 1) fb showWin
         
-        let currentRecord: IterationRecord = {
-            Iteration = iter
-            AgentOutput = out
-            VerifierResults = []
-        }
-        addIterationRecord item.FilePath currentRecord
-        SchedulerState.save state
-
+        let resumingVerification =
+            resumeCursor |> Option.exists (fun cursor -> cursor.SprintPath = item.FilePath && cursor.Iteration = iter && cursor.Stage = "Verify")
         let! resolved = async {
-            let complete = hasSignalAny "SUBTASK_COMPLETE" out
-            let incomplete = hasSignalAny "SUBTASK_INCOMPLETE" out
-            if SchedulerState.blockRequest out |> Option.isSome || complete <> incomplete then return out
+            if resumingVerification then
+                return (getItemTiming item.FilePath |> Option.get).IterationHistory |> List.last |> _.AgentOutput
             else
-                let! clarification = resolveSubtaskAmbiguity sessionId item.Name
-                updateTiming item.FilePath (fun timing ->
-                    let history =
-                        timing.IterationHistory |> List.mapi (fun index record ->
-                            if index = timing.IterationHistory.Length - 1 then
-                                { record with AgentOutput = record.AgentOutput + "\n" + clarification }
-                            else record)
-                    { timing with IterationHistory = history })
+                resumeCursor <- Some { SprintPath = item.FilePath; Iteration = iter; Stage = "Implement" }
                 SchedulerState.save state
-                return clarification
+                persist ()
+                let prompt = Prompts.implement item iter feedback prevDoDResults pastSprints pastSteps iterHistory
+                let! (out, sessionId) = runAgent prompt ($"Implement-{item.Order}") showWin None
+                let record: IterationRecord = { Iteration = iter; AgentOutput = out; VerifierResults = [] }
+                addIterationRecord item.FilePath record
+                state <- { state with CompletedIterations = state.CompletedIterations + 1 }
+                SchedulerState.save state
+                let complete = hasSignalAny "SUBTASK_COMPLETE" out
+                let incomplete = hasSignalAny "SUBTASK_INCOMPLETE" out
+                if SchedulerState.blockRequest out |> Option.isSome || complete <> incomplete then
+                    return out
+                else
+                    let! clarification = resolveSubtaskAmbiguity sessionId item.Name
+                    updateTiming item.FilePath (fun timing ->
+                        let history =
+                            timing.IterationHistory |> List.mapi (fun index record ->
+                                if index = timing.IterationHistory.Length - 1 then
+                                    { record with AgentOutput = record.AgentOutput + "\n" + clarification }
+                                else record)
+                        { timing with IterationHistory = history })
+                    SchedulerState.save state
+                    return clarification
         }
         match SchedulerState.blockRequest resolved with
         | Some reason ->
@@ -414,23 +462,19 @@ let rec runBacklogItem (item: BacklogItem) iter totalIter feedback showWin = asy
                 Logging.exn ex "Persisting blocked checkpoint"
                 return Fault $"Cannot persist blocked checkpoint: {ex.Message}"
         | None ->
-            let retry fb dodResults =
-                let reason = fb |> List.tryHead |> Option.defaultValue "Unknown"
-                addIterationReason item.FilePath iter reason
-                updateDoDResults item.FilePath dodResults
-                state <- { state with CompletedIterations = state.CompletedIterations + 1 }
-                runBacklogItem item (iter + 1) (totalIter + 1) fb showWin
-
-            let isComplete = hasSignalAny "SUBTASK_COMPLETE" resolved && not (hasSignalAny "SUBTASK_INCOMPLETE" resolved)
+            let isComplete = resumingVerification || (hasSignalAny "SUBTASK_COMPLETE" resolved && not (hasSignalAny "SUBTASK_INCOMPLETE" resolved))
 
             if isComplete then
-                state <- { state with CompletedIterations = state.CompletedIterations + 1 }
+                resumeCursor <- Some { SprintPath = item.FilePath; Iteration = iter; Stage = "Verify" }
+                persist ()
                 match! runAllVerifiers showWin item.FilePath item with
                 | Ok _ ->
                     let allPassed = item.DoD |> List.map (fun c -> { Criterion = c; Passed = Some true })
                     updateDoDResults item.FilePath allPassed
                     endItemTiming item.FilePath $"Completed in {totalIter + 1} iterations"
                     updateStatus item.FilePath (Done (totalIter + 1)) $"Sprint {item.Order} complete in {totalIter + 1} iterations"
+                    resumeCursor <- None
+                    persist ()
                     return Complete ()
                 | Error e -> return! retry [e] prevDoDResults
             else
@@ -449,8 +493,15 @@ let rec runAllBacklogItems (items: BacklogItem list) showWin = async {
         let wasBlocked =
             state.Backlog |> List.exists (fun (sprint, status, _) ->
                 sprint.FilePath = item.FilePath && (match status with Blocked _ -> true | _ -> false))
-        let nextIteration = if wasBlocked then max 1 lastIteration else lastIteration + 1
-        match! runBacklogItem item nextIteration timing.IterationHistory.Length [] showWin with
+        let nextIteration =
+            state.Backlog |> List.tryPick (fun (sprint, status, _) ->
+                if sprint.FilePath <> item.FilePath then None
+                else match status with Running(_, n) -> Some n | _ -> None)
+            |> Option.defaultValue (if wasBlocked then max 1 lastIteration else lastIteration + 1)
+        let verifying =
+            resumeCursor |> Option.exists (fun cursor -> cursor.SprintPath = item.FilePath && cursor.Stage = "Verify")
+        let previousAttempts = timing.IterationHistory.Length - (if verifying then 1 else 0)
+        match! runBacklogItem item nextIteration (max previousAttempts (nextIteration - 1)) [] showWin with
         | Complete () -> return! runAllBacklogItems rest showWin
         | Block blocked -> return Block blocked
         | Fault error -> return Fault error
@@ -462,6 +513,7 @@ let rec runAllBacklogItems (items: BacklogItem list) showWin = async {
 
 let runFinalVerifiers showWin = async {
     state <- { state with CurrentPhase = "Final Verification" }
+    persist ()
     liveCtx |> Option.iter (fun ctx -> ctx.Refresh())
     
     let verifierNames = Verifiers.listAll ()
@@ -470,7 +522,8 @@ let runFinalVerifiers showWin = async {
     let sprintFiles = SprintFiles.listSprints()
     let finalContext = buildFinalVerificationContext sprintFiles
     
-    for name in verifierNames do
+    let completed = state.FinalVerifierResults
+    for name in verifierNames |> List.filter (fun name -> not (completed.ContainsKey name)) do
         setMessage $"Final verification: {name}..."
         
         let prevCount = 
@@ -498,9 +551,10 @@ let runFinalVerifiers showWin = async {
                         LastVerifierLog = Some (0, name, false, summary) }
             allPassed <- false
         
+        persist ()
         liveCtx |> Option.iter (fun ctx -> ctx.Refresh())
     
-    return allPassed
+    return allPassed && (completed |> Map.forall (fun _ result -> match result with Passed _ -> true | _ -> false))
 }
 
 let createFixupSprint (failedVerifiers: string list) (fixupNumber: int) (summaries: Map<string, string>) : BacklogItem =
@@ -597,6 +651,8 @@ let rec finalChecksWithFixup showWin maxFixupSprints currentFixup = async {
                        Backlog = state.Backlog @ [(fixupItem, Todo, emptyTiming)]
                        ActiveSprints = state.ActiveSprints @ [fixupItem.FilePath]
                        TotalEstimatedIterations = state.TotalEstimatedIterations + 3
+                       FinalVerifierResults = Map.empty
+                       FinalVerifierSummaries = Map.empty
                  }
         liveCtx |> Option.iter (fun ctx -> ctx.Refresh())
         
@@ -613,10 +669,12 @@ let rec finalChecksWithFixup showWin maxFixupSprints currentFixup = async {
 
 let finalChecks showWin =
     setMessage "Running final verification on complete feature..."
-    finalChecksWithFixup showWin 3 0 |> Async.RunSynchronously
+    let existingFixups = state.Backlog |> List.filter (fun (item, _, _) -> item.TargetVerifiers.IsSome) |> List.length
+    finalChecksWithFixup showWin 3 existingFixups |> Async.RunSynchronously
 
 
 let runWithLive (sprints: BacklogItem list) showWin (originalRequest: string) = 
+    currentRequest <- originalRequest
     let estimatedIterations = sprints.Length * 3
     
     let overview = BacklogFile.readOverview() |> Option.defaultValue originalRequest
@@ -653,8 +711,8 @@ let runWithLive (sprints: BacklogItem list) showWin (originalRequest: string) =
         AgentStartTime = None
         TotalEstimatedIterations = estimatedIterations
         CompletedIterations = state.CompletedIterations
-        FinalVerifierResults = Map.empty
-        FinalVerifierSummaries = Map.empty
+        FinalVerifierResults = state.FinalVerifierResults
+        FinalVerifierSummaries = state.FinalVerifierSummaries
         CIStatus = None
         CurrentPhase = "Executing"
         CurrentAgentTask = ""
@@ -668,6 +726,7 @@ let runWithLive (sprints: BacklogItem list) showWin (originalRequest: string) =
     
     Directory.CreateDirectory Config.ralphDir |> ignore
     SprintFiles.ensureDir()
+    persist ()
     
     Logging.info $"Starting execution with {sprints.Length} sprints ({oldHistorical.Length} historical preserved)"
     
@@ -698,9 +757,12 @@ let runWithLive (sprints: BacklogItem list) showWin (originalRequest: string) =
                 | Complete true ->
                     Logging.info "Final checks passed"
                     state <- { state with CurrentPhase = "Complete"; Message = "[green bold]WORKFLOW COMPLETE[/]" }
+                    persist ()
                 | Complete false ->
                     Logging.info "Final checks had issues"
-                    state <- { state with CurrentPhase = "Complete"; Message = "[yellow]Completed with some issues[/]" }
+                    state <- { state with Message = "[yellow]Completed with some issues[/]" }
+                    persist ()
+                    result <- Retry "Final verification failed"
                 | Block blocked -> result <- Block blocked
                 | Fault error -> result <- Fault error
                 | Retry error -> result <- Retry error
@@ -749,8 +811,11 @@ let invokeArbiter (originalRequest: string) (showWin: bool) : DispatchResult<Bac
     match SchedulerState.pendingBlock () with
     | Some blocked -> Block blocked
     | None ->
+    archivePlan ()
+    resumeCursor <- None
     Logging.info "invokeArbiter called"
-    state <- { state with CurrentPhase = "Arbiter"; Message = "Invoking arbiter for recovery..." }
+    state <- { state with CurrentPhase = "Arbiter"; Message = "Invoking arbiter for recovery..."
+                          FinalVerifierResults = Map.empty; FinalVerifierSummaries = Map.empty }
     liveCtx |> Option.iter (fun ctx -> ctx.Refresh())
     
     // Find the failed sprint (the one that's Running or first non-Done)
@@ -863,6 +928,23 @@ let dispatchExit = function
         43
     | Retry _ -> 1
 
+let private validateFinishedState (saved: State) =
+    let active = Set.ofList saved.ActiveSprints
+    let paths = saved.Backlog |> List.map (fun (item, _, _) -> item.FilePath) |> Set.ofList
+    if saved.Backlog.IsEmpty || active.IsEmpty || active.Count <> saved.ActiveSprints.Length
+       || not (Set.isSubset active paths)
+       || (saved.Backlog |> List.exists (fun (item, status, _) ->
+           active.Contains item.FilePath && (match status with Done iterations when iterations > 0 -> false | _ -> true))) then
+        raise (SchedulerState.CheckpointFault "Completed checkpoint requires a nonempty, finished active backlog with positive iteration counts.")
+    let required = Verifiers.listAll ()
+    if required.IsEmpty || (required |> List.exists (fun name ->
+        match saved.FinalVerifierResults.TryFind name with
+        | Some (Passed iterations) when iterations > 0 -> false
+        | _ -> true)) then
+        raise (SchedulerState.CheckpointFault "Completed checkpoint requires passing results with positive iteration counts for every final verifier.")
+    if saved.AgentStartTime.IsSome || saved.CurrentAgentTask <> "" || saved.ErrorLog.IsSome then
+        raise (SchedulerState.CheckpointFault "Completed checkpoint contains unfinished agent or error state.")
+
 let rec resumeCheckpoint request showWin explicitRestart =
     let restored =
         try
@@ -870,20 +952,7 @@ let rec resumeCheckpoint request showWin explicitRestart =
                 if explicitRestart then SchedulerState.restoreExplicitRestart ()
                 else SchedulerState.restore (not state.Backlog.IsEmpty)
             match restored with
-            | SchedulerState.Finished saved ->
-                if saved.Backlog.IsEmpty
-                   || (saved.Backlog |> List.exists (fun (_, status, _) ->
-                       match status with Done iterations when iterations > 0 -> false | _ -> true)) then
-                    raise (SchedulerState.CheckpointFault "Completed checkpoint requires a nonempty, finished backlog with positive iteration counts.")
-                let requiredVerifiers = Verifiers.listAll ()
-                if requiredVerifiers.IsEmpty
-                   || (requiredVerifiers |> List.exists (fun name ->
-                       match saved.FinalVerifierResults.TryFind name with
-                       | Some (Passed iterations) when iterations > 0 -> false
-                       | _ -> true)) then
-                    raise (SchedulerState.CheckpointFault "Completed checkpoint requires passing results with positive iteration counts for every final verifier.")
-                if saved.AgentStartTime.IsSome || saved.CurrentAgentTask <> "" || saved.ErrorLog.IsSome then
-                    raise (SchedulerState.CheckpointFault "Completed checkpoint contains unfinished agent or error state.")
+            | SchedulerState.Finished saved -> validateFinishedState saved
             | _ -> ()
             Ok restored
         with ex -> Error $"Checkpoint dispatch refused: {ex.Message}"
@@ -909,6 +978,9 @@ and run request showWin autoApprove arbiterCount (ciFailureContext: string optio
     match resumeCheckpoint request showWin false with
     | Some code -> code
     | None ->
+    currentRequest <- request
+    archivePlan ()
+    resumeCursor <- None
     Logging.info $"run() called: arbiterCount={arbiterCount}, autoApprove={autoApprove}"
     
     if arbiterCount >= Config.MaxArbiterAttempts then
@@ -1061,12 +1133,16 @@ let requestFromArgs args =
 
 /// Restart: Learn from previous failed run and create new plan
 let shouldResumeBeforeRestart () =
-    File.Exists(Path.Combine(Config.ralphDir, "scheduler-state.json"))
+    ["scheduler-state.json"; "completed-state.json"; "blocked.json"; "resume-launch.json"]
+    |> List.exists (fun name -> File.Exists(Path.Combine(Config.ralphDir, name)))
 
 let runRestart (request: string) showWin autoApprove =
     match if shouldResumeBeforeRestart () then resumeCheckpoint request showWin true else None with
     | Some code -> code
     | None ->
+    currentRequest <- request
+    archivePlan ()
+    resumeCursor <- None
     AnsiConsole.Write(FigletText("RESTART").Color(Color.Yellow))
     AnsiConsole.MarkupLine "[yellow]Learning from previous run...[/]"
     
@@ -1186,8 +1262,50 @@ and runWithCIContext request showWin auto ciAttempt ciOutput =
             1
     else result
 
+let runResume request showWin adopt =
+    try
+        match SchedulerState.pendingBlock () with
+        | Some _ -> resumeCheckpoint request showWin false |> Option.get
+        | None ->
+            if File.Exists(Path.Combine(Config.ralphDir, "resume-launch.json")) then
+                raise (SchedulerState.CheckpointFault "Retained continuation has an unauthenticated resume launch.")
+            if File.Exists(Path.Combine(Config.ralphDir, "scheduler-state.json")) then
+                SchedulerState.readUnblockedSnapshot () |> ignore
+            if adopt && (File.Exists(Path.Combine(Config.ralphDir, "scheduler-state.json"))
+                         || File.Exists(Path.Combine(Config.ralphDir, "completed-state.json"))) then
+                raise (SchedulerState.CheckpointFault "Cannot adopt an existing scheduler checkpoint as unfinished work.")
+            currentRequest <- request
+            let restored, cursor =
+                if adopt then Resume.adopt checkpointPath request
+                else Resume.load checkpointPath request
+            state <- restored
+            resumeCursor <- cursor
+            if state.CurrentPhase = "Complete" then
+                validateFinishedState state
+                if File.Exists(Path.Combine(Config.ralphDir, "scheduler-state.json")) then
+                    SchedulerState.save state
+                    try SchedulerState.archiveCompleted ()
+                    with ex -> raise (SchedulerState.CheckpointFault $"Cannot finalize completed continuation: {ex.Message}")
+                0
+            else
+                let finalFinished =
+                    Verifiers.listAll () |> List.forall (fun name ->
+                        match state.FinalVerifierResults.TryFind name with Some (Passed _) | Some (Failed _) -> true | _ -> false)
+                let failedFinal = state.FinalVerifierResults |> Map.exists (fun _ result -> match result with Failed _ -> true | _ -> false)
+                let fixups = state.Backlog |> List.filter (fun (item, _, _) -> item.TargetVerifiers.IsSome) |> List.length
+                if state.CurrentPhase = "Final Verification" && finalFinished && failedFinal && fixups >= 3 then
+                    Logging.error "Final verification failed after three fixup sprints; retained outcome is unchanged."
+                    eprintfn "Final verification remains unsuccessful; no agents were rerun."
+                    dispatchExit (Retry "Final verification failed after three fixup sprints")
+                else
+                    runWithLive (state.Backlog |> List.choose (fun (item, _, _) ->
+                        if List.contains item.FilePath state.ActiveSprints then Some item else None)) showWin request
+                    |> dispatchExit
+    with SchedulerState.CheckpointFault error -> dispatchExit (Fault error)
+
 match fsi.CommandLineArgs |> Array.toList |> List.tail with
 | args when List.contains "--fixture" args -> ()
+| ["--check"] -> printfn "Ralph load chain OK (no agents started)"
 | [] -> runInteractive () |> ignore
 | ["--help"] | ["-h"] ->
     printfn "Ralph - Autonomous AI Coding Loop\n"
@@ -1200,6 +1318,9 @@ match fsi.CommandLineArgs |> Array.toList |> List.tail with
     printfn "  --push      Push after completion and monitor CI, fix failures"
     printfn "  --restart   Learn from previous failed run and restart with new plan"
     printfn "  --request-file PATH  Read the request from a file instead of the command line"
+    printfn "  --resume    Resume a validated durable checkpoint without replanning"
+    printfn "  --adopt-plan Use existing backlog/sprints as unfinished work (no checkpoint)"
+    printfn "  --check     Typecheck/load only; never start agents"
 | args ->
     let request = requestFromArgs args
     let showWin = not (List.contains "--hidden" args)
@@ -1207,8 +1328,13 @@ match fsi.CommandLineArgs |> Array.toList |> List.tail with
     let auto = List.contains "--yes" args
     let push = List.contains "--push" args
     let restart = List.contains "--restart" args
+    let resume = List.contains "--resume" args
+    let adopt = List.contains "--adopt-plan" args
     if headless then dashboardDisabled <- true
     if String.IsNullOrWhiteSpace request then printfn "No request.  Use --help"; exit 1
-    if restart then runRestart request showWin auto |> exit
+    if [restart; push; resume; adopt] |> List.filter id |> List.length > 1 then
+        failwith "--restart, --push, --resume, and --adopt-plan are mutually exclusive"
+    if resume || adopt then runResume request showWin adopt |> exit
+    elif restart then runRestart request showWin auto |> exit
     elif push then runWithPush request showWin auto 0 |> exit
     else run request showWin auto 0 None |> exit
